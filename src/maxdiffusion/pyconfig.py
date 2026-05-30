@@ -90,7 +90,7 @@ def _lists_to_tuples(l: list[Any]) -> Union[tuple[Any], list[Any]]:
   return tuple(_lists_to_tuples(x) for x in l) if isinstance(l, list) else l
 
 
-class _HyperParameters:
+class _HyperParameters: # core params class
   # pylint: disable=missing-class-docstring
   def __init__(self, argv: list[str], **kwargs):
     with open(argv[1], "r", encoding="utf-8") as yaml_file:
@@ -138,7 +138,7 @@ class _HyperParameters:
       max_utils.maybe_initialize_jax_distributed_system(raw_keys)
 
     if raw_keys["jax_cache_dir"]:
-      jax.config.update("jax_compilation_cache_dir", raw_keys["jax_cache_dir"])
+      jax.config.update("jax_compilation_cache_dir", raw_keys["jax_cache_dir"]) # update jax_compilation_cache_dir
 
     _HyperParameters.user_init(raw_keys)
     _HyperParameters.wan_init(raw_keys)
@@ -184,6 +184,11 @@ class _HyperParameters:
   @staticmethod
   def calculate_global_batch_sizes(per_device_batch_size):
     num_devices = len(jax.devices())
+    process_count = jax.process_count()
+    local_device_count = jax.local_device_count()
+    if process_count > 1 and num_devices == local_device_count:
+      num_devices = process_count * local_device_count
+
     if per_device_batch_size < 1:
       # For per_device_batch_size<1, we load the data as if per_device_batch_size=1
       global_batch_size_to_load = num_devices
@@ -191,6 +196,11 @@ class _HyperParameters:
       global_batch_size_to_load = int(num_devices * per_device_batch_size)
 
     global_batch_size_to_train_on = int(num_devices * per_device_batch_size)
+    if global_batch_size_to_train_on < 1:
+      raise ValueError(
+          "per_device_batch_size is too small: "
+          f"{per_device_batch_size} * {num_devices} devices is < 1 global sample."
+      )
     return global_batch_size_to_load, global_batch_size_to_train_on
 
   @staticmethod

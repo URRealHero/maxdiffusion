@@ -125,7 +125,11 @@ def _make_tfrecord_iterator(
     clip_embeddings = tf.io.parse_tensor(tnp.asarray(features["clip_embeddings"]), out_type=tf.float32)
     return {"pixel_values": moments, "input_ids": clip_embeddings}
 
-  filenames = tf.io.gfile.glob(os.path.join(dataset_path, "*"))
+  filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*.tfrec")))
+  if not filenames:
+    filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*.tfrecord")))
+  if not filenames:
+    raise ValueError(f"No TFRecord shards found in {dataset_path}. Expected *.tfrec or *.tfrecord files.")
   ds = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
 
   # --- PADDING LOGIC FOR EVALUATION ---
