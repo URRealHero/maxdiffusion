@@ -81,17 +81,28 @@ mask_padding_tokens: True
 attention_sharding_uniform: True
 dropout: 0.0
 
+# flash_block_sizes: {
+#   "block_q" : 512,
+#   "block_kv_compute" : 512,
+#   "block_kv" : 512,
+#   "block_q_dkv" : 512,
+#   "block_kv_dkv" : 512,
+#   "block_kv_dkv_compute" : 512,
+#   "block_q_dq" : 512,
+#   "block_kv_dq" : 512,
+#   "use_fused_bwd_kernel": False,
+# }
 flash_block_sizes: {
-  "block_q" : 512,
-  "block_kv_compute" : 512,
-  "block_kv" : 512,
-  "block_q_dkv" : 512,
-  "block_kv_dkv" : 512,
-  "block_kv_dkv_compute" : 512,
-  "block_q_dq" : 512,
-  "block_kv_dq" : 512,
-  "use_fused_bwd_kernel": False,
+  "block_q" : 3024,
+  "block_kv_compute" : 1024,
+  "block_kv" : 2048,
+  "block_q_dkv" : 1024,
+  "block_kv_dkv" : 3072,
+  "block_kv_dkv_compute" : 256,
+  "block_q_dq" : 1024,
+  "block_kv_dq" : 3072
 }
+
 # GroupNorm groups
 norm_num_groups: 32
 
