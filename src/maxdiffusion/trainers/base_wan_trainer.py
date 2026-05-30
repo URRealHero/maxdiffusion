@@ -343,7 +343,9 @@ class BaseWanTrainer(abc.ABC):
             train_metric, last_step_completion - start_step_time, per_device_tflops, learning_rate_scheduler(step)
         )
         if self.config.write_metrics:
-          train_utils.write_metrics(writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config)
+          running_gcs_metrics = train_utils.write_metrics(
+              writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config
+          )
 
         if self.config.eval_every > 0 and (step + 1) % self.config.eval_every == 0:
           if self.config.enable_generate_video_for_eval:
@@ -361,6 +363,12 @@ class BaseWanTrainer(abc.ABC):
           else:
             self.checkpointer.save_checkpoint(step, pipeline, state.params)
 
+      if self.config.write_metrics:
+        # Metrics are double-buffered to avoid blocking on lazy JAX arrays during
+        # the next step. Flush the final buffered step once training exits.
+        running_gcs_metrics = train_utils.write_metrics(
+            writer, local_metrics_file, running_gcs_metrics, None, None, self.config
+        )
       _metrics_queue.put(None)
       writer_thread.join()
       if writer:
