@@ -17,11 +17,11 @@ import jax
 import time
 import os
 import subprocess
+from maxdiffusion import pyconfig, max_logging, max_utils
 from maxdiffusion.checkpointing.wan_checkpointer_2_1 import WanCheckpointer2_1
 from maxdiffusion.checkpointing.wan_checkpointer_2_2 import WanCheckpointer2_2
 from maxdiffusion.checkpointing.wan_checkpointer_i2v_2p1 import WanCheckpointerI2V_2_1
 from maxdiffusion.checkpointing.wan_checkpointer_i2v_2p2 import WanCheckpointerI2V_2_2
-from maxdiffusion import pyconfig, max_logging, max_utils
 from absl import app
 from maxdiffusion.train_utils import transformer_engine_context
 from maxdiffusion.utils import export_to_video
@@ -167,7 +167,11 @@ def inference_generate_video(config, pipeline, filename_prefix=""):
       f"Num steps: {config.num_inference_steps}, height: {config.height}, width: {config.width}, frames: {config.num_frames}, video: {filename_prefix}"
   )
 
-  videos = call_pipeline(config, pipeline, prompt, negative_prompt)
+  outputs = call_pipeline(config, pipeline, prompt, negative_prompt)
+  if isinstance(outputs, tuple):
+    videos = outputs[0]
+  else:
+    videos = outputs
 
   max_logging.log(f"video {filename_prefix}, compile time: {(time.perf_counter() - s0)}")
   for i in range(len(videos)):
@@ -181,9 +185,9 @@ def inference_generate_video(config, pipeline, filename_prefix=""):
 
 
 def run(config, pipeline=None, filename_prefix="", commit_hash=None):
-  model_key = config.model_name
-  writer = max_utils.initialize_summary_writer(config)
-  if jax.process_index() == 0 and writer:
+  model_key = config.model_name # WAN 2.1 / WAN 2.2
+  writer = max_utils.initialize_summary_writer(config) # tensorboard logging 
+  if jax.process_index() == 0 and writer: # process 0 writes.
     max_logging.log(f"TensorBoard logs will be written to: {config.tensorboard_dir}")
 
     if commit_hash:
@@ -192,7 +196,7 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
     else:
       max_logging.log("Could not retrieve Git commit hash.")
 
-  if pipeline is None:
+  if pipeline is None: # choosing ckpt (e.g., wan2.1, T2V)
     load_start = time.perf_counter()
     model_type = config.model_type
     if model_key == WAN2_1:
@@ -207,7 +211,7 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
         checkpoint_loader = WanCheckpointer2_2(config=config)
     else:
       raise ValueError(f"Unsupported model_name for checkpointer: {model_key}")
-    pipeline, _, _ = checkpoint_loader.load_checkpoint()
+    pipeline, _, _ = checkpoint_loader.load_checkpoint() # loading
     load_time = time.perf_counter() - load_start
     max_logging.log(f"load_time: {load_time:.1f}s")
   else:
@@ -346,13 +350,13 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
 
 
 def main(argv: Sequence[str]) -> None:
-  commit_hash = get_git_commit_hash()
-  pyconfig.initialize(argv)
+  commit_hash = get_git_commit_hash() # tracing
+  pyconfig.initialize(argv) # configuration
   try:
     flax.config.update("flax_always_shard_variable", False)
   except LookupError:
     pass
-  max_utils.ensure_machinelearning_job_runs(pyconfig.config)
+  max_utils.ensure_machinelearning_job_runs(pyconfig.config) # cloud job bookkeeping
   run(pyconfig.config, commit_hash=commit_hash)
 
 

@@ -137,6 +137,24 @@ def train_step(state, data, rng, scheduler_state, scheduler, config):
   return step_optimizer(state, data, rng, scheduler_state, scheduler, config)
 
 
+def _finite_fraction(tree):
+  leaves = jax.tree_util.tree_leaves(tree)
+  finite = jnp.array(0, dtype=jnp.int32)
+  total = jnp.array(0, dtype=jnp.int32)
+  for leaf in leaves:
+    finite = finite + jnp.sum(jnp.isfinite(leaf))
+    total = total + leaf.size
+  return finite.astype(jnp.float32) / jnp.maximum(total, 1).astype(jnp.float32)
+
+
+def _tree_max_abs(tree):
+  return jax.tree_util.tree_reduce(
+      lambda max_val, arr: jnp.maximum(max_val, jnp.max(jnp.abs(arr))),
+      tree,
+      initializer=jnp.array(0.0, dtype=jnp.float32),
+  )
+
+
 def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   _, new_rng, timestep_rng, dropout_rng = jax.random.split(rng, num=4)
 
@@ -167,34 +185,81 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
       model_pred = model_pred[:, :, cond_frames:]
 
     with jax.named_scope("loss"):
-      loss = (training_target - model_pred) ** 2
+      loss_tensor_unweighted = (training_target - model_pred) ** 2
+      loss_tensor = loss_tensor_unweighted
       if not config.disable_training_weights:
-        training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
-        loss = loss * training_weight
-      loss = jnp.mean(loss)
+        training_weight_for_loss = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
+        loss_tensor = loss_tensor * training_weight_for_loss
+      loss = jnp.mean(loss_tensor)
 
-    return loss
+    debug_metrics = {
+        "debug/latents_finite_frac": jnp.mean(jnp.isfinite(latents)),
+        "debug/cond_latents_finite_frac": jnp.mean(jnp.isfinite(cond_latents)),
+        "debug/encoder_hidden_states_finite_frac": jnp.mean(jnp.isfinite(encoder_hidden_states)),
+        "debug/noise_finite_frac": jnp.mean(jnp.isfinite(noise)),
+        "debug/noisy_latents_finite_frac": jnp.mean(jnp.isfinite(noisy_latents)),
+        "debug/hidden_states_finite_frac": jnp.mean(jnp.isfinite(hidden_states)),
+        "debug/model_pred_finite_frac": jnp.mean(jnp.isfinite(model_pred)),
+        "debug/training_target_finite_frac": jnp.mean(jnp.isfinite(training_target)),
+        "debug/loss_tensor_finite_frac": jnp.mean(jnp.isfinite(loss_tensor)),
+        "debug/loss_unweighted_mean": jnp.mean(loss_tensor_unweighted),
+        "debug/timesteps_min": jnp.min(timesteps),
+        "debug/timesteps_max": jnp.max(timesteps),
+        "debug/training_weight_min": jnp.min(training_weight),
+        "debug/training_weight_max": jnp.max(training_weight),
+        "debug/latents_max_abs": jnp.max(jnp.abs(latents)),
+        "debug/cond_latents_max_abs": jnp.max(jnp.abs(cond_latents)),
+        "debug/encoder_hidden_states_max_abs": jnp.max(jnp.abs(encoder_hidden_states)),
+        "debug/noisy_latents_max_abs": jnp.max(jnp.abs(noisy_latents)),
+        "debug/model_pred_max_abs": jnp.max(jnp.abs(model_pred)),
+        "debug/training_target_max_abs": jnp.max(jnp.abs(training_target)),
+    }
 
-  grad_fn = nnx.value_and_grad(loss_fn)
-  loss, grads = grad_fn(state.params)
+    return loss, debug_metrics
+
+  grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+  (loss, debug_metrics), grads = grad_fn(state.params)
   max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
+  max_abs_grad = _tree_max_abs(grads)
+  grads_finite_frac = _finite_fraction(grads)
 
-  max_abs_grad = jax.tree_util.tree_reduce(
-      lambda max_val, arr: jnp.maximum(max_val, jnp.max(jnp.abs(arr))),
-      grads,
-      initializer=-1.0,
-  )
+  new_state = state.apply_gradients(grads=grads)
+  params_finite_frac_after_update = _finite_fraction(new_state.params)
+  params_max_abs_after_update = _tree_max_abs(new_state.params)
+
+  if str(getattr(config, "frame_concat_debug_print", False)).lower() == "true":
+    jax.debug.print(
+        "FrameConcat debug: loss={loss} lat={lat} cond={cond} hidden={hidden} pred={pred} "
+        "target={target} loss_tensor={loss_tensor} w=[{wmin},{wmax}] grad={grad} "
+        "grad_max={grad_max} params_after={params_after} pred_max={pred_max}",
+        loss=loss,
+        lat=debug_metrics["debug/latents_finite_frac"],
+        cond=debug_metrics["debug/cond_latents_finite_frac"],
+        hidden=debug_metrics["debug/hidden_states_finite_frac"],
+        pred=debug_metrics["debug/model_pred_finite_frac"],
+        target=debug_metrics["debug/training_target_finite_frac"],
+        loss_tensor=debug_metrics["debug/loss_tensor_finite_frac"],
+        wmin=debug_metrics["debug/training_weight_min"],
+        wmax=debug_metrics["debug/training_weight_max"],
+        grad=grads_finite_frac,
+        grad_max=max_abs_grad,
+        params_after=params_finite_frac_after_update,
+        pred_max=debug_metrics["debug/model_pred_max_abs"],
+    )
 
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
+          "debug/grads_finite_frac": grads_finite_frac,
+          "debug/params_finite_frac_after_update": params_finite_frac_after_update,
+          "debug/params_max_abs_after_update": params_max_abs_after_update,
+          **debug_metrics,
       },
       "scalars": {},
   }
 
-  new_state = state.apply_gradients(grads=grads)
   return new_state, scheduler_state, metrics, new_rng
 
 

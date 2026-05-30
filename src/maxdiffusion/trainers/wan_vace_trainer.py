@@ -77,16 +77,26 @@ class WanVaceTrainer(BaseWanTrainer):
     feature_description = {
         "latents": tf.io.FixedLenFeature([], tf.string),
         "encoder_hidden_states": tf.io.FixedLenFeature([], tf.string),
-        "conditioning_latents": tf.io.FixedLenFeature([], tf.string),
+        "cond_latents": tf.io.FixedLenFeature([], tf.string),
     }
 
     if not is_training:
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
 
+    def make_vace_conditioning(cond_latents):
+      # VACE expects 96 channels: 32 latent-condition channels + 64 mask channels.
+      # For HM-World TV2V smoke data, approximate this as inactive=zeros,
+      # reactive=cond_latents, and an all-active mask.
+      inactive_latents = tf.zeros_like(cond_latents)
+      mask = tf.ones_like(cond_latents[:1])
+      mask = tf.tile(mask, [64, 1, 1, 1])
+      return tf.concat([inactive_latents, cond_latents, mask], axis=0)
+
     def prepare_sample_train(features):
       latents = tf.io.parse_tensor(features["latents"], out_type=tf.float32)
       encoder_hidden_states = tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32)
-      conditioning_latents = tf.io.parse_tensor(features["conditioning_latents"], out_type=tf.float32)
+      cond_latents = tf.io.parse_tensor(features["cond_latents"], out_type=tf.float32)
+      conditioning_latents = make_vace_conditioning(cond_latents)
       return {
           "latents": latents,
           "encoder_hidden_states": encoder_hidden_states,
@@ -96,7 +106,8 @@ class WanVaceTrainer(BaseWanTrainer):
     def prepare_sample_eval(features):
       latents = tf.io.parse_tensor(features["latents"], out_type=tf.float32)
       encoder_hidden_states = tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32)
-      conditioning_latents = tf.io.parse_tensor(features["conditioning_latents"], out_type=tf.float32)
+      cond_latents = tf.io.parse_tensor(features["cond_latents"], out_type=tf.float32)
+      conditioning_latents = make_vace_conditioning(cond_latents)
       timesteps = features["timesteps"]
       return {
           "latents": latents,
@@ -151,6 +162,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
 
     bsz = latents.shape[0]
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
+    timesteps = jnp.reshape(timesteps, (bsz,))
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
     with jax.named_scope("forward_pass"):
@@ -166,16 +178,66 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     with jax.named_scope("loss"):
       model_pred = model_pred.astype(jnp.float32)
       training_target = training_target.astype(jnp.float32)
-      loss = (training_target - model_pred) ** 2
+      loss_tensor = (training_target - model_pred) ** 2
       if not config.disable_training_weights:
         training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
-        loss = loss * training_weight
-      loss = jnp.mean(loss)
+        loss_tensor = loss_tensor * training_weight
+      loss = jnp.mean(loss_tensor)
 
-    return loss
+    aux = {
+        "latents_finite_frac": jnp.mean(jnp.isfinite(latents)),
+        "encoder_hidden_states_finite_frac": jnp.mean(jnp.isfinite(encoder_hidden_states)),
+        "control_hidden_states_finite_frac": jnp.mean(jnp.isfinite(control_hidden_states)),
+        "noisy_latents_finite_frac": jnp.mean(jnp.isfinite(noisy_latents)),
+        "training_target_finite_frac": jnp.mean(jnp.isfinite(training_target)),
+        "training_weight_finite_frac": jnp.mean(jnp.isfinite(training_weight)),
+        "model_pred_finite_frac": jnp.mean(jnp.isfinite(model_pred)),
+        "loss_tensor_finite_frac": jnp.mean(jnp.isfinite(loss_tensor)),
+        "latents_max_abs": jnp.max(jnp.abs(latents.astype(jnp.float32))),
+        "control_hidden_states_max_abs": jnp.max(jnp.abs(control_hidden_states.astype(jnp.float32))),
+        "noisy_latents_max_abs": jnp.max(jnp.abs(noisy_latents.astype(jnp.float32))),
+        "training_target_max_abs": jnp.max(jnp.abs(training_target.astype(jnp.float32))),
+        "training_weight_max": jnp.max(training_weight.astype(jnp.float32)),
+        "model_pred_max_abs": jnp.max(jnp.abs(model_pred.astype(jnp.float32))),
+        "loss_tensor_max": jnp.max(loss_tensor.astype(jnp.float32)),
+        "timestep_min": jnp.min(timesteps.astype(jnp.float32)),
+        "timestep_max": jnp.max(timesteps.astype(jnp.float32)),
+    }
 
-  grad_fn = nnx.value_and_grad(loss_fn)
-  loss, grads = grad_fn(state.params)
+    if str(getattr(config, "vace_debug_print", False)).lower() == "true":
+      jax.debug.print(
+          "VACE debug: loss={loss} lat={lat} cond={cond} noisy={noisy} target={target} "
+          "pred={pred} loss_tensor={loss_tensor} pred_max={pred_max} cond_max={cond_max} t=[{tmin},{tmax}]",
+          loss=loss,
+          lat=aux["latents_finite_frac"],
+          cond=aux["control_hidden_states_finite_frac"],
+          noisy=aux["noisy_latents_finite_frac"],
+          target=aux["training_target_finite_frac"],
+          pred=aux["model_pred_finite_frac"],
+          loss_tensor=aux["loss_tensor_finite_frac"],
+          pred_max=aux["model_pred_max_abs"],
+          cond_max=aux["control_hidden_states_max_abs"],
+          tmin=aux["timestep_min"],
+          tmax=aux["timestep_max"],
+      )
+
+    return loss, aux
+
+  debug_forward_only = str(getattr(config, "vace_debug_forward_only", False)).lower() == "true"
+  if debug_forward_only:
+    loss, aux = loss_fn(state.params)
+    metrics = {
+        "scalar": {
+            "learning/loss": loss,
+            "debug/vace_forward_only": jnp.array(1.0),
+            **{f"debug/{k}": v for k, v in aux.items()},
+        },
+        "scalars": {},
+    }
+    return state, scheduler_state, metrics, new_rng
+
+  grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+  (loss, aux), grads = grad_fn(state.params)
   max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
 
   max_abs_grad = jax.tree_util.tree_reduce(
@@ -189,6 +251,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
+          **{f"debug/{k}": v for k, v in aux.items()},
       },
       "scalars": {},
   }

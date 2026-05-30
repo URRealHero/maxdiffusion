@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import abc
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import datetime
 import os
 import pprint
@@ -47,6 +47,54 @@ def _to_array(x):
   if not isinstance(x, jax.Array):
     x = jnp.asarray(x)
   return x
+
+
+def _get_config_value(config, key, default):
+  try:
+    return getattr(config, key)
+  except (AttributeError, ValueError):
+    return default
+
+
+def _debug_training_loop_enabled(config):
+  return str(_get_config_value(config, "debug_training_loop", False)).lower() == "true"
+
+
+def _debug_disable_async_next_batch(config):
+  return str(_get_config_value(config, "debug_disable_async_next_batch", False)).lower() == "true"
+
+
+def _debug_precompile_train_step(config):
+  return str(_get_config_value(config, "debug_precompile_train_step", False)).lower() == "true"
+
+
+def _debug_training_loop_log(config, msg):
+  if _debug_training_loop_enabled(config):
+    max_logging.log(f"[training-loop-debug p{jax.process_index()}] {msg}")
+
+
+def _summarize_batch(batch):
+  parts = []
+  for key, value in batch.items():
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    sharding = getattr(value, "sharding", None)
+    parts.append(f"{key}: shape={shape}, dtype={dtype}, sharding={sharding}")
+  return "; ".join(parts)
+
+
+def _wait_for_future_with_debug(future, config, step, label):
+  if not _debug_training_loop_enabled(config):
+    return future.result()
+
+  wait_seconds = int(_get_config_value(config, "debug_training_loop_wait_seconds", 60))
+  while True:
+    try:
+      result = future.result(timeout=wait_seconds)
+      _debug_training_loop_log(config, f"step {step}: {label} finished")
+      return result
+    except FuturesTimeoutError:
+      _debug_training_loop_log(config, f"step {step}: still waiting for {label} after {wait_seconds}s")
 
 
 def generate_sample(config, pipeline, filename_prefix):
@@ -316,7 +364,18 @@ class BaseWanTrainer(abc.ABC):
     start_step = restore_args.get("step", 0)
     per_device_tflops, _, _ = BaseWanTrainer.calculate_tflops(pipeline)
     scheduler_state = pipeline.scheduler_state
+    _debug_training_loop_log(self.config, "before first load_next_batch")
     example_batch = load_next_batch(train_data_iterator, None, self.config)
+    _debug_training_loop_log(self.config, f"after first load_next_batch: {_summarize_batch(example_batch)}")
+
+    compiled_train_step = p_train_step
+    if _debug_precompile_train_step(self.config):
+      with pipeline.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+        _debug_training_loop_log(self.config, "before p_train_step.lower")
+        lowered_train_step = p_train_step.lower(state, example_batch, rng, scheduler_state)
+        _debug_training_loop_log(self.config, "after p_train_step.lower, before compile")
+        compiled_train_step = lowered_train_step.compile()
+        _debug_training_loop_log(self.config, "after p_train_step.compile")
 
     with ThreadPoolExecutor(max_workers=1) as executor:
       for step in np.arange(start_step, self.config.max_train_steps):
@@ -325,37 +384,59 @@ class BaseWanTrainer(abc.ABC):
           self._profiler.start()
         start_step_time = datetime.datetime.now()
 
-        next_batch_future = executor.submit(load_next_batch, train_data_iterator, example_batch, self.config)
+        if _debug_disable_async_next_batch(self.config):
+          _debug_training_loop_log(self.config, f"step {step}: async next batch disabled")
+          next_batch_future = None
+        else:
+          _debug_training_loop_log(self.config, f"step {step}: submitting async next batch")
+          next_batch_future = executor.submit(load_next_batch, train_data_iterator, example_batch, self.config)
         with (
             jax.profiler.StepTraceAnnotation("train", step_num=step),
             pipeline.mesh,
             nn_partitioning.axis_rules(self.config.logical_axis_rules),
         ):
-          state, scheduler_state, train_metric, rng = p_train_step(state, example_batch, rng, scheduler_state)
+          _debug_training_loop_log(self.config, f"step {step}: before p_train_step dispatch")
+          state, scheduler_state, train_metric, rng = compiled_train_step(state, example_batch, rng, scheduler_state)
+          _debug_training_loop_log(self.config, f"step {step}: after p_train_step dispatch, before loss block_until_ready")
           train_metric["scalar"]["learning/loss"].block_until_ready()
+          _debug_training_loop_log(self.config, f"step {step}: after loss block_until_ready")
         last_step_completion = datetime.datetime.now()
 
         if max_utils.profiler_enabled(self.config) and step == last_profiling_step:
           if self._profiler:
             self._profiler.stop()
 
+        _debug_training_loop_log(self.config, f"step {step}: before record_scalar_metrics")
         train_utils.record_scalar_metrics(
             train_metric, last_step_completion - start_step_time, per_device_tflops, learning_rate_scheduler(step)
         )
+        _debug_training_loop_log(self.config, f"step {step}: after record_scalar_metrics")
         if self.config.write_metrics:
+          _debug_training_loop_log(self.config, f"step {step}: before write_metrics")
           running_gcs_metrics = train_utils.write_metrics(
               writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config
           )
+          _debug_training_loop_log(self.config, f"step {step}: after write_metrics")
 
         if self.config.eval_every > 0 and (step + 1) % self.config.eval_every == 0:
           if self.config.enable_generate_video_for_eval:
             pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
             inference_generate_video(self.config, pipeline, filename_prefix=f"{step+1}-train_steps-")
-          # Re-create the iterator each time you start evaluation to reset it
-          # This assumes your data loading logic can be called to get a fresh iterator.
-          self.eval(mesh, eval_rng_key, step, p_eval_step, state, scheduler_state, writer)
+          if self.config.eval_data_dir:
+            # Re-create the iterator each time you start evaluation to reset it
+            # This assumes your data loading logic can be called to get a fresh iterator.
+            self.eval(mesh, eval_rng_key, step, p_eval_step, state, scheduler_state, writer)
+          else:
+            max_logging.log("Skipping eval loss because eval_data_dir is empty.")
 
-        example_batch = next_batch_future.result()
+        if next_batch_future is None:
+          _debug_training_loop_log(self.config, f"step {step}: before synchronous load_next_batch")
+          example_batch = load_next_batch(train_data_iterator, example_batch, self.config)
+          _debug_training_loop_log(self.config, f"step {step}: synchronous next batch ready: {_summarize_batch(example_batch)}")
+        else:
+          _debug_training_loop_log(self.config, f"step {step}: before next_batch_future.result")
+          example_batch = _wait_for_future_with_debug(next_batch_future, self.config, step, "next_batch_future")
+          _debug_training_loop_log(self.config, f"step {step}: next batch ready: {_summarize_batch(example_batch)}")
         if step != 0 and self.config.checkpoint_every != -1 and step % self.config.checkpoint_every == 0:
           max_logging.log(f"Saving checkpoint for step {step}")
           if self.config.save_optimizer:

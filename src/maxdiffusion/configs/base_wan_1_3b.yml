@@ -81,28 +81,17 @@ mask_padding_tokens: True
 attention_sharding_uniform: True
 dropout: 0.0
 
-# flash_block_sizes: {
-#   "block_q" : 512,
-#   "block_kv_compute" : 512,
-#   "block_kv" : 512,
-#   "block_q_dkv" : 512,
-#   "block_kv_dkv" : 512,
-#   "block_kv_dkv_compute" : 512,
-#   "block_q_dq" : 512,
-#   "block_kv_dq" : 512,
-#   "use_fused_bwd_kernel": False,
-# }
 flash_block_sizes: {
-  "block_q" : 3024,
-  "block_kv_compute" : 1024,
-  "block_kv" : 2048,
-  "block_q_dkv" : 1024,
-  "block_kv_dkv" : 3072,
-  "block_kv_dkv_compute" : 256,
-  "block_q_dq" : 1024,
-  "block_kv_dq" : 3072
+  "block_q" : 512,
+  "block_kv_compute" : 512,
+  "block_kv" : 512,
+  "block_q_dkv" : 512,
+  "block_kv_dkv" : 512,
+  "block_kv_dkv_compute" : 512,
+  "block_q_dq" : 512,
+  "block_kv_dq" : 512,
+  "use_fused_bwd_kernel": False,
 }
-
 # GroupNorm groups
 norm_num_groups: 32
 
@@ -279,7 +268,7 @@ num_eval_samples: 420
 
 warmup_steps_fraction: 0.1
 learning_rate_schedule_steps: -1 # By default the length of the schedule is set to the number of steps.
-save_optimizer: False
+save_optimizer: True
 
 # However you may choose a longer schedule (learning_rate_schedule_steps > steps), in which case the training will end before
 # dropping fully down. Or you may choose a shorter schedule, where the unspecified steps will have a learning rate of 0.
@@ -318,6 +307,10 @@ flow_shift: 3.0
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
 use_cfg_cache: False
 use_kv_cache: False
+use_magcache: False
+magcache_thresh: 0.12
+magcache_K: 2
+retention_ratio: 0.2
 
 # Batch positive and negative prompts in text encoder to save compute.
 use_batched_text_encoder: False
@@ -372,6 +365,18 @@ qwix_module_path: ".*"
 # Eval model on per eval_every steps. -1 means don't eval.
 eval_every: -1
 eval_data_dir: ""
+
+# VACE debug: run forward/loss only and skip grad/update.
+vace_debug_forward_only: False
+vace_debug_print: False
+# Training-loop debug: log around first batch, JIT dispatch, execution barriers, metrics, and async input waits.
+debug_training_loop: False
+debug_training_loop_wait_seconds: 60
+# Debug-only: lower/compile the train step before the loop so compile/load is separated from first execution.
+debug_precompile_train_step: False
+# Debug-only: load the next batch synchronously after the step instead of prefetching in a thread.
+debug_disable_async_next_batch: False
+frame_concat_debug_print: False
 enable_generate_video_for_eval: False # This will increase the used TPU memory.
 eval_max_number_of_samples_in_bucket: 60 # The number of samples per bucket for evaluation. This is calculated by num_eval_samples / len(timesteps_list).
 

@@ -214,12 +214,19 @@ class WanVACETransformerBlock(nnx.Module):
       encoder_attention_mask: Optional[jax.Array] = None,
       deterministic: bool = True,
       rngs: nnx.Rngs | None = None,
+      input_projection_scale: Optional[jax.Array] = None,
   ) -> Tuple[jax.Array, jax.Array]:
     with self.conditional_named_scope("vace_transformer_block"):
       with self.conditional_named_scope("input_projection"):
         if self.apply_input_projection:
-          control_hidden_states = self.proj_in(control_hidden_states)
-          control_hidden_states = control_hidden_states + hidden_states
+          projected_control_hidden_states = self.proj_in(control_hidden_states) + hidden_states
+          if input_projection_scale is None:
+            control_hidden_states = projected_control_hidden_states
+          else:
+            projection_scale = input_projection_scale.astype(control_hidden_states.dtype)
+            control_hidden_states = (
+                projected_control_hidden_states * projection_scale + control_hidden_states * (1 - projection_scale)
+            ).astype(control_hidden_states.dtype)
 
       shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = jnp.split(
           (self.adaln_scale_shift_table + temb.astype(jnp.float32)), 6, axis=1
@@ -329,6 +336,7 @@ class WanVACEModel(WanModel):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      debug_vace_numerics: bool = False,
   ):
     """Initializes the VACE model.
 
@@ -342,6 +350,7 @@ class WanVACEModel(WanModel):
     self.num_layers = num_layers
     self.scan_layers = scan_layers
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    self.debug_vace_numerics = debug_vace_numerics
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -377,9 +386,37 @@ class WanVACEModel(WanModel):
     self.names_which_can_be_saved = names_which_can_be_saved
 
     # 3. Transformer blocks
+    @nnx.split_rngs(splits=num_layers)
+    @nnx.vmap(
+        in_axes=0,
+        out_axes=0,
+        transform_metadata={nnx.PARTITION_NAME: "layers_per_stage"},
+    )
+    def init_block(rngs):
+      return WanTransformerBlock(
+          rngs=rngs,
+          dim=inner_dim,
+          ffn_dim=ffn_dim,
+          num_heads=num_attention_heads,
+          qk_norm=qk_norm,
+          cross_attn_norm=cross_attn_norm,
+          eps=eps,
+          flash_min_seq_length=flash_min_seq_length,
+          flash_block_sizes=flash_block_sizes,
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+          attention=attention,
+          dropout=dropout,
+          mask_padding_tokens=mask_padding_tokens,
+          enable_jax_named_scopes=enable_jax_named_scopes,
+          use_base2_exp=use_base2_exp,
+          use_experimental_scheduler=use_experimental_scheduler,
+      )
 
     if scan_layers:
-      raise NotImplementedError("scan_layers is not supported yet")
+      self.blocks = init_block(rngs)
     else:
       blocks = nnx.List([])
       for _ in range(num_layers):
@@ -407,11 +444,44 @@ class WanVACEModel(WanModel):
         blocks.append(block)
       self.blocks = blocks
 
+    if scan_layers and list(self.config.vace_layers) != list(range(num_layers)):
+      raise NotImplementedError("scan_layers=True for VACE currently requires vace_layers to cover every layer")
+
+    @nnx.split_rngs(splits=num_layers)
+    @nnx.vmap(
+        in_axes=0,
+        out_axes=0,
+        transform_metadata={nnx.PARTITION_NAME: "layers_per_stage"},
+    )
+    def init_vace_block(rngs):
+      return WanVACETransformerBlock(
+          rngs=rngs,
+          dim=inner_dim,
+          ffn_dim=ffn_dim,
+          num_heads=num_attention_heads,
+          qk_norm=qk_norm,
+          cross_attn_norm=cross_attn_norm,
+          eps=eps,
+          flash_min_seq_length=flash_min_seq_length,
+          flash_block_sizes=flash_block_sizes,
+          mesh=mesh,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+          attention=attention,
+          dropout=dropout,
+          mask_padding_tokens=mask_padding_tokens,
+          enable_jax_named_scopes=enable_jax_named_scopes,
+          apply_input_projection=True,
+          apply_output_projection=True,
+          use_base2_exp=use_base2_exp,
+          use_experimental_scheduler=use_experimental_scheduler,
+      )
+
     if scan_layers:
-      raise NotImplementedError("scan_layers is not supported yet")
+      self.vace_blocks = init_vace_block(rngs)
     else:
       vace_blocks = nnx.List([])
-
       for vace_block_id in self.config.vace_layers:
         vace_block = WanVACETransformerBlock(
             rngs=rngs,
@@ -474,6 +544,13 @@ class WanVACEModel(WanModel):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
 
+  def debug_finite(self, name: str, value: jax.Array):
+    if self.debug_vace_numerics:
+      value_f32 = value.astype(jnp.float32)
+      finite = jnp.mean(jnp.isfinite(value_f32))
+      max_abs = jnp.max(jnp.abs(value_f32))
+      jax.debug.print("VACE numerics {name}: finite={finite} max_abs={max_abs}", name=name, finite=finite, max_abs=max_abs)
+
   def compute_kv_cache(
       self,
       encoder_hidden_states: jax.Array,
@@ -506,9 +583,18 @@ class WanVACEModel(WanModel):
         encoder_attention_mask = jnp.concatenate([encoder_attention_mask, text_mask], axis=1)
 
     if self.scan_layers:
-      raise NotImplementedError("scan_layers is not supported yet")
+
+      @nnx.vmap(
+          in_axes=(0, None, None),
+          out_axes=0,
+          transform_metadata={nnx.PARTITION_NAME: "layers_per_stage"},
+      )
+      def _compute_kv(block, enc_states, enc_mask):
+        return block.compute_kv(enc_states, enc_mask)
+
+      vace_kv_cache = _compute_kv(self.vace_blocks, encoder_hidden_states, encoder_attention_mask)
+      main_kv_cache = _compute_kv(self.blocks, encoder_hidden_states, encoder_attention_mask)
     else:
-      # VACE blocks
       vace_kv_cache_list = []
       for block in self.vace_blocks:
         vace_kv_cache_list.append(block.compute_kv(encoder_hidden_states, encoder_attention_mask))
@@ -520,7 +606,6 @@ class WanVACEModel(WanModel):
           v_list = [d[k][1] for d in vace_kv_cache_list]
           vace_kv_cache[k] = (jnp.stack(k_list, axis=0), jnp.stack(v_list, axis=0))
 
-      # Main blocks
       main_kv_cache_list = []
       for block in self.blocks:
         main_kv_cache_list.append(block.compute_kv(encoder_hidden_states, encoder_attention_mask))
@@ -558,7 +643,7 @@ class WanVACEModel(WanModel):
     post_patch_width = width // p_w
 
     if control_hidden_states_scale is None:
-      control_hidden_states_scale = jnp.ones_like(control_hidden_states, shape=(len(self.config.vace_layers),))
+      control_hidden_states_scale = jnp.ones((len(self.config.vace_layers),), dtype=control_hidden_states.dtype)
     if control_hidden_states_scale.shape[0] != len(self.config.vace_layers):
       raise ValueError(
           "Length of `control_hidden_states_scale`"
@@ -573,16 +658,26 @@ class WanVACEModel(WanModel):
     with self.conditional_named_scope("patch_embedding"):
       hidden_states = self.patch_embedding(hidden_states)
       hidden_states = jax.lax.collapse(hidden_states, 1, -1)
+      self.debug_finite("main_patch_embedding", hidden_states)
 
       control_hidden_states = self.vace_patch_embedding(control_hidden_states)
       control_hidden_states = jax.lax.collapse(control_hidden_states, 1, -1)
-    control_hidden_states_padding = jnp.zeros((
-        batch_size,
-        control_hidden_states.shape[1],
-        hidden_states.shape[2] - control_hidden_states.shape[2],
-    ))
-
-    control_hidden_states = jnp.concatenate([control_hidden_states, control_hidden_states_padding], axis=2)
+      self.debug_finite("vace_patch_embedding", control_hidden_states)
+    if control_hidden_states.shape[1] < hidden_states.shape[1]:
+      control_hidden_states_padding = jnp.zeros(
+          (
+              batch_size,
+              hidden_states.shape[1] - control_hidden_states.shape[1],
+              control_hidden_states.shape[2],
+          ),
+          dtype=control_hidden_states.dtype,
+      )
+      control_hidden_states = jnp.concatenate([control_hidden_states, control_hidden_states_padding], axis=1)
+    elif control_hidden_states.shape[1] > hidden_states.shape[1]:
+      raise ValueError(
+          "VACE control sequence is longer than the noisy latent sequence: "
+          f"{control_hidden_states.shape[1]} > {hidden_states.shape[1]}"
+      )
 
     # Condition embedder is a FC layer.
     with self.conditional_named_scope("condition_embedder"):
@@ -596,16 +691,76 @@ class WanVACEModel(WanModel):
           timestep, encoder_hidden_states, encoder_hidden_states_image, skip_embeddings=(kv_cache is not None)
       )
       timestep_proj = timestep_proj.reshape(timestep_proj.shape[0], 6, -1)
+      self.debug_finite("temb", temb)
+      self.debug_finite("timestep_proj", timestep_proj)
+      self.debug_finite("encoder_hidden_states", encoder_hidden_states)
 
     if encoder_hidden_states_image is not None:
       raise NotImplementedError("img2vid is not yet implemented.")
 
-    if self.scan_layers:
-      raise NotImplementedError("scan_layers is not supported yet")
-    else:
-      vace_kv_cache, main_kv_cache = kv_cache if kv_cache is not None else (None, None)
+    vace_kv_cache, main_kv_cache = kv_cache if kv_cache is not None else (None, None)
+    vace_base_hidden_states = hidden_states
 
-      # Prepare VACE hints
+    if self.scan_layers:
+      control_scales = control_hidden_states_scale.astype(hidden_states.dtype)
+      layer_indices = jnp.arange(self.num_layers, dtype=jnp.int32)
+
+      def scan_fn(carry, block_input):
+        hidden_states_carry, control_hidden_states_carry, rngs_carry = carry
+        if main_kv_cache is not None:
+          main_block, vace_block, main_layer_kv_cache, vace_layer_kv_cache, layer_idx, control_scale = block_input
+        else:
+          main_block, vace_block, layer_idx, control_scale = block_input
+          main_layer_kv_cache = None
+          vace_layer_kv_cache = None
+
+        input_projection_scale = (layer_idx == 0).astype(control_hidden_states_carry.dtype)
+        conditioning_states, control_hidden_states_out = vace_block(
+            hidden_states=vace_base_hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            control_hidden_states=control_hidden_states_carry,
+            temb=timestep_proj,
+            rotary_emb=rotary_emb,
+            kv_cache=vace_layer_kv_cache,
+            encoder_attention_mask=encoder_attention_mask,
+            deterministic=deterministic,
+            rngs=rngs_carry,
+            input_projection_scale=input_projection_scale,
+        )
+
+        hidden_states_out = main_block(
+            hidden_states_carry,
+            encoder_hidden_states,
+            timestep_proj,
+            rotary_emb,
+            deterministic,
+            rngs_carry,
+            encoder_attention_mask=encoder_attention_mask,
+            cached_kv=main_layer_kv_cache,
+        )
+        hidden_states_out = hidden_states_out + conditioning_states * control_scale.astype(conditioning_states.dtype)
+        return (hidden_states_out, control_hidden_states_out, rngs_carry), None
+
+      rematted_block_forward = self.gradient_checkpoint.apply(
+          scan_fn,
+          self.names_which_can_be_saved,
+          self.names_which_can_be_offloaded,
+          prevent_cse=not self.scan_layers,
+      )
+      initial_carry = (hidden_states, control_hidden_states, rngs)
+      if main_kv_cache is not None:
+        scan_input = (self.blocks, self.vace_blocks, main_kv_cache, vace_kv_cache, layer_indices, control_scales)
+      else:
+        scan_input = (self.blocks, self.vace_blocks, layer_indices, control_scales)
+      final_carry, _ = nnx.scan(
+          rematted_block_forward,
+          length=self.num_layers,
+          in_axes=(nnx.Carry, 0),
+          out_axes=(nnx.Carry, 0),
+      )(initial_carry, scan_input)
+      hidden_states, _, _ = final_carry
+    else:
+      # Prepare VACE hints.
       control_hidden_states_list = []
       for i, vace_block in enumerate(self.vace_blocks):
         layer_kv_cache = None
@@ -632,10 +787,14 @@ class WanVACEModel(WanModel):
             prevent_cse=not self.scan_layers,
         )
         conditioning_states, control_hidden_states = rematted_layer_forward(hidden_states, control_hidden_states, rngs)
-        control_hidden_states_list.append((conditioning_states, control_hidden_states_scale[i]))
+        self.debug_finite(f"vace_block_{i}_conditioning", conditioning_states)
+        self.debug_finite(f"vace_block_{i}_state", control_hidden_states)
+        control_hidden_states_list.append(conditioning_states)
 
-      control_hidden_states_list = control_hidden_states_list[::-1]
-
+      control_hidden_states_list = [
+          (control_hidden_states_list[i], control_hidden_states_scale[i])
+          for i in range(len(control_hidden_states_list) - 1, -1, -1)
+      ]
       for i, block in enumerate(self.blocks):
         layer_kv_cache = None
         if main_kv_cache is not None:
@@ -660,16 +819,21 @@ class WanVACEModel(WanModel):
             prevent_cse=not self.scan_layers,
         )
         hidden_states = rematted_layer_forward(hidden_states, rngs)
+        self.debug_finite(f"main_block_{i}", hidden_states)
         if i in self.config.vace_layers:
           control_hint, scale = control_hidden_states_list.pop()
+          self.debug_finite(f"control_hint_layer_{i}", control_hint)
           hidden_states = hidden_states + control_hint * scale
+          self.debug_finite(f"main_block_{i}_after_vace", hidden_states)
 
     # 6. Output norm, projection & unpatchify
     shift, scale = jnp.split(self.scale_shift_table + jnp.expand_dims(temb, axis=1), 2, axis=1)
 
     hidden_states = (self.norm_out(hidden_states.astype(jnp.float32)) * (1 + scale) + shift).astype(hidden_states.dtype)
+    self.debug_finite("final_norm", hidden_states)
     with jax.named_scope("proj_out"):
       hidden_states = self.proj_out(hidden_states)  # Linear layer.
+    self.debug_finite("final_proj_out", hidden_states)
 
     hidden_states = hidden_states.reshape(
         batch_size,

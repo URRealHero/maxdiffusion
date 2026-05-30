@@ -84,8 +84,9 @@ def create_sharded_logical_transformer(
   wan_config["enable_jax_named_scopes"] = config.enable_jax_named_scopes
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
+  wan_config["debug_vace_numerics"] = str(getattr(config, "vace_debug_print", False)).lower() == "true"
 
-  wan_config["scan_layers"] = False
+  wan_config["scan_layers"] = config.scan_layers
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.

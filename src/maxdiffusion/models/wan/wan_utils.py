@@ -91,9 +91,10 @@ def rename_for_custom_trasformer(key):
 def get_key_and_value(pt_tuple_key, tensor, flax_state_dict, random_flax_state_dict, scan_layers, num_layers=40):
   block_index = None
   if scan_layers:
-    if len(pt_tuple_key) >= 2 and pt_tuple_key[0] == "blocks":
+    if len(pt_tuple_key) >= 2 and pt_tuple_key[0] in ("blocks", "vace_blocks"):
+      block_collection = pt_tuple_key[0]
       block_index = int(pt_tuple_key[1])
-      pt_tuple_key = ("blocks",) + pt_tuple_key[2:]
+      pt_tuple_key = (block_collection,) + pt_tuple_key[2:]
 
   flax_key, flax_tensor = rename_key_and_reshape_tensor(pt_tuple_key, tensor, random_flax_state_dict, scan_layers)
 

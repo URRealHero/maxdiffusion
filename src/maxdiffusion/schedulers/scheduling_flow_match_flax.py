@@ -228,13 +228,21 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     )
 
   def _calculate_training_weights(self, timesteps: jnp.ndarray, num_inference_steps: int) -> jnp.ndarray:
-    """Calculates the training weight for a given timestep."""
-    x = timesteps
+    """Calculates finite per-sample training weights for sampled timesteps.
+
+    The original batch-normalized form divided by ``sum(y - min(y))``. For a
+    single-sample batch, or any batch where all sampled timesteps receive the
+    same score, that denominator is zero and makes the loss NaN. Normalize over
+    the current batch to mean 1 when possible, otherwise fall back to uniform
+    weights.
+    """
+    x = timesteps.astype(jnp.float32)
     y = jnp.exp(-2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2)
     y_shifted = y - jnp.min(y)
-    bsmntw_weighing = y_shifted * (num_inference_steps / jnp.sum(y_shifted))
-    linear_timesteps_weights = bsmntw_weighing
-    return linear_timesteps_weights
+    denom = jnp.sum(y_shifted)
+    batch_size = jnp.maximum(jnp.asarray(timesteps.size, dtype=jnp.float32), 1.0)
+    normalized = y_shifted * (batch_size / jnp.maximum(denom, 1e-12))
+    return jnp.where(denom > 0, normalized, jnp.ones_like(y_shifted))
 
   def sample_timesteps(self, timestep_rng, batch_size):
     # 1. Sample continuous timesteps t in [0, 1]
