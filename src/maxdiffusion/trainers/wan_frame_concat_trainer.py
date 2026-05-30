@@ -152,6 +152,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     bsz = latents.shape[0]
     cond_frames = cond_latents.shape[2]
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
+    timesteps = jnp.reshape(timesteps, (bsz,))
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
     hidden_states = jnp.concatenate([cond_latents, noisy_latents], axis=2)
