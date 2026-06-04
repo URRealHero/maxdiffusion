@@ -378,6 +378,9 @@ debug_precompile_train_step: False
 debug_disable_async_next_batch: False
 frame_concat_debug_print: False
 enable_generate_video_for_eval: False # This will increase the used TPU memory.
+# Log generated eval samples into TensorBoard media summaries. MP4s are still uploaded separately.
+tensorboard_eval_video_max_outputs: 1
+tensorboard_eval_video_max_frames: 32
 eval_max_number_of_samples_in_bucket: 60 # The number of samples per bucket for evaluation. This is calculated by num_eval_samples / len(timesteps_list).
 
 enable_ssim: False

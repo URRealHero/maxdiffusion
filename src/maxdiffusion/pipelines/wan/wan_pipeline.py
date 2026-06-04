@@ -32,6 +32,7 @@ from ...max_utils import get_flash_block_sizes, get_precision, device_put_replic
 from ...models.wan.wan_utils import load_wan_transformer, load_wan_vae
 from ...models.wan.transformers.transformer_wan import WanModel
 from ...models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
+from ...models.wan.autoencoder_kl_wan_2p2 import AutoencoderKLWan2p2
 from maxdiffusion.video_processor import VideoProcessor
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler, UniPCMultistepSchedulerState
 from transformers import AutoTokenizer, UMT5EncoderModel
@@ -313,13 +314,14 @@ class WanPipeline:
       vae_logical_axis_rules: tuple = None,
   ):
     def create_model(rngs: nnx.Rngs, config: HyperParameters):
-      wan_vae = AutoencoderKLWan.from_config(
-          config.pretrained_model_name_or_path,
-          subfolder="vae",
-          rngs=rngs,
-          mesh=mesh,
-          dtype=jnp.float32,
-          weights_dtype=jnp.float32,
+      vae_cls = AutoencoderKLWan2p2 if config.model_name == "wan2.2" else AutoencoderKLWan
+      wan_vae = vae_cls.from_config(
+        config.pretrained_model_name_or_path,
+        subfolder="vae",
+        rngs=rngs,
+        mesh=mesh,
+        dtype=jnp.float32,
+        weights_dtype=jnp.float32,
       )
       return wan_vae
 
@@ -669,7 +671,7 @@ class WanPipeline:
   @classmethod
   def _create_common_components(cls, config, vae_only=False, i2v=False):
     devices_array = max_utils.create_device_mesh(config)
-    mesh = Mesh(devices_array, config.mesh_axes)
+    mesh = Mesh(devices_array, config.mesh_axes) # (shape, name)
 
     vae_spatial = getattr(config, "vae_spatial", -1)
     total_devices = math.prod(devices_array.shape)

@@ -20,16 +20,16 @@ metrics_file: "" # for testing, local file that stores scalar metrics. If empty,
 write_metrics: True
 
 timing_metrics_file: "" # for testing, local file that stores function timing metrics such as state creation, compilation. If empty, no metrics are written.
-write_timing_metrics: True 
+write_timing_metrics: True
 
 gcs_metrics: False
 # If true save config to GCS in {base_output_directory}/{run_name}/
 save_config_to_gcs: False
 log_period: 100
 
-pretrained_model_name_or_path: 'Wan-AI/Wan2.1-T2V-14B-Diffusers'
-model_name: wan2.1
-model_type: 'T2V'
+pretrained_model_name_or_path: 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'
+model_name: wan2.2
+model_type: 'TI2V'
 
 # Overrides the transformer from pretrained_model_name_or_path
 wan_transformer_pretrained_model_name_or_path: ''
@@ -49,7 +49,6 @@ compile_text_encoder: False
 
 # Replicates vae across devices instead of using the model's sharding annotations for sharding.
 replicate_vae: False
-vae_spatial: -1 # default to total_device * 2 // (dp)
 
 # matmul and conv precision from https://jax.readthedocs.io/en/latest/jax.lax.html#jax.lax.Precision
 # Options are "DEFAULT", "HIGH", "HIGHEST"
@@ -58,9 +57,6 @@ vae_spatial: -1 # default to total_device * 2 // (dp)
 precision: "DEFAULT"
 # Use jax.lax.scan for transformer layers
 scan_layers: True
-# Use jax.lax.scan for the diffusion loop (non-cache path only).
-# Note: Enabling this will disable per-step profiling.
-scan_diffusion_loop: False
 
 # if False state is not jitted and instead replicate is called. This is good for debugging on single host
 # It must be True for multi-host.
@@ -69,11 +65,10 @@ jit_initializers: True
 # Set true to load weights from pytorch
 from_pt: True
 split_head_dim: True
-attention: 'flash' # Supported attention: dot_product, flash, tokamax_flash, cudnn_flash_te, ring, tokamax_ring, ulysses, ulysses_custom
+attention: 'flash' # Supported attention: dot_product, flash, cudnn_flash_te, ring, ulysses
 use_base2_exp: True
 use_experimental_scheduler: True
-flash_min_seq_length: 4096
-dropout: 0.0
+flash_min_seq_length: 0
 
 # If mask_padding_tokens is True, we pass in segment ids to splash attention to avoid attending to padding tokens.
 # Else we do not pass in segment ids and on vpu bound hardware like trillium this is faster.
@@ -84,40 +79,18 @@ mask_padding_tokens: True
 # 2. attention_sharding_uniform = False : Heads are sharded uniformly across devices for self attention while sequence is sharded
 #    in cross attention q.
 attention_sharding_uniform: True
+dropout: 0.0
 
-# flash_block_sizes: {
-#   "block_q" : 512,
-#   "block_kv_compute" : 512,
-#   "block_kv" : 512,
-#   "block_q_dkv" : 512,
-#   "block_kv_dkv" : 512,
-#   "block_kv_dkv_compute" : 512,
-#   "block_q_dq" : 512,
-#   "block_kv_dq" : 512,
-#   "use_fused_bwd_kernel": False,
-# }
-# Use on v6e
-# flash_block_sizes: {
-#   "block_q" : 3024,
-#   "block_kv_compute" : 1024,
-#   "block_kv" : 2048,
-#   "block_q_dkv" : 3024,
-#   "block_kv_dkv" : 2048,
-#   "block_kv_dkv_compute" : 1024,
-#   "block_q_dq" : 3024,
-#   "block_kv_dq" : 2048,
-#   "use_fused_bwd_kernel": False,
-# }
-# Use on v5p
 flash_block_sizes: {
-  "block_q" : 3024,
-  "block_kv_compute" : 1024,
-  "block_kv" : 2048,
-  "block_q_dkv" : 1024,
-  "block_kv_dkv" : 3072,
-  "block_kv_dkv_compute" : 256,
-  "block_q_dq" : 1024,
-  "block_kv_dq" : 3072
+  "block_q" : 512,
+  "block_kv_compute" : 512,
+  "block_kv" : 512,
+  "block_q_dkv" : 512,
+  "block_kv_dkv" : 512,
+  "block_kv_dkv_compute" : 512,
+  "block_q_dq" : 512,
+  "block_kv_dq" : 512,
+  "use_fused_bwd_kernel": False,
 }
 # GroupNorm groups
 norm_num_groups: 32
@@ -210,9 +183,9 @@ data_sharding: [['data', 'fsdp', 'context', 'tensor']]
 # value to auto-shard based on available slices and devices.
 # By default, product of the DCN axes should equal number of slices
 # and product of the ICI axes should equal number of devices per slice.
-dcn_data_parallelism: 1
+dcn_data_parallelism: 1  # recommended DCN axis to be auto-sharded
 dcn_fsdp_parallelism: 1
-dcn_context_parallelism: -1  # recommended DCN axis to be auto-sharded
+dcn_context_parallelism: -1
 dcn_tensor_parallelism: 1
 ici_data_parallelism: 1
 ici_fsdp_parallelism: 1
@@ -225,28 +198,7 @@ allow_split_physical_axes: False
 # Replace with dataset path or train_data_dir. One has to be set.
 dataset_name: 'diffusers/pokemon-gpt4-captions'
 train_split: 'train'
-dataset_type: 'tfrecord'  # Options: 'tfrecord', 'hf', 'tf', 'grain', 'synthetic'
-# ==============================================================================
-# Synthetic Data Configuration (only used when dataset_type='synthetic')
-# ==============================================================================
-# To use synthetic data for testing/debugging without real datasets:
-# 1. Set dataset_type: 'synthetic' above
-# 2. Optionally set synthetic_num_samples (null=infinite, or a number like 10000)
-# 3. Optionally override dimensions with synthetic_override_* flags below
-#
-# synthetic_num_samples: null  # null for infinite, or set a number
-#
-# Optional dimension overrides (comment out to use pipeline/config values):
-# synthetic_override_height: 720
-# synthetic_override_width: 1280
-# synthetic_override_num_frames: 121
-# synthetic_override_max_sequence_length: 512
-# synthetic_override_text_embed_dim: 4096
-# synthetic_override_num_channels_latents: 16
-# synthetic_override_vae_scale_factor_spatial: 8
-# synthetic_override_vae_scale_factor_temporal: 4
-# ==============================================================================
-
+dataset_type: 'tfrecord'
 cache_latents_text_encoder_outputs: True
 # cache_latents_text_encoder_outputs only apply to dataset_type="tf",
 # only apply to small dataset that fits in memory
@@ -316,7 +268,7 @@ num_eval_samples: 420
 
 warmup_steps_fraction: 0.1
 learning_rate_schedule_steps: -1 # By default the length of the schedule is set to the number of steps.
-save_optimizer: False
+save_optimizer: True
 
 # However you may choose a longer schedule (learning_rate_schedule_steps > steps), in which case the training will end before
 # dropping fully down. Or you may choose a shorter schedule, where the unspecified steps will have a learning rate of 0.
@@ -346,31 +298,31 @@ prompt: "A cat and a dog baking a cake together in a kitchen. The cat is careful
 prompt_2: "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
 negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 do_classifier_free_guidance: True
-height: 720
-width: 1280
+height: 480
+width: 832
 num_frames: 81
 guidance_scale: 5.0
 flow_shift: 5.0
 
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
-# Skips the unconditional forward pass on ~35% of steps via residual compensation.
-# See: FasterCache (Lv et al. 2024), WAN 2.1 paper §4.4.2
 use_cfg_cache: False
-
-# Batch positive and negative prompts in text encoder to save compute.
-use_batched_text_encoder: False
-
 use_kv_cache: False
 use_magcache: False
 magcache_thresh: 0.12
 magcache_K: 2
 retention_ratio: 0.2
-mag_ratios_base: [1.0, 1.0, 1.02504, 1.03017, 1.00025, 1.00251, 0.9985, 0.99962, 0.99779, 0.99771, 0.9966, 0.99658, 0.99482, 0.99476, 0.99467, 0.99451, 0.99664, 0.99656, 0.99434, 0.99431, 0.99533, 0.99545, 0.99468, 0.99465, 0.99438, 0.99434, 0.99516, 0.99517, 0.99384, 0.9938, 0.99404, 0.99401, 0.99517, 0.99516, 0.99409, 0.99408, 0.99428, 0.99426, 0.99347, 0.99343, 0.99418, 0.99416, 0.99271, 0.99269, 0.99313, 0.99311, 0.99215, 0.99215, 0.99218, 0.99215, 0.99216, 0.99217, 0.99163, 0.99161, 0.99138, 0.99135, 0.98982, 0.9898, 0.98996, 0.98995, 0.9887, 0.98866, 0.98772, 0.9877, 0.98767, 0.98765, 0.98573, 0.9857, 0.98501, 0.98498, 0.9838, 0.98376, 0.98177, 0.98173, 0.98037, 0.98035, 0.97678, 0.97677, 0.97546, 0.97543, 0.97184, 0.97183, 0.96711, 0.96708, 0.96349, 0.96345, 0.95629, 0.95625, 0.94926, 0.94929, 0.93964, 0.93961, 0.92511, 0.92504, 0.90693, 0.90678, 0.8796, 0.87945, 0.86111, 0.86189]
+
+# Batch positive and negative prompts in text encoder to save compute.
+use_batched_text_encoder: False
+
+# Use jax.lax.scan for the diffusion loop (non-cache path only).
+# Note: Enabling this will disable per-step profiling.
+scan_diffusion_loop: False
 
 # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
 guidance_rescale: 0.0
-num_inference_steps: 50
-fps: 16
+num_inference_steps: 30
+fps: 24
 save_final_checkpoint: False
 
 # SDXL Lightning parameters
@@ -385,20 +337,12 @@ enable_lora: False
 # Values are lists to support multiple LoRA loading during inference in the future.
 lora_config: {
   rank: [64],
-  lora_model_name_or_path: ["lightx2v/Wan2.1-Distill-Loras"],
-  weight_name: ["wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors"],
-  adapter_name: ["wan21-distill-lora"],
+  lora_model_name_or_path: [""],
+  weight_name: [""],
+  adapter_name: [""],
   scale: [1.0],
   from_pt: []
 }
-# Ex with values:
-# lora_config : {
-#   lora_model_name_or_path: ["ByteDance/Hyper-SD"],
-#   weight_name: ["Hyper-SDXL-2steps-lora.safetensors"],
-#   adapter_name: ["hyper-sdxl"],
-#   scale: [0.7],
-#   from_pt: [True]
-# }
 
 enable_mllog: False
 
@@ -421,6 +365,18 @@ qwix_module_path: ".*"
 # Eval model on per eval_every steps. -1 means don't eval.
 eval_every: -1
 eval_data_dir: ""
+
+# VACE debug: run forward/loss only and skip grad/update.
+vace_debug_forward_only: False
+vace_debug_print: False
+# Training-loop debug: log around first batch, JIT dispatch, execution barriers, metrics, and async input waits.
+debug_training_loop: False
+debug_training_loop_wait_seconds: 60
+# Debug-only: lower/compile the train step before the loop so compile/load is separated from first execution.
+debug_precompile_train_step: False
+# Debug-only: load the next batch synchronously after the step instead of prefetching in a thread.
+debug_disable_async_next_batch: False
+frame_concat_debug_print: False
 enable_generate_video_for_eval: False # This will increase the used TPU memory.
 # Log generated eval samples into TensorBoard media summaries. MP4s are still uploaded separately.
 tensorboard_eval_video_max_outputs: 1

@@ -421,7 +421,13 @@ class BaseWanTrainer(abc.ABC):
         if self.config.eval_every > 0 and (step + 1) % self.config.eval_every == 0:
           if self.config.enable_generate_video_for_eval:
             pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
-            inference_generate_video(self.config, pipeline, filename_prefix=f"{step+1}-train_steps-")
+            inference_generate_video(
+                self.config,
+                pipeline,
+                filename_prefix=f"{step+1}-train_steps-",
+                writer=writer,
+                step=step + 1,
+            )
           if self.config.eval_data_dir:
             # Re-create the iterator each time you start evaluation to reset it
             # This assumes your data loading logic can be called to get a fresh iterator.

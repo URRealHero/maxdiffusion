@@ -17,11 +17,13 @@ import jax
 import time
 import os
 import subprocess
+import numpy as np
 from maxdiffusion import pyconfig, max_logging, max_utils
 from maxdiffusion.checkpointing.wan_checkpointer_2_1 import WanCheckpointer2_1
 from maxdiffusion.checkpointing.wan_checkpointer_2_2 import WanCheckpointer2_2
 from maxdiffusion.checkpointing.wan_checkpointer_i2v_2p1 import WanCheckpointerI2V_2_1
 from maxdiffusion.checkpointing.wan_checkpointer_i2v_2p2 import WanCheckpointerI2V_2_2
+from maxdiffusion.checkpointing.wan_checkpointer_2_2_dense import WanCheckpointer2_2_Dense
 from absl import app
 from maxdiffusion.train_utils import transformer_engine_context
 from maxdiffusion.utils import export_to_video
@@ -53,9 +55,11 @@ def upload_video_to_gcs(output_dir: str, video_path: str):
     max_logging.log(f"Uploading {source_file_path} to {bucket_name}/{destination_blob_name}...")
     blob.upload_from_filename(source_file_path)
     max_logging.log(f"Upload complete {source_file_path}.")
+    return f"gs://{bucket_name}/{destination_blob_name}"
 
   except Exception as e:
     max_logging.log(f"An error occurred: {e}")
+    return None
 
 
 def delete_file(file_path: str):
@@ -67,6 +71,66 @@ def delete_file(file_path: str):
       max_logging.log(f"Error deleting file '{file_path}': {e}")
   else:
     max_logging.log(f"The file '{file_path}' does not exist.")
+
+
+def _prepare_video_for_tensorboard(video, max_frames):
+  """Converts a generated video to tensorboardX add_video format: N,T,C,H,W."""
+  video = np.asarray(video)
+  if video.ndim == 3:
+    video = video[None, ...]
+  if video.ndim != 4:
+    max_logging.log(f"Skipping TensorBoard video logging for unsupported shape: {video.shape}")
+    return None
+
+  # Accept either T,H,W,C or C,T,H,W.
+  if video.shape[-1] in (1, 3, 4):
+    video = video[..., :3]
+  elif video.shape[0] in (1, 3, 4):
+    video = np.transpose(video[:3], (1, 2, 3, 0))
+  else:
+    max_logging.log(f"Skipping TensorBoard video logging for ambiguous shape: {video.shape}")
+    return None
+
+  if max_frames > 0 and video.shape[0] > max_frames:
+    frame_ids = np.linspace(0, video.shape[0] - 1, max_frames).round().astype(np.int32)
+    video = video[frame_ids]
+
+  if np.issubdtype(video.dtype, np.floating):
+    video = np.clip(video, 0.0, 1.0) * 255.0
+  else:
+    video = np.clip(video, 0, 255)
+  video = video.astype(np.uint8)
+  return np.transpose(video, (0, 3, 1, 2))[None, ...]
+
+
+def _video_to_frame_grid(tb_video, columns=8):
+  # tb_video is N,T,C,H,W. Use first video and tile frames into an image strip/grid.
+  frames = np.transpose(tb_video[0], (0, 2, 3, 1))
+  rows = int(np.ceil(frames.shape[0] / columns))
+  pad = rows * columns - frames.shape[0]
+  if pad:
+    frames = np.concatenate([frames, np.zeros((pad, *frames.shape[1:]), dtype=frames.dtype)], axis=0)
+  row_images = []
+  for row in range(rows):
+    row_images.append(np.concatenate(frames[row * columns : (row + 1) * columns], axis=1))
+  return np.concatenate(row_images, axis=0)
+
+
+def _write_eval_video_to_tensorboard(writer, video, tag, step, fps, max_frames):
+  if writer is None or jax.process_index() != 0:
+    return
+  tb_video = _prepare_video_for_tensorboard(video, max_frames)
+  if tb_video is None:
+    return
+  try:
+    writer.add_video(tag, tb_video, global_step=step, fps=fps)
+  except Exception as e:  # Keep eval generation from failing because of logging.
+    max_logging.log(f"Failed to write eval video to TensorBoard, writing frame grid fallback: {e}")
+    try:
+      writer.add_image(f"{tag}_frames", _video_to_frame_grid(tb_video), global_step=step, dataformats="HWC")
+    except Exception as image_e:
+      max_logging.log(f"Failed to write eval frame grid to TensorBoard: {image_e}")
+  writer.flush()
 
 
 def get_git_commit_hash():
@@ -158,7 +222,7 @@ def call_pipeline(config, pipeline, prompt, negative_prompt):
       raise ValueError(f"Unsupported model_name for T2V in config: {model_key}")
 
 
-def inference_generate_video(config, pipeline, filename_prefix=""):
+def inference_generate_video(config, pipeline, filename_prefix="", writer=None, step=None):
   s0 = time.perf_counter()
   prompt = [config.prompt] * config.global_batch_size_to_train_on
   negative_prompt = [config.negative_prompt] * config.global_batch_size_to_train_on
@@ -174,13 +238,28 @@ def inference_generate_video(config, pipeline, filename_prefix=""):
     videos = outputs
 
   max_logging.log(f"video {filename_prefix}, compile time: {(time.perf_counter() - s0)}")
+  max_outputs = getattr(config, "tensorboard_eval_video_max_outputs", 1)
+  max_frames = getattr(config, "tensorboard_eval_video_max_frames", 32)
   for i in range(len(videos)):
     video_path = f"{filename_prefix}wan_output_{config.seed}_{i}.mp4"
     export_to_video(videos[i], video_path, fps=config.fps)
+    uploaded_video_path = None
     if config.output_dir.startswith("gs://"):
-      upload_video_to_gcs(os.path.join(config.output_dir, config.run_name), video_path)
-      # Delete local files to avoid storing too manys videos
+      uploaded_video_path = upload_video_to_gcs(os.path.join(config.output_dir, config.run_name), video_path)
+      # Delete local files to avoid storing too many videos.
       delete_file(f"./{video_path}")
+    if i < max_outputs:
+      tb_step = step if step is not None else 0
+      _write_eval_video_to_tensorboard(
+          writer,
+          videos[i],
+          tag=f"eval/generated_video_{i}",
+          step=tb_step,
+          fps=config.fps,
+          max_frames=max_frames,
+      )
+      if writer is not None and jax.process_index() == 0 and uploaded_video_path:
+        writer.add_text(f"eval/generated_video_{i}_path", uploaded_video_path, global_step=tb_step)
   return
 
 
@@ -207,6 +286,8 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
     elif model_key == WAN2_2:
       if model_type == "I2V":
         checkpoint_loader = WanCheckpointerI2V_2_2(config=config)
+      elif model_type == "TI2V":
+        checkpoint_loader = WanCheckpointer2_2_Dense(config=config)
       else:
         checkpoint_loader = WanCheckpointer2_2(config=config)
     else:
