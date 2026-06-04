@@ -449,8 +449,27 @@ def load_wan_animate_transformer(
     jax.clear_caches()
     return flax_state_dict
 
+def _remap_wan_2p2_vae_key(key: str) -> str:
+  """Map Wan2.2 high-compression VAE diffusers keys to the NNX VAE tree."""
+  key = key.replace("downsamplers_", "downsamplers.")
+  key = key.replace("upsamplers_", "upsamplers.")
 
-def load_wan_vae(pretrained_model_name_or_path: str, eval_shapes: dict, device: str, hf_download: bool = True):
+  # Diffusers stores samplers separately; AutoencoderKLWan2p2 appends them
+  # as the final residual block entry in each down/up block.
+  key = key.replace(".downsamplers.0.", ".resnets.2.")
+  key = key.replace(".downsampler.", ".resnets.2.")
+  key = key.replace(".upsamplers.0.", ".resnets.3.")
+  key = key.replace(".upsampler.", ".resnets.3.")
+  return key
+
+
+def load_wan_vae(
+    pretrained_model_name_or_path: str,
+    eval_shapes: dict,
+    device: str,
+    hf_download: bool = True,
+    is_wan_2p2: bool = False,
+):
   device = jax.devices(device)[0]
   subfolder = "vae"
   filename = "diffusion_pytorch_model.safetensors"
@@ -471,6 +490,8 @@ def load_wan_vae(pretrained_model_name_or_path: str, eval_shapes: dict, device: 
       cpu = jax.local_devices(backend="cpu")[0]
       for pt_key, tensor in tensors.items():
         renamed_pt_key = rename_key(pt_key)
+        if is_wan_2p2:
+          renamed_pt_key = _remap_wan_2p2_vae_key(renamed_pt_key)
         # Order matters
         renamed_pt_key = renamed_pt_key.replace("up_blocks_", "up_blocks.")
         renamed_pt_key = renamed_pt_key.replace("mid_block_", "mid_block.")

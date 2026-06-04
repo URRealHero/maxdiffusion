@@ -314,7 +314,7 @@ class WanPipeline:
       vae_logical_axis_rules: tuple = None,
   ):
     def create_model(rngs: nnx.Rngs, config: HyperParameters):
-      vae_cls = AutoencoderKLWan2p2 if config.model_name == "wan2.2" else AutoencoderKLWan
+      vae_cls = AutoencoderKLWan2p2 if (config.model_name == "wan2.2" and config.model_type == "TI2V" or config.model_type == "TI2V-CC") else AutoencoderKLWan
       wan_vae = vae_cls.from_config(
         config.pretrained_model_name_or_path,
         subfolder="vae",
@@ -341,7 +341,12 @@ class WanPipeline:
     # 4. Load pretrained weights and move them to device using the state shardings from (3) above.
     # This helps with loading sharded weights directly into the accelerators without fist copying them
     # all to one device and then distributing them, thus using low HBM memory.
-    params = load_wan_vae(config.pretrained_model_name_or_path, params, "cpu")
+    params = load_wan_vae(
+      config.pretrained_model_name_or_path,
+      params,
+      "cpu",
+      is_wan_2p2=config.model_type == "TI2V",
+    )
     params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
     for path, val in flax.traverse_util.flatten_dict(params).items():
       sharding = logical_state_sharding[path].value
