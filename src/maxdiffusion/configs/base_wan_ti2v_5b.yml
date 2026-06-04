@@ -136,6 +136,9 @@ skip_jax_distributed_system: False
 
 # Parallelism
 mesh_axes: ['data', 'fsdp', 'context', 'tensor']
+# Number of devices used along the VAE spatial axis. 16 divides WAN 2.2 TI2V
+# intermediate sizes at 480x832, e.g. 240 and 416. Use 4 on v5p/v6e slices.
+vae_spatial: -1
 
 # batch : batch dimension of data and activations
 # hidden :

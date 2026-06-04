@@ -38,38 +38,38 @@ class WanPipeline2_2_Dense(WanPipeline):
   def _load_and_init(cls, config, restored_checkpoint=None, vae_only=False, load_transformer=True):
     common_components = cls._create_common_components(config, vae_only)
     transformer = None
-    if not vae_only:
-      if load_transformer:
-        transformer = super().load_transformer(
-            devices_array=common_components["devices_array"],
-            mesh=common_components["mesh"],
-            rngs=common_components["rngs"],
-            config=config,
-            restored_checkpoint=restored_checkpoint,
-            subfolder="transformer",
-        )
+    if not vae_only and load_transformer:
+      transformer = super().load_transformer(
+          devices_array=common_components["devices_array"],
+          mesh=common_components["mesh"],
+          rngs=common_components["rngs"],
+          config=config,
+          restored_checkpoint=restored_checkpoint,
+          subfolder="transformer",
+      )
 
-        pipeline = cls(
-            tokenizer=common_components["tokenizer"],
-            text_encoder=common_components["text_encoder"],
-            transformer=transformer,
-            vae=common_components["vae"],
-            vae_cache=common_components["vae_cache"],
-            scheduler=common_components["scheduler"],
-            scheduler_state=common_components["scheduler_state"],
-            devices_array=common_components["devices_array"],
-            mesh=common_components["mesh"],
-            vae_mesh=common_components["vae_mesh"],
-            vae_logical_axis_rules=common_components["vae_logical_axis_rules"],
-            config=config,
-        )
+    pipeline = cls(
+        tokenizer=common_components["tokenizer"],
+        text_encoder=common_components["text_encoder"],
+        transformer=transformer,
+        vae=common_components["vae"],
+        vae_cache=common_components["vae_cache"],
+        scheduler=common_components["scheduler"],
+        scheduler_state=common_components["scheduler_state"],
+        devices_array=common_components["devices_array"],
+        mesh=common_components["mesh"],
+        vae_mesh=common_components["vae_mesh"],
+        vae_logical_axis_rules=common_components["vae_logical_axis_rules"],
+        config=config,
+    )
 
     return pipeline, transformer
 
   @classmethod
   def from_pretrained(cls, config: HyperParameters, vae_only=False, load_transformer=True):
     pipeline, transformer = cls._load_and_init(config, None, vae_only, load_transformer)
-    pipeline.transformer = cls.quantize_transformer(config, transformer, pipeline, pipeline.mesh)
+    if transformer is not None:
+      pipeline.transformer = cls.quantize_transformer(config, transformer, pipeline, pipeline.mesh)
     return pipeline
 
   @classmethod
