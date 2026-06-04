@@ -187,6 +187,25 @@ def call_pipeline(config, pipeline, prompt, negative_prompt):
       )
     else:
       raise ValueError(f"Unsupported model_name for I2V in config: {model_key}")
+  elif model_type in ("TI2V", "TI2V-CC"):
+    if model_key == WAN2_2:
+      return pipeline(
+          prompt=prompt,
+          negative_prompt=negative_prompt,
+          height=config.height,
+          width=config.width,
+          num_frames=config.num_frames,
+          num_inference_steps=config.num_inference_steps,
+          guidance_scale=config.guidance_scale,
+          use_cfg_cache=config.use_cfg_cache,
+          use_magcache=config.use_magcache,
+          magcache_thresh=config.magcache_thresh,
+          magcache_K=config.magcache_K,
+          retention_ratio=config.retention_ratio,
+          use_kv_cache=config.use_kv_cache,
+      )
+    else:
+      raise ValueError(f"Unsupported model_name for TI2V in config: {model_key}")
   elif model_type == "T2V":
     if model_key == WAN2_1:
       return pipeline(
@@ -220,6 +239,8 @@ def call_pipeline(config, pipeline, prompt, negative_prompt):
       )
     else:
       raise ValueError(f"Unsupported model_name for T2V in config: {model_key}")
+  else:
+    raise ValueError(f"Unsupported model_type in config: {model_type}")
 
 
 def inference_generate_video(config, pipeline, filename_prefix="", writer=None, step=None):

@@ -313,8 +313,11 @@ class WanPipeline:
       config: HyperParameters,
       vae_logical_axis_rules: tuple = None,
   ):
+    
+    use_wan_2p2_vae = config.model_name == "wan2.2" and config.model_type in ("TI2V", "TI2V-CC")
+    
     def create_model(rngs: nnx.Rngs, config: HyperParameters):
-      vae_cls = AutoencoderKLWan2p2 if (config.model_name == "wan2.2" and config.model_type == "TI2V" or config.model_type == "TI2V-CC") else AutoencoderKLWan
+      vae_cls = AutoencoderKLWan2p2 if use_wan_2p2_vae else AutoencoderKLWan
       wan_vae = vae_cls.from_config(
         config.pretrained_model_name_or_path,
         subfolder="vae",
@@ -345,7 +348,7 @@ class WanPipeline:
       config.pretrained_model_name_or_path,
       params,
       "cpu",
-      is_wan_2p2=config.model_type == "TI2V",
+      is_wan_2p2=use_wan_2p2_vae,
     )
     params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
     for path, val in flax.traverse_util.flatten_dict(params).items():
