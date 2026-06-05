@@ -139,12 +139,15 @@ def train_step(state, data, rng, scheduler_state, scheduler, config):
 
 def _finite_fraction(tree):
   leaves = jax.tree_util.tree_leaves(tree)
-  finite = jnp.array(0, dtype=jnp.int32)
-  total = jnp.array(0, dtype=jnp.int32)
+  finite = jnp.array(0.0, dtype=jnp.float32)
+  total = jnp.array(0.0, dtype=jnp.float32)
+
   for leaf in leaves:
-    finite = finite + jnp.sum(jnp.isfinite(leaf))
-    total = total + leaf.size
-  return finite.astype(jnp.float32) / jnp.maximum(total, 1).astype(jnp.float32)
+    is_finite = jnp.isfinite(leaf)
+    finite = finite + jnp.sum(is_finite.astype(jnp.float32))
+    total = total + jnp.asarray(leaf.size, dtype=jnp.float32)
+
+  return finite / jnp.maximum(total, jnp.array(1.0, dtype=jnp.float32))
 
 
 def _tree_max_abs(tree):
@@ -174,6 +177,16 @@ def _tree_path_to_str(path):
       pieces.append(str(getattr(entry, "key", getattr(entry, "name", entry))))
     return ".".join(pieces)
 
+def _tree_all_finite(tree):
+  leaves = jax.tree_util.tree_leaves(tree)
+  if not leaves:
+    return jnp.array(True)
+
+  all_finite = jnp.array(True)
+  for leaf in leaves:
+    all_finite = all_finite & jnp.all(jnp.isfinite(leaf))
+
+  return all_finite
 
 def _make_trainable_grad_mask(grads, config):
   substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
@@ -211,12 +224,15 @@ def _restore_frozen_params(old_state, new_state, trainable_mask):
 def _mask_fraction(trainable_mask):
   if trainable_mask is None:
     return jnp.array(1.0, dtype=jnp.float32)
-  trainable = jnp.array(0, dtype=jnp.int32)
-  total = jnp.array(0, dtype=jnp.int32)
+
+  trainable = jnp.array(0.0, dtype=jnp.float32)
+  total = jnp.array(0.0, dtype=jnp.float32)
+
   for leaf in jax.tree_util.tree_leaves(trainable_mask):
-    trainable = trainable + jnp.sum(leaf)
-    total = total + leaf.size
-  return trainable.astype(jnp.float32) / jnp.maximum(total, 1).astype(jnp.float32)
+    trainable = trainable + jnp.sum(leaf.astype(jnp.float32))
+    total = total + jnp.asarray(leaf.size, dtype=jnp.float32)
+
+  return trainable / jnp.maximum(total, jnp.array(1.0, dtype=jnp.float32))
 
 
 def _debug_print_trainable_paths(params, config):
@@ -311,6 +327,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   raw_max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
   raw_max_abs_grad = _tree_max_abs(grads)
   raw_grads_finite_frac = _finite_fraction(grads)
+  raw_grads_all_finite = _tree_all_finite(grads)
   trainable_grad_mask = _make_trainable_grad_mask(grads, config)
   trainable_param_fraction = _mask_fraction(trainable_grad_mask)
   grads = _apply_trainable_grad_mask(grads, trainable_grad_mask)
@@ -318,11 +335,9 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   max_abs_grad = _tree_max_abs(grads)
   grads_finite_frac = _finite_fraction(grads)
 
-  update_is_finite = jnp.isfinite(loss) & (grads_finite_frac == 1.0)
-  try:
-    skip_nonfinite_update = str(getattr(config, "frame_concat_skip_nonfinite_update")).lower() == "true"
-  except (AttributeError, ValueError):
-    skip_nonfinite_update = False
+  grads_all_finite = _tree_all_finite(grads)
+  update_is_finite = jnp.isfinite(loss) & grads_all_finite
+  skip_nonfinite_update = _as_bool(getattr(config, "frame_concat_skip_nonfinite_update", False))
 
   if skip_nonfinite_update:
     new_state = jax.lax.cond(
@@ -337,14 +352,15 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   new_state = _restore_frozen_params(state, new_state, trainable_grad_mask)
 
   params_finite_frac_after_update = _finite_fraction(new_state.params)
+  params_all_finite_after_update = _tree_all_finite(new_state.params)
   params_max_abs_after_update = _tree_max_abs(new_state.params)
   update_skipped = jnp.asarray(skip_nonfinite_update, dtype=jnp.bool_) & ~update_is_finite
 
-  if str(getattr(config, "frame_concat_debug_print", False)).lower() == "true":
+  if _as_bool(getattr(config, "frame_concat_debug_print", False)):
     jax.debug.print(
         "FrameConcat debug: loss={loss} lat={lat} cond={cond} hidden={hidden} pred={pred} "
         "target={target} loss_tensor={loss_tensor} w=[{wmin},{wmax}] "
-        "raw_grad={raw_grad} raw_grad_max={raw_grad_max} trainable_frac={trainable_frac} "
+        "raw_grad={raw_grad} raw_grad_max={raw_grad_max} raw_grad_all={raw_grad_all} trainable_frac={trainable_frac} "
         "grad={grad} grad_max={grad_max} params_after={params_after} pred_max={pred_max} update_ok={update_ok} skipped={skipped}",
         loss=loss,
         lat=debug_metrics["debug/latents_finite_frac"],
@@ -357,6 +373,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
         wmax=debug_metrics["debug/training_weight_max"],
         raw_grad=raw_grads_finite_frac,
         raw_grad_max=raw_max_abs_grad,
+        raw_grad_all=raw_grads_all_finite,
         trainable_frac=trainable_param_fraction,
         grad=grads_finite_frac,
         grad_max=max_abs_grad,
@@ -374,10 +391,13 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           "debug/raw_max_grad_norm": raw_max_grad_norm,
           "debug/raw_max_abs_grad": raw_max_abs_grad,
           "debug/raw_grads_finite_frac": raw_grads_finite_frac,
+          "debug/raw_grads_all_finite": raw_grads_all_finite.astype(jnp.float32),
           "debug/trainable_param_fraction": trainable_param_fraction,
           "debug/grads_finite_frac": grads_finite_frac,
+          "debug/grads_all_finite": grads_all_finite.astype(jnp.float32),
           "debug/params_finite_frac_after_update": params_finite_frac_after_update,
           "debug/params_max_abs_after_update": params_max_abs_after_update,
+          "debug/params_all_finite_after_update": params_all_finite_after_update.astype(jnp.float32),
           "debug/update_is_finite": update_is_finite.astype(jnp.float32),
           "debug/update_skipped": update_skipped.astype(jnp.float32),
           **debug_metrics,

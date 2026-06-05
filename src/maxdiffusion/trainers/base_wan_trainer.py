@@ -230,7 +230,7 @@ class BaseWanTrainer(abc.ABC):
     with nn_partitioning.axis_rules(self.config.logical_axis_rules):
       pipeline, opt_state, step = self.checkpointer.load_checkpoint()
     restore_args = {}
-    if opt_state and step:
+    if opt_state is not None and step is not None and step > 0:
       restore_args = {"opt_state": opt_state, "step": step}
       del opt_state
     if self.config.enable_ssim:
@@ -313,11 +313,28 @@ class BaseWanTrainer(abc.ABC):
       state = TrainState.create(
           apply_fn=graphdef.apply, params=params, tx=optimizer, graphdef=graphdef, rest_of_state=rest_of_state
       )
+      restored_ckpt_step = 0
+
       if restore_args:
-        step = restore_args.get("step", 0)
-        max_logging.log(f"Restoring optimizer and resuming from step {step}")
-        state.replace(opt_state=restore_args.get("opt_state"), step=restore_args.get("step", 0))
-        del restore_args["opt_state"]
+        restored_ckpt_step = int(restore_args.get("step", 0))
+        # Params are already restored (the pipeline was rebuilt from the checkpoint).
+        # We intentionally do NOT restore the Adam optimizer state here: Orbax restores
+        # it as generic dicts ([{count,mu,nu}, None, {count}]) instead of the live optax
+        # namedtuple structure (ScaleByAdamState/EmptyState/ScaleByScheduleState), so
+        # splicing it in fails with a pytree-structure mismatch (and mapping by leaf
+        # order risks silently swapping mu/nu). Resume therefore continues from the
+        # trained weights with a fresh optimizer (Adam moments reset).
+        # TODO: for exact optimizer continuation, restore opt_state into the live
+        # optimizer's abstract structure (jax.eval_shape(optimizer.init, params)).
+        if restore_args.get("opt_state", None) is not None:
+          max_logging.log(
+              f"Resuming from checkpoint step {restored_ckpt_step}: restoring params, "
+              "resetting optimizer (Adam) state."
+          )
+        else:
+          max_logging.log(f"Resuming from checkpoint step {restored_ckpt_step} (params only).")
+        state = state.replace(step=restored_ckpt_step + 1)
+        restore_args.pop("opt_state", None)
         del optimizer
       state = jax.tree.map(_to_array, state)
       state_spec = nnx.get_partition_spec(state)
@@ -363,9 +380,13 @@ class BaseWanTrainer(abc.ABC):
     last_profiling_step = np.clip(
         first_profiling_step + self.config.profiler_steps - 1, first_profiling_step, self.config.max_train_steps - 1
     )
-    if restore_args.get("step", 0):
-      max_logging.log(f"Resuming training from step {step}")
-    start_step = restore_args.get("step", 0)
+    start_step = 0
+    if restored_ckpt_step:
+      start_step = restored_ckpt_step + 1
+      max_logging.log(
+          f"Resuming training from checkpoint step {restored_ckpt_step}; "
+          f"next loop step {start_step}"
+      )
     per_device_tflops, _, _ = BaseWanTrainer.calculate_tflops(pipeline)
     scheduler_state = pipeline.scheduler_state
     _debug_training_loop_log(self.config, "before first load_next_batch")
@@ -465,8 +486,12 @@ class BaseWanTrainer(abc.ABC):
       if writer:
         writer.flush()
       if self.config.save_final_checkpoint:
-        max_logging.log(f"Saving final checkpoint for step {step}")
-        self.checkpointer.save_checkpoint(self.config.max_train_steps - 1, pipeline, state.params)
+        final_step = self.config.max_train_steps - 1
+        max_logging.log(f"Saving final checkpoint for step {final_step}")
+        if self.config.save_optimizer:
+          self.checkpointer.save_checkpoint(final_step, pipeline, state)
+        else:
+          self.checkpointer.save_checkpoint(final_step, pipeline, state.params)
         self.checkpointer.checkpoint_manager.wait_until_finished()
       # load new state for trained transformer
       pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
