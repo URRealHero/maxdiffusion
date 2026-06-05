@@ -155,6 +155,88 @@ def _tree_max_abs(tree):
   )
 
 
+def _as_bool(value):
+  return str(value).lower() == "true"
+
+
+def _csv_config(value):
+  if value is None:
+    return ()
+  return tuple(item.strip() for item in str(value).split(",") if item.strip())
+
+
+def _tree_path_to_str(path):
+  try:
+    return jax.tree_util.keystr(path)
+  except Exception:  # pragma: no cover - defensive for older JAX path entries.
+    pieces = []
+    for entry in path:
+      pieces.append(str(getattr(entry, "key", getattr(entry, "name", entry))))
+    return ".".join(pieces)
+
+
+def _make_trainable_grad_mask(grads, config):
+  substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
+  if not substrings:
+    return None
+
+  def make_mask(path, grad):
+    path_str = _tree_path_to_str(path)
+    is_trainable = any(substring in path_str for substring in substrings)
+    return jnp.ones_like(grad, dtype=jnp.bool_) if is_trainable else jnp.zeros_like(grad, dtype=jnp.bool_)
+
+  path_leaves, treedef = jax.tree_util.tree_flatten_with_path(grads)
+  mask_leaves = [make_mask(path, grad) for path, grad in path_leaves]
+  return jax.tree_util.tree_unflatten(treedef, mask_leaves)
+
+
+def _apply_trainable_grad_mask(grads, trainable_mask):
+  if trainable_mask is None:
+    return grads
+  return jax.tree_util.tree_map(lambda grad, mask: jnp.where(mask, grad, jnp.zeros_like(grad)), grads, trainable_mask)
+
+
+def _restore_frozen_params(old_state, new_state, trainable_mask):
+  if trainable_mask is None:
+    return new_state
+  restored_params = jax.tree_util.tree_map(
+      lambda old_param, new_param, mask: jnp.where(mask, new_param, old_param),
+      old_state.params,
+      new_state.params,
+      trainable_mask,
+  )
+  return new_state.replace(params=restored_params)
+
+
+def _mask_fraction(trainable_mask):
+  if trainable_mask is None:
+    return jnp.array(1.0, dtype=jnp.float32)
+  trainable = jnp.array(0, dtype=jnp.int32)
+  total = jnp.array(0, dtype=jnp.int32)
+  for leaf in jax.tree_util.tree_leaves(trainable_mask):
+    trainable = trainable + jnp.sum(leaf)
+    total = total + leaf.size
+  return trainable.astype(jnp.float32) / jnp.maximum(total, 1).astype(jnp.float32)
+
+
+def _debug_print_trainable_paths(params, config):
+  if not _as_bool(getattr(config, "frame_concat_print_trainable_params", False)):
+    return
+  substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
+  if not substrings or jax.process_index() != 0:
+    return
+  print("FrameConcat trainable parameter substrings:", ",".join(substrings))
+  matched = []
+  for path, value in jax.tree_util.tree_flatten_with_path(params)[0]:
+    path_str = _tree_path_to_str(path)
+    if any(substring in path_str for substring in substrings):
+      matched.append((path_str, getattr(value, "shape", None)))
+  print(f"FrameConcat trainable parameter leaves: {len(matched)}")
+  for path_str, shape in matched[:200]:
+    print(f"  trainable {path_str} shape={shape}")
+  if len(matched) > 200:
+    print(f"  ... {len(matched) - 200} more trainable leaves omitted")
+
 def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   _, noise_rng, timestep_rng, dropout_rng, new_rng = jax.random.split(rng, num=5)
 
@@ -217,8 +299,15 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
 
     return loss, debug_metrics
 
+  _debug_print_trainable_paths(state.params, config)
   grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
   (loss, debug_metrics), grads = grad_fn(state.params)
+  raw_max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
+  raw_max_abs_grad = _tree_max_abs(grads)
+  raw_grads_finite_frac = _finite_fraction(grads)
+  trainable_grad_mask = _make_trainable_grad_mask(grads, config)
+  trainable_param_fraction = _mask_fraction(trainable_grad_mask)
+  grads = _apply_trainable_grad_mask(grads, trainable_grad_mask)
   max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
   max_abs_grad = _tree_max_abs(grads)
   grads_finite_frac = _finite_fraction(grads)
@@ -239,6 +328,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   else:
     new_state = state.apply_gradients(grads=grads)
 
+  new_state = _restore_frozen_params(state, new_state, trainable_grad_mask)
+
   params_finite_frac_after_update = _finite_fraction(new_state.params)
   params_max_abs_after_update = _tree_max_abs(new_state.params)
   update_skipped = jnp.asarray(skip_nonfinite_update, dtype=jnp.bool_) & ~update_is_finite
@@ -246,8 +337,9 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   if str(getattr(config, "frame_concat_debug_print", False)).lower() == "true":
     jax.debug.print(
         "FrameConcat debug: loss={loss} lat={lat} cond={cond} hidden={hidden} pred={pred} "
-        "target={target} loss_tensor={loss_tensor} w=[{wmin},{wmax}] grad={grad} "
-        "grad_max={grad_max} params_after={params_after} pred_max={pred_max} update_ok={update_ok} skipped={skipped}",
+        "target={target} loss_tensor={loss_tensor} w=[{wmin},{wmax}] "
+        "raw_grad={raw_grad} raw_grad_max={raw_grad_max} trainable_frac={trainable_frac} "
+        "grad={grad} grad_max={grad_max} params_after={params_after} pred_max={pred_max} update_ok={update_ok} skipped={skipped}",
         loss=loss,
         lat=debug_metrics["debug/latents_finite_frac"],
         cond=debug_metrics["debug/cond_latents_finite_frac"],
@@ -257,6 +349,9 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
         loss_tensor=debug_metrics["debug/loss_tensor_finite_frac"],
         wmin=debug_metrics["debug/training_weight_min"],
         wmax=debug_metrics["debug/training_weight_max"],
+        raw_grad=raw_grads_finite_frac,
+        raw_grad_max=raw_max_abs_grad,
+        trainable_frac=trainable_param_fraction,
         grad=grads_finite_frac,
         grad_max=max_abs_grad,
         params_after=params_finite_frac_after_update,
@@ -270,6 +365,10 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
+          "debug/raw_max_grad_norm": raw_max_grad_norm,
+          "debug/raw_max_abs_grad": raw_max_abs_grad,
+          "debug/raw_grads_finite_frac": raw_grads_finite_frac,
+          "debug/trainable_param_fraction": trainable_param_fraction,
           "debug/grads_finite_frac": grads_finite_frac,
           "debug/params_finite_frac_after_update": params_finite_frac_after_update,
           "debug/params_max_abs_after_update": params_max_abs_after_update,

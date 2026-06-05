@@ -75,6 +75,17 @@ def parse_args() -> argparse.Namespace:
       action="store_true",
       help="Print full exception tracebacks for failed records.",
   )
+  parser.add_argument(
+      "--run-id",
+      default=None,
+      help="Common run id shared by all hosts. Needed for the manual final file barrier.",
+  )
+  parser.add_argument(
+      "--final-file-barrier-timeout-seconds",
+      type=int,
+      default=7200,
+      help="When --host-count is set, wait this long for all hosts to write done markers. Use <=0 to disable.",
+  )
   args = parser.parse_args()
 
   if args.batch_size <= 0:
@@ -223,7 +234,14 @@ def preprocess_video(
 ) -> np.ndarray:
   np = load_numpy()
   local_path = copy_to_local_if_needed(video_uri, temp_dir)
-  frames = sample_frames(read_video_frames(local_path, decoder), num_frames, sample_mode)
+  try:
+    frames = sample_frames(read_video_frames(local_path, decoder), num_frames, sample_mode)
+  finally:
+    if video_uri.startswith("gs://"):
+      try:
+        os.remove(local_path)
+      except FileNotFoundError:
+        pass
 
   arrays = []
   for frame in frames:
@@ -362,10 +380,12 @@ class ShardedWriter:
     self.records_in_shard = 0
     self.total_records = 0
     self.writer = None
+    self.current_path = None
     self.tf.io.gfile.makedirs(self.output_dir)
 
   def _open(self):
     path = f"{self.output_dir}/host_{self.host_index:03d}_run_{self.run_id}_file_{self.shard_index:06d}.tfrec"
+    self.current_path = path
     print(f"Writing shard: {path}", flush=True)
     self.writer = self.tf.io.TFRecordWriter(path)
 
@@ -383,6 +403,7 @@ class ShardedWriter:
     if self.writer is not None:
       self.writer.close()
       self.writer = None
+      self.current_path = None
       self.records_in_shard = 0
 
   def close(self):
@@ -415,6 +436,36 @@ class JsonlWriter:
 
   def close(self) -> None:
     self.file.close()
+
+
+def wait_for_manual_file_barrier(output_dir: str, run_id: str, host_index: int, host_count: int, timeout_seconds: int) -> None:
+  if timeout_seconds <= 0:
+    return
+
+  import time
+  import tensorflow as tf
+
+  output_dir = output_dir.rstrip("/")
+  done_path = f"{output_dir}/_done_{run_id}_host_{host_index:03d}.json"
+  with tf.io.gfile.GFile(done_path, "w") as f:
+    f.write(json.dumps({"run_id": run_id, "host_index": host_index, "host_count": host_count}) + "\n")
+
+  expected = [f"{output_dir}/_done_{run_id}_host_{i:03d}.json" for i in range(host_count)]
+  deadline = time.time() + timeout_seconds
+  last_seen = -1
+  while True:
+    seen = sum(1 for path in expected if tf.io.gfile.exists(path))
+    if seen == host_count:
+      print(f"Process {host_index}: manual file barrier complete for run_id={run_id}", flush=True)
+      return
+    if seen != last_seen:
+      print(f"Process {host_index}: manual file barrier waiting {seen}/{host_count} for run_id={run_id}", flush=True)
+      last_seen = seen
+    if time.time() > deadline:
+      raise TimeoutError(
+          f"Timed out waiting for manual file barrier run_id={run_id}: saw {seen}/{host_count} done files"
+      )
+    time.sleep(10)
 
 
 def main() -> int:
@@ -459,7 +510,7 @@ def main() -> int:
 
   metadata_read_prefix = args.output_dir.rstrip("/")
   completed_sample_ids = load_completed_sample_ids(metadata_read_prefix, process_index) if args.resume else set()
-  run_id = str(os.getpid())
+  run_id = args.run_id or os.environ.get("TPU_TFRECORD_ENCODER_RUN_ID") or str(os.getpid())
   metadata_path = f"{metadata_read_prefix}/metadata_host_{process_index:03d}_run_{run_id}.jsonl"
   failures_path = f"{metadata_read_prefix}/failures_host_{process_index:03d}_run_{run_id}.jsonl"
 
@@ -496,6 +547,7 @@ def main() -> int:
                 "condition_video": record.get(args.condition_video_field),
                 "error": str(error),
                 "process_index": process_index,
+                "tfrec_path": writer.current_path,
             },
         )
 
@@ -551,6 +603,7 @@ def main() -> int:
                 "width": width,
                 "num_frames": num_frames,
                 "process_index": process_index,
+                "tfrec_path": writer.current_path,
             },
         )
         print(f"encoded sample_id={sample_id} latent_shape={latent.shape}", flush=True)
@@ -583,7 +636,14 @@ def main() -> int:
   metadata_writer.close()
   failures_writer.close()
   if manual_host_sharding:
-    print(f"Process {process_index}: wrote {writer.total_records} records; no JAX distributed barrier", flush=True)
+    print(f"Process {process_index}: wrote {writer.total_records} records; waiting at manual file barrier", flush=True)
+    wait_for_manual_file_barrier(
+        args.output_dir,
+        run_id,
+        process_index,
+        process_count,
+        args.final_file_barrier_timeout_seconds,
+    )
   else:
     print(f"Process {process_index}: wrote {writer.total_records} records; waiting at final multihost barrier", flush=True)
 
