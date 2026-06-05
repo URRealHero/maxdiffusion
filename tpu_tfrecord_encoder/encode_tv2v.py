@@ -260,6 +260,18 @@ def make_example(latent: np.ndarray, cond_latent: np.ndarray, hidden_state: np.n
   return tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()
 
 
+def assert_finite_encoded_record(sample_id: str, latent: np.ndarray, cond_latent: np.ndarray, hidden_state: np.ndarray) -> None:
+  np = load_numpy()
+  checks = {
+      "latents": latent,
+      "cond_latents": cond_latent,
+      "encoder_hidden_states": hidden_state,
+  }
+  bad = [name for name, value in checks.items() if not np.isfinite(value).all()]
+  if bad:
+    raise ValueError(f"nonfinite encoded tensors for sample_id={sample_id}: {','.join(bad)}")
+
+
 class ShardedWriter:
   def __init__(self, output_dir: str, records_per_shard: int, host_index: int, run_id: str):
     import tensorflow as tf
@@ -428,7 +440,11 @@ def main() -> int:
       cond_latents = encode_videos(pipeline, condition_array)
       hidden_states = encode_prompts(pipeline, prompts, args.max_sequence_length)
 
-      for (_, sample_id, record), latent, cond_latent, hidden_state in zip(records, latents, cond_latents, hidden_states):
+      encoded_records = list(zip(records, latents, cond_latents, hidden_states))
+      for (_, sample_id, _), latent, cond_latent, hidden_state in encoded_records:
+        assert_finite_encoded_record(sample_id, latent, cond_latent, hidden_state)
+
+      for (_, sample_id, record), latent, cond_latent, hidden_state in encoded_records:
         writer.write(make_example(latent, cond_latent, hidden_state, args.condition_output_field))
         metadata_writer.write(
             {

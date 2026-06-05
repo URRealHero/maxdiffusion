@@ -156,7 +156,7 @@ def _tree_max_abs(tree):
 
 
 def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
-  _, new_rng, timestep_rng, dropout_rng = jax.random.split(rng, num=4)
+  _, noise_rng, timestep_rng, dropout_rng, new_rng = jax.random.split(rng, num=5)
 
   for k, v in data.items():
     data[k] = v[: config.global_batch_size_to_train_on, :]
@@ -171,7 +171,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     cond_frames = cond_latents.shape[2]
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     timesteps = jnp.reshape(timesteps, (bsz,))
-    noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
+    noise = jax.random.normal(key=noise_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
     hidden_states = jnp.concatenate([cond_latents, noisy_latents], axis=2)
     with jax.named_scope("forward_pass"):
@@ -223,15 +223,31 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   max_abs_grad = _tree_max_abs(grads)
   grads_finite_frac = _finite_fraction(grads)
 
-  new_state = state.apply_gradients(grads=grads)
+  update_is_finite = jnp.isfinite(loss) & (grads_finite_frac == 1.0)
+  try:
+    skip_nonfinite_update = str(getattr(config, "frame_concat_skip_nonfinite_update")).lower() == "true"
+  except (AttributeError, ValueError):
+    skip_nonfinite_update = False
+
+  if skip_nonfinite_update:
+    new_state = jax.lax.cond(
+        update_is_finite,
+        lambda _: state.apply_gradients(grads=grads),
+        lambda _: state,
+        operand=None,
+    )
+  else:
+    new_state = state.apply_gradients(grads=grads)
+
   params_finite_frac_after_update = _finite_fraction(new_state.params)
   params_max_abs_after_update = _tree_max_abs(new_state.params)
+  update_skipped = jnp.asarray(skip_nonfinite_update, dtype=jnp.bool_) & ~update_is_finite
 
   if str(getattr(config, "frame_concat_debug_print", False)).lower() == "true":
     jax.debug.print(
         "FrameConcat debug: loss={loss} lat={lat} cond={cond} hidden={hidden} pred={pred} "
         "target={target} loss_tensor={loss_tensor} w=[{wmin},{wmax}] grad={grad} "
-        "grad_max={grad_max} params_after={params_after} pred_max={pred_max}",
+        "grad_max={grad_max} params_after={params_after} pred_max={pred_max} update_ok={update_ok} skipped={skipped}",
         loss=loss,
         lat=debug_metrics["debug/latents_finite_frac"],
         cond=debug_metrics["debug/cond_latents_finite_frac"],
@@ -245,6 +261,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
         grad_max=max_abs_grad,
         params_after=params_finite_frac_after_update,
         pred_max=debug_metrics["debug/model_pred_max_abs"],
+        update_ok=update_is_finite,
+        skipped=update_skipped,
     )
 
   metrics = {
@@ -255,6 +273,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           "debug/grads_finite_frac": grads_finite_frac,
           "debug/params_finite_frac_after_update": params_finite_frac_after_update,
           "debug/params_max_abs_after_update": params_max_abs_after_update,
+          "debug/update_is_finite": update_is_finite.astype(jnp.float32),
+          "debug/update_skipped": update_skipped.astype(jnp.float32),
           **debug_metrics,
       },
       "scalars": {},
