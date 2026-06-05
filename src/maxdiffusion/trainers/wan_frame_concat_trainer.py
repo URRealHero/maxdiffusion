@@ -254,7 +254,13 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     timesteps = jnp.reshape(timesteps, (bsz,))
     noise = jax.random.normal(key=noise_rng, shape=latents.shape, dtype=latents.dtype)
-    noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
+    noisy_latents, training_target, _ = scheduler.apply_flow_match(noise, latents, timesteps)
+    # Match DiffSynth/ReCamMaster/HyDRA: weight each sample by the fixed per-timestep
+    # weight precomputed over the full 1000-step grid (global normalization), looked up
+    # by timestep. apply_flow_match's own weight renormalizes within the current batch,
+    # which forces the batch-min-timestep sample to weight 0 and adds batch-dependent
+    # variance -- a divergence from the reference recipe.
+    training_weight = scheduler.training_weight(scheduler_state, timesteps)
     hidden_states = jnp.concatenate([cond_latents, noisy_latents], axis=2)
     with jax.named_scope("forward_pass"):
       model_pred = model(

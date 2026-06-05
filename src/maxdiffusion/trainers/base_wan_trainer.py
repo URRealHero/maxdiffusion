@@ -147,7 +147,11 @@ class BaseWanTrainer(abc.ABC):
 
   def create_scheduler(self):
     """Creates and initializes the Flow Match scheduler for training."""
-    noise_scheduler = FlaxFlowMatchScheduler(dtype=jnp.float32)
+    # Use the configured flow_shift so the training noise schedule matches inference
+    # and the reference frame-concat works (HyDRA builds its scheduler with shift=5).
+    # Falls back to the scheduler default (3.0) when flow_shift is unset.
+    flow_shift = float(_get_config_value(self.config, "flow_shift", 3.0))
+    noise_scheduler = FlaxFlowMatchScheduler(dtype=jnp.float32, shift=flow_shift)
     noise_scheduler_state = noise_scheduler.create_state()
     noise_scheduler_state = noise_scheduler.set_timesteps(noise_scheduler_state, num_inference_steps=1000, training=True)
     return noise_scheduler, noise_scheduler_state
