@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import tempfile
+import traceback
 from typing import Iterable
 
 np = None
@@ -56,6 +58,23 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--resume", action="store_true", help="Skip sample_ids listed in this host's metadata sidecar.")
   parser.add_argument("--dry-run", action="store_true", help="Validate manifest sharding without loading models.")
+  parser.add_argument(
+      "--host-index",
+      type=int,
+      default=None,
+      help="Manual shard index for non-JAX-distributed encoding. Defaults to parsing TPU worker id from hostname.",
+  )
+  parser.add_argument(
+      "--host-count",
+      type=int,
+      default=None,
+      help="Manual shard count for non-JAX-distributed encoding, e.g. 16 for v5p-128 or 64 for v6e-256.",
+  )
+  parser.add_argument(
+      "--print-tracebacks",
+      action="store_true",
+      help="Print full exception tracebacks for failed records.",
+  )
   args = parser.parse_args()
 
   if args.batch_size <= 0:
@@ -64,10 +83,35 @@ def parse_args() -> argparse.Namespace:
     parser.error("--records-per-shard must be > 0")
   if args.condition_output_field in {"latents", "encoder_hidden_states"}:
     parser.error("--condition-output-field must not collide with latents or encoder_hidden_states")
+  if args.host_index is not None and args.host_count is None:
+    parser.error("--host-index requires --host-count")
+  if args.host_count is not None:
+    if args.host_count <= 0:
+      parser.error("--host-count must be > 0")
+    if args.host_index is not None and (args.host_index < 0 or args.host_index >= args.host_count):
+      parser.error("--host-index must satisfy 0 <= host-index < host-count")
   for item in args.config_arg:
     if "=" not in item:
       parser.error(f"--config-arg must be key=value, got {item!r}")
   return args
+
+
+def has_config_arg(config_args: list[str], key: str) -> bool:
+  return any(item.split("=", 1)[0] == key for item in config_args)
+
+
+def infer_tpu_worker_index_from_hostname() -> int:
+  hostname = socket.gethostname()
+  match = re.search(r"-w-(\d+)$", hostname)
+  if match:
+    return int(match.group(1))
+  match = re.search(r"-w(\d+)$", hostname)
+  if match:
+    return int(match.group(1))
+  raise ValueError(
+      "Could not infer TPU worker index from hostname "
+      f"{hostname!r}; pass --host-index explicitly."
+  )
 
 
 def prompt_clean(text: str) -> str:
@@ -218,22 +262,55 @@ def materialize_addressable_array(array) -> np.ndarray:
   return result
 
 
+def _debug_jax_array(name: str, value) -> None:
+  if os.environ.get("TPU_TFRECORD_ENCODER_DEBUG_VAE", "0").lower() not in {"1", "true", "yes"}:
+    return
+
+  import jax
+  import jax.numpy as jnp
+
+  finite = jnp.mean(jnp.isfinite(value).astype(jnp.float32))
+  min_value = jnp.min(value)
+  max_value = jnp.max(value)
+  jax.debug.print(
+      f"encoder debug {name}: shape={value.shape} finite={{finite}} min={{min}} max={{max}}",
+      finite=finite,
+      min=min_value,
+      max=max_value,
+  )
+
+
 def encode_videos(pipeline, videos: np.ndarray) -> np.ndarray:
   import jax.numpy as jnp
   from flax.linen import partitioning as nn_partitioning
 
   video = jnp.asarray(videos, dtype=getattr(pipeline.vae, "dtype", jnp.float32))
+  _debug_jax_array("input_video", video)
 
   with pipeline.vae_mesh, nn_partitioning.axis_rules(pipeline.vae_logical_axis_rules):
     encoded = pipeline.vae.encode(video, pipeline.vae_cache)[0].mode()
 
+  _debug_jax_array("encoded_mode_before_normalize", encoded)
   latents_mean = jnp.array(pipeline.vae.latents_mean).reshape(1, 1, 1, 1, pipeline.vae.z_dim)
   latents_std = jnp.array(pipeline.vae.latents_std).reshape(1, 1, 1, 1, pipeline.vae.z_dim)
+  _debug_jax_array("latents_mean", latents_mean)
+  _debug_jax_array("latents_std", latents_std)
   latents = (encoded - latents_mean) / latents_std  # [B, F, H, W, C]
+  _debug_jax_array("latents_after_normalize_channel_last", latents)
   latents = jnp.transpose(latents, (0, 4, 1, 2, 3))  # [B, C, F, H, W]
   latents = latents.astype(jnp.float32)
+  _debug_jax_array("latents_after_transpose", latents)
   latents.block_until_ready()
-  return materialize_addressable_array(latents)
+  materialized = materialize_addressable_array(latents)
+  if os.environ.get("TPU_TFRECORD_ENCODER_DEBUG_VAE", "0").lower() in {"1", "true", "yes"}:
+    np = load_numpy()
+    print(
+        "encoder debug materialized_latents: "
+        f"shape={materialized.shape} finite={np.isfinite(materialized).mean()} "
+        f"min={np.nanmin(materialized)} max={np.nanmax(materialized)}",
+        flush=True,
+    )
+  return materialized
 
 
 def bytes_feature(value: bytes):
@@ -348,7 +425,14 @@ def main() -> int:
   import jax
   import tensorflow as tf
 
-  pyconfig.initialize(["encode_tv2v.py", args.config] + args.config_arg)
+  config_args = list(args.config_arg)
+  manual_host_sharding = args.host_count is not None
+  if manual_host_sharding and not has_config_arg(config_args, "skip_jax_distributed_system"):
+    config_args.append("skip_jax_distributed_system=True")
+  if manual_host_sharding:
+    os.environ.setdefault("MAXDIFFUSION_FORCE_LOCAL_DEVICE_MESH", "1")
+
+  pyconfig.initialize(["encode_tv2v.py", args.config] + config_args)
   config = pyconfig.config
 
   height = args.height if args.height is not None else config.height
@@ -358,10 +442,18 @@ def main() -> int:
   if height % 16 != 0 or width % 16 != 0:
     raise ValueError(f"height/width should be divisible by 16 for WAN VAE, got {height}x{width}")
 
-  process_index = jax.process_index()
-  process_count = jax.process_count()
+  if manual_host_sharding:
+    process_index = args.host_index
+    process_count = args.host_count
+    if process_index is None:
+      process_index = infer_tpu_worker_index_from_hostname()
+  else:
+    process_index = jax.process_index()
+    process_count = jax.process_count()
+
   print(
-      f"Encoder process {process_index}/{process_count}: height={height} width={width} frames={num_frames}",
+      f"Encoder process {process_index}/{process_count}: height={height} width={width} frames={num_frames} "
+      f"manual_host_sharding={manual_host_sharding}",
       flush=True,
   )
 
@@ -471,6 +563,8 @@ def main() -> int:
           mark_failed(records, exc)
           _, sample_id, _ = records[0]
           print(f"failed sample_id={sample_id}: {exc}", flush=True)
+          if args.print_tracebacks:
+            traceback.print_exc()
           return
         print(f"failed {label} with {len(records)} records; retrying records one by one: {exc}", flush=True)
         for record in records:
@@ -488,15 +582,18 @@ def main() -> int:
   writer.close()
   metadata_writer.close()
   failures_writer.close()
-  print(f"Process {process_index}: wrote {writer.total_records} records; waiting at final multihost barrier", flush=True)
+  if manual_host_sharding:
+    print(f"Process {process_index}: wrote {writer.total_records} records; no JAX distributed barrier", flush=True)
+  else:
+    print(f"Process {process_index}: wrote {writer.total_records} records; waiting at final multihost barrier", flush=True)
 
-  # JAX distributed jobs are collective: if one host exits while others still run
-  # VAE JAX work, the coordination service aborts the whole job. Keep fast hosts
-  # alive until every host has closed its writers.
-  from jax.experimental import multihost_utils
+    # JAX distributed jobs are collective: if one host exits while others still run
+    # VAE JAX work, the coordination service aborts the whole job. Keep fast hosts
+    # alive until every host has closed its writers.
+    from jax.experimental import multihost_utils
 
-  multihost_utils.sync_global_devices("tpu_tv2v_encoder_done")
-  print(f"Process {process_index}: final barrier complete", flush=True)
+    multihost_utils.sync_global_devices("tpu_tv2v_encoder_done")
+    print(f"Process {process_index}: final barrier complete", flush=True)
   return 0
 
 

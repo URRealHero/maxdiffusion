@@ -18,6 +18,7 @@ from functools import partial
 from maxdiffusion.image_processor import PipelineImageInput
 import numpy as np
 import math
+import os
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -678,7 +679,10 @@ class WanPipeline:
 
   @classmethod
   def _create_common_components(cls, config, vae_only=False, i2v=False):
-    devices_array = max_utils.create_device_mesh(config)
+    if os.environ.get("MAXDIFFUSION_FORCE_LOCAL_DEVICE_MESH", "0").lower() in {"1", "true", "yes"}:
+      devices_array = max_utils.create_device_mesh(config, devices=jax.local_devices())
+    else:
+      devices_array = max_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes) # (shape, name)
 
     vae_spatial = getattr(config, "vae_spatial", -1)

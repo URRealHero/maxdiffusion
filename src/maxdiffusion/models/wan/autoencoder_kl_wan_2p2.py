@@ -15,6 +15,7 @@ limitations under the License.
 
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
+import os
 import flax
 from flax import nnx
 import jax
@@ -66,6 +67,23 @@ class RepSentinel:
 
 
 tree_util.register_pytree_node(RepSentinel, lambda x: ((), None), lambda _, __: RepSentinel())
+
+
+def _debug_wan2p2_vae_enabled() -> bool:
+  return os.environ.get("MAXDIFFUSION_DEBUG_WAN2P2_VAE", "0").lower() in {"1", "true", "yes"}
+
+
+def _debug_wan2p2_vae_array(name: str, value: jax.Array) -> None:
+  if not _debug_wan2p2_vae_enabled():
+    return
+
+  finite = jnp.mean(jnp.isfinite(value).astype(jnp.float32))
+  jax.debug.print(
+      f"wan2p2 vae debug {name}: shape={value.shape} finite={{finite}} min={{min}} max={{max}}",
+      finite=finite,
+      min=jnp.min(value),
+      max=jnp.max(value),
+  )
 
 
 class WanPatchify(nnx.Module):
@@ -1329,13 +1347,16 @@ class AutoencoderKLWan2p2(nnx.Module, FlaxModelMixin, ConfigMixin):
   def _encode(self, x: jax.Array, feat_cache: AutoencoderKLWanCache):
     feat_cache.init_cache()
     # [N, C, D, H, W]
+    _debug_wan2p2_vae_array("input_raw", x)
 
     if x.shape[-1] != 3:
       # reshape channel last for JAX
       x = jnp.transpose(x, (0, 2, 3, 4, 1))
       assert x.shape[-1] == 3, f"Expected input shape (N, D, H, W, 3), got {x.shape}"
+      _debug_wan2p2_vae_array("input_channel_last", x)
 
     x = self.patchify(x)
+    _debug_wan2p2_vae_array("after_patchify", x)
 
     t = x.shape[1]
     iter_ = 1 + (t - 1) // 4
@@ -1346,11 +1367,14 @@ class AutoencoderKLWan2p2(nnx.Module, FlaxModelMixin, ConfigMixin):
       enc_conv_idx = 0
       if i == 0:
         chunk = x[:, :1, :, :, :]
+        _debug_wan2p2_vae_array("encoder_chunk_0_input", chunk)
         chunk = jax.lax.with_sharding_constraint(chunk, spatial_sharding)
         out, enc_feat_map, enc_conv_idx = self.encoder(chunk, feat_cache=enc_feat_map, feat_idx=enc_conv_idx)
         out = jax.lax.with_sharding_constraint(out, spatial_sharding)
+        _debug_wan2p2_vae_array("encoder_chunk_0_output", out)
       else:
         chunk = x[:, 1 + 4 * (i - 1) : 1 + 4 * i, :, :, :]
+        _debug_wan2p2_vae_array(f"encoder_chunk_{i}_input", chunk)
         chunk = jax.lax.with_sharding_constraint(chunk, spatial_sharding)
         out_, enc_feat_map, enc_conv_idx = self.encoder(
             chunk,
@@ -1358,13 +1382,18 @@ class AutoencoderKLWan2p2(nnx.Module, FlaxModelMixin, ConfigMixin):
             feat_idx=enc_conv_idx,
         )
         out_ = jax.lax.with_sharding_constraint(out_, spatial_sharding)
+        _debug_wan2p2_vae_array(f"encoder_chunk_{i}_output", out_)
         out = jnp.concatenate([out, out_], axis=1)
 
+    _debug_wan2p2_vae_array("encoder_concat_output", out)
     # Update back to the wrapper object if needed, but for result we use local vars
     feat_cache._enc_feat_map = enc_feat_map
 
     enc = self.quant_conv(out)
+    _debug_wan2p2_vae_array("after_quant_conv", enc)
     mu, logvar = enc[:, :, :, :, : self.z_dim], enc[:, :, :, :, self.z_dim :]
+    _debug_wan2p2_vae_array("mu_before_distribution", mu)
+    _debug_wan2p2_vae_array("logvar_before_distribution", logvar)
     enc = jnp.concatenate([mu, logvar], axis=-1)
     feat_cache.init_cache()
     return enc
