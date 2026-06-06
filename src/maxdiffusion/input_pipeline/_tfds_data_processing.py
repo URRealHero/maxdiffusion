@@ -130,10 +130,38 @@ def _make_tfrecord_iterator(
     filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*.tfrecord")))
   if not filenames:
     raise ValueError(f"No TFRecord shards found in {dataset_path}. Expected *.tfrec or *.tfrecord files.")
-  ds = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
+  used_prepare_sample = (
+      prepare_sample_fn if (make_cached_tfrecord_iterator or config.dataset_type == "tfrecord") else prepare_sample
+  )
 
-  # --- PADDING LOGIC FOR EVALUATION ---
-  if not is_training:
+  if is_training:
+    # File-level sharding: each host reads only its slice of the TFRecord files.
+    # The previous record-level shard had every host open ALL files (with
+    # num_parallel_reads=AUTOTUNE) and then discard (1 - 1/host_count) of the
+    # records. That amplified concurrent GCS reads by dataloading_host_count,
+    # which triggers GCS throttling/stalls and hangs the iterator inside
+    # iterator_get_next (confirmed via py-spy). Sharding the file list first
+    # means each host only opens its own files (e.g. 256 files / 64 hosts = 4).
+    files_ds = tf.data.Dataset.from_tensor_slices(filenames)
+    files_ds = files_ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+    files_ds = files_ds.shuffle(len(filenames))  # reshuffle file order each epoch
+    ds = files_ds.interleave(
+        lambda f: tf.data.TFRecordDataset(f),
+        cycle_length=4,
+        num_parallel_calls=4,  # bounded; avoids AUTOTUNE opening many GCS connections
+        deterministic=False,
+    )
+    ds = (
+        ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
+        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+        .shuffle(global_batch_size * 10)
+        .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
+        .repeat(-1)
+        .prefetch(AUTOTUNE)
+    )
+  # For Evaluation: keep record-level sharding (low volume) + padding logic.
+  else:
+    ds = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
     num_eval_samples = 0
     for _ in ds:
       num_eval_samples += 1
@@ -147,24 +175,13 @@ def _make_tfrecord_iterator(
       ds = ds.concatenate(padding_ds)
       max_logging.log(f"Padded evaluation dataset with {num_to_pad} samples.")
 
-  used_prepare_sample = (
-      prepare_sample_fn if (make_cached_tfrecord_iterator or config.dataset_type == "tfrecord") else prepare_sample
-  )
-  ds = (
-      ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
-      .map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
-      .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
-  )
-  if is_training:
     ds = (
-        ds.shuffle(global_batch_size * 10)
-        .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
-        .repeat(-1)
+        ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+        .map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
+        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+        .batch(global_batch_size // dataloading_host_count, drop_remainder=False)
         .prefetch(AUTOTUNE)
     )
-  # For Evaluation
-  else:
-    ds = ds.batch(global_batch_size // dataloading_host_count, drop_remainder=False).prefetch(AUTOTUNE)
 
   iter = multihost_dataloading.MultiHostDataLoadIterator(ds, mesh)
   return iter

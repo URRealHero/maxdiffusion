@@ -75,8 +75,17 @@ def get_next_batch_sharded(local_dataset: Iterator, global_mesh: Mesh) -> jax.Ar
     try:
       local_data = next(local_dataset)
       loaded_data_success = True
-    except tf.errors.FailedPreconditionError:
-      max_logging.log("Failed to get next data batch, retrying")
+    except (
+        tf.errors.FailedPreconditionError,
+        tf.errors.UnavailableError,
+        tf.errors.DeadlineExceededError,
+        tf.errors.AbortedError,
+        tf.errors.InternalError,
+    ) as e:
+      # GCS throttling/stalls surface as Unavailable/DeadlineExceeded (or, with
+      # GCS_*_TIMEOUT_SECS set, a timeout error) rather than FailedPrecondition.
+      # Retry these instead of crashing/hanging.
+      max_logging.log(f"Failed to get next data batch ({type(e).__name__}), retrying")
       time.sleep(SLEEP_TIME)
 
   # Try one last time, if this fails we will see the full stack trace.
