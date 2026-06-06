@@ -27,6 +27,99 @@ from maxdiffusion.trainers.base_wan_trainer import BaseWanTrainer
 import tensorflow as tf
 
 
+# ---------------------------------------------------------------------------
+# Gradient-masking utilities (shared with frame-concat trainer pattern)
+# ---------------------------------------------------------------------------
+
+def _csv_config(value):
+  if value is None:
+    return ()
+  return tuple(item.strip() for item in str(value).split(",") if item.strip())
+
+
+def _as_bool(value):
+  return str(value).lower() == "true"
+
+
+def _tree_path_to_str(path):
+  try:
+    return jax.tree_util.keystr(path)
+  except Exception:
+    pieces = []
+    for entry in path:
+      pieces.append(str(getattr(entry, "key", getattr(entry, "name", entry))))
+    return ".".join(pieces)
+
+
+def _make_trainable_grad_mask(grads, config):
+  """Zero gradients for params whose path doesn't match vace_trainable_param_substrings.
+
+  Defaults to "vace" so only VACE branch params are updated.
+  Set vace_trainable_param_substrings="" in the config to train all params.
+  """
+  substrings = _csv_config(getattr(config, "vace_trainable_param_substrings", "vace"))
+  if not substrings:
+    return None
+
+  def make_mask(path, grad):
+    path_str = _tree_path_to_str(path)
+    is_trainable = any(s in path_str for s in substrings)
+    return jnp.ones_like(grad, dtype=jnp.bool_) if is_trainable else jnp.zeros_like(grad, dtype=jnp.bool_)
+
+  path_leaves, treedef = jax.tree_util.tree_flatten_with_path(grads)
+  mask_leaves = [make_mask(path, grad) for path, grad in path_leaves]
+  return jax.tree_util.tree_unflatten(treedef, mask_leaves)
+
+
+def _apply_trainable_grad_mask(grads, mask):
+  if mask is None:
+    return grads
+  return jax.tree_util.tree_map(
+      lambda g, m: jnp.where(m, g, jnp.zeros_like(g)), grads, mask
+  )
+
+
+def _restore_frozen_params(old_state, new_state, mask):
+  """After apply_gradients, restore any frozen params to their pre-update values."""
+  if mask is None:
+    return new_state
+  restored = jax.tree_util.tree_map(
+      lambda old, new, m: jnp.where(m, new, old),
+      old_state.params, new_state.params, mask,
+  )
+  return new_state.replace(params=restored)
+
+
+def _mask_fraction(mask):
+  if mask is None:
+    return jnp.array(1.0, dtype=jnp.float32)
+  trainable = jnp.array(0.0, dtype=jnp.float32)
+  total = jnp.array(0.0, dtype=jnp.float32)
+  for leaf in jax.tree_util.tree_leaves(mask):
+    trainable = trainable + jnp.sum(leaf.astype(jnp.float32))
+    total = total + jnp.asarray(leaf.size, dtype=jnp.float32)
+  return trainable / jnp.maximum(total, jnp.array(1.0, dtype=jnp.float32))
+
+
+def _debug_print_trainable_paths(params, config):
+  substrings = _csv_config(getattr(config, "vace_trainable_param_substrings", "vace"))
+  if not substrings or not _as_bool(getattr(config, "vace_print_trainable_params", False)):
+    return
+  if jax.process_index() != 0:
+    return
+  print("VACE trainable param substrings:", ",".join(substrings))
+  matched = []
+  for path, value in jax.tree_util.tree_flatten_with_path(params)[0]:
+    path_str = _tree_path_to_str(path)
+    if any(s in path_str for s in substrings):
+      matched.append((path_str, getattr(value, "shape", None)))
+  print(f"VACE trainable parameter leaves: {len(matched)}")
+  for path_str, shape in matched[:200]:
+    print(f"  trainable {path_str} shape={shape}")
+  if len(matched) > 200:
+    print(f"  ... {len(matched) - 200} more omitted")
+
+
 class WanVaceTrainer(BaseWanTrainer):
 
   def _get_checkpointer(self):
@@ -164,7 +257,10 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     timesteps = jnp.reshape(timesteps, (bsz,))
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
-    noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
+    noisy_latents, training_target, _ = scheduler.apply_flow_match(noise, latents, timesteps)
+    # Global-grid weight lookup matches DiffSynth/HyDRA (avoids per-batch renorm
+    # that forces the batch-min-timestep sample to weight 0).
+    training_weight = scheduler.training_weight(scheduler_state, timesteps)
     with jax.named_scope("forward_pass"):
       model_pred = model(
           hidden_states=noisy_latents,
@@ -223,7 +319,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
 
     return loss, aux
 
-  debug_forward_only = str(getattr(config, "vace_debug_forward_only", False)).lower() == "true"
+  debug_forward_only = _as_bool(getattr(config, "vace_debug_forward_only", False))
   if debug_forward_only:
     loss, aux = loss_fn(state.params)
     metrics = {
@@ -236,27 +332,40 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
     }
     return state, scheduler_state, metrics, new_rng
 
+  _debug_print_trainable_paths(state.params, config)
   grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
   (loss, aux), grads = grad_fn(state.params)
-  max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
 
-  max_abs_grad = jax.tree_util.tree_reduce(
-      lambda max_val, arr: jnp.maximum(max_val, jnp.max(jnp.abs(arr))),
-      grads,
-      initializer=-1.0,
+  raw_max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
+  raw_max_abs_grad = jax.tree_util.tree_reduce(
+      lambda m, a: jnp.maximum(m, jnp.max(jnp.abs(a))), grads, initializer=jnp.array(0.0)
   )
+
+  trainable_mask = _make_trainable_grad_mask(grads, config)
+  trainable_param_fraction = _mask_fraction(trainable_mask)
+  grads = _apply_trainable_grad_mask(grads, trainable_mask)
+
+  max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
+  max_abs_grad = jax.tree_util.tree_reduce(
+      lambda m, a: jnp.maximum(m, jnp.max(jnp.abs(a))), grads, initializer=jnp.array(0.0)
+  )
+
+  new_state = state.apply_gradients(grads=grads)
+  # Restore frozen params that the optimizer may have perturbed via momentum.
+  new_state = _restore_frozen_params(state, new_state, trainable_mask)
 
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
+          "debug/raw_max_grad_norm": raw_max_grad_norm,
+          "debug/raw_max_abs_grad": raw_max_abs_grad,
+          "debug/trainable_param_fraction": trainable_param_fraction,
           **{f"debug/{k}": v for k, v in aux.items()},
       },
       "scalars": {},
   }
-
-  new_state = state.apply_gradients(grads=grads)
   return new_state, scheduler_state, metrics, new_rng
 
 

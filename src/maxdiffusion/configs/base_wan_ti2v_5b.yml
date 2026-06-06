@@ -369,6 +369,13 @@ qwix_module_path: ".*"
 eval_every: -1
 eval_data_dir: ""
 
+# VACE architecture: comma-separated layer indices and input channel count.
+vace_layers: '0,5,10,15,20,25'
+vace_in_channels: 96
+# Comma-separated path substrings that are trainable. Empty means full finetune.
+vace_trainable_param_substrings: 'vace'
+# Print matching trainable parameter leaves on host 0.
+vace_print_trainable_params: False
 # VACE debug: run forward/loss only and skip grad/update.
 vace_debug_forward_only: False
 vace_debug_print: False
