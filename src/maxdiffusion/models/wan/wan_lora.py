@@ -64,7 +64,9 @@ class WanLoRAAdapter(nnx.Module):
   ):
     self.scale = alpha / rank
 
-    # A: down-project to rank.  Kaiming/LeCun normal init (std = 1/sqrt(rank)).
+    # A: down-project to rank.  PEFT/DiffSynth init = nn.init.kaiming_uniform_(a=sqrt(5))
+    #    = U(-1/sqrt(fan_in), 1/sqrt(fan_in)), fan_in = in_features. In flax this is
+    #    variance_scaling(1/3, "fan_in", "uniform").
     # B: up-project to out_features.  Zero init → delta starts at 0.
     # Both replicated (None, None) — rank is small (~32) so no sharding needed.
     self.lora_A = nnx.Linear(
@@ -75,7 +77,7 @@ class WanLoRAAdapter(nnx.Module):
         param_dtype=weights_dtype,
         precision=precision,
         kernel_init=nnx.with_partitioning(
-            nnx.initializers.normal(stddev=1.0 / rank**0.5),
+            nnx.initializers.variance_scaling(1.0 / 3.0, "fan_in", "uniform"),
             (None, None),
         ),
         rngs=rngs,

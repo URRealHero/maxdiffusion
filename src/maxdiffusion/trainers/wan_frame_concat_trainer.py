@@ -214,6 +214,36 @@ def _apply_trainable_grad_mask(grads, trainable_mask):
   return jax.tree_util.tree_map(lambda grad, mask: jnp.where(mask, grad, jnp.zeros_like(grad)), grads, trainable_mask)
 
 
+def _sanitize_nonfinite_grads(grads):
+  return jax.tree_util.tree_map(lambda grad: jnp.where(jnp.isfinite(grad), grad, jnp.zeros_like(grad)), grads)
+
+
+def _masked_finite_fraction(tree, mask):
+  if mask is None:
+    return _finite_fraction(tree)
+
+  finite = jnp.array(0.0, dtype=jnp.float32)
+  total = jnp.array(0.0, dtype=jnp.float32)
+  for leaf, leaf_mask in zip(jax.tree_util.tree_leaves(tree), jax.tree_util.tree_leaves(mask)):
+    selected = leaf_mask.astype(jnp.bool_)
+    finite = finite + jnp.sum((jnp.isfinite(leaf) & selected).astype(jnp.float32))
+    total = total + jnp.sum(selected.astype(jnp.float32))
+
+  return finite / jnp.maximum(total, jnp.array(1.0, dtype=jnp.float32))
+
+
+def _masked_all_finite(tree, mask):
+  if mask is None:
+    return _tree_all_finite(tree)
+
+  all_finite = jnp.array(True)
+  for leaf, leaf_mask in zip(jax.tree_util.tree_leaves(tree), jax.tree_util.tree_leaves(mask)):
+    selected = leaf_mask.astype(jnp.bool_)
+    all_finite = all_finite & jnp.all(jnp.isfinite(jnp.where(selected, leaf, jnp.zeros_like(leaf))))
+
+  return all_finite
+
+
 def _restore_frozen_params(old_state, new_state, trainable_mask):
   if trainable_mask is None:
     return new_state
@@ -258,6 +288,31 @@ def _debug_print_trainable_paths(params, config):
     print(f"  trainable {path_str} shape={shape}")
   if len(matched) > 200:
     print(f"  ... {len(matched) - 200} more trainable leaves omitted")
+
+
+def _debug_print_trainable_grad_stats(grads, trainable_mask, config):
+  if not _as_bool(getattr(config, "frame_concat_debug_trainable_grad_stats", False)):
+    return
+  if trainable_mask is None:
+    return
+
+  path_leaves, _ = jax.tree_util.tree_flatten_with_path(grads)
+  mask_leaves = jax.tree_util.tree_leaves(trainable_mask)
+  for (path, grad), mask in zip(path_leaves, mask_leaves):
+    path_str = _tree_path_to_str(path)
+    selected = jnp.any(mask)
+    finite_frac = jnp.mean(jnp.isfinite(grad))
+    max_abs = jnp.max(jnp.abs(grad.astype(jnp.float32)))
+
+    def print_leaf(_):
+      jax.debug.print(
+          "trainable grad {path}: finite_frac={finite_frac} max_abs={max_abs}",
+          path=path_str,
+          finite_frac=finite_frac,
+          max_abs=max_abs,
+      )
+
+    jax.lax.cond(selected, print_leaf, lambda _: None, operand=None)
 
 def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   _, noise_rng, timestep_rng, dropout_rng, new_rng = jax.random.split(rng, num=5)
@@ -336,7 +391,12 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   raw_grads_all_finite = _tree_all_finite(grads)
   trainable_grad_mask = _make_trainable_grad_mask(grads, config)
   trainable_param_fraction = _mask_fraction(trainable_grad_mask)
+  trainable_grads_finite_frac_before_sanitize = _masked_finite_fraction(grads, trainable_grad_mask)
+  trainable_grads_all_finite_before_sanitize = _masked_all_finite(grads, trainable_grad_mask)
+  _debug_print_trainable_grad_stats(grads, trainable_grad_mask, config)
   grads = _apply_trainable_grad_mask(grads, trainable_grad_mask)
+  if _as_bool(getattr(config, "frame_concat_sanitize_nonfinite_trainable_grads", False)):
+    grads = _sanitize_nonfinite_grads(grads)
   max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
   max_abs_grad = _tree_max_abs(grads)
   grads_finite_frac = _finite_fraction(grads)
@@ -399,6 +459,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           "debug/raw_grads_finite_frac": raw_grads_finite_frac,
           "debug/raw_grads_all_finite": raw_grads_all_finite.astype(jnp.float32),
           "debug/trainable_param_fraction": trainable_param_fraction,
+          "debug/trainable_grads_finite_frac_before_sanitize": trainable_grads_finite_frac_before_sanitize,
+          "debug/trainable_grads_all_finite_before_sanitize": trainable_grads_all_finite_before_sanitize.astype(jnp.float32),
           "debug/grads_finite_frac": grads_finite_frac,
           "debug/grads_all_finite": grads_all_finite.astype(jnp.float32),
           "debug/params_finite_frac_after_update": params_finite_frac_after_update,

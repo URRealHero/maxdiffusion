@@ -411,6 +411,10 @@ debug_precompile_train_step: False
 # Debug-only: load the next batch synchronously after the step instead of prefetching in a thread.
 debug_disable_async_next_batch: False
 frame_concat_debug_print: False
+# Debug LoRA/trainable gradient leaves inside frame-concat training.
+frame_concat_debug_trainable_grad_stats: False
+# Debug/smoke safety: replace non-finite trainable gradients with zero before optimizer update.
+frame_concat_sanitize_nonfinite_trainable_grads: False
 # If true, skip optimizer update when loss or selected trainable gradients are non-finite.
 frame_concat_skip_nonfinite_update: False
 # Comma-separated path substrings. Empty means full finetune. For self-attn-only use: attn1

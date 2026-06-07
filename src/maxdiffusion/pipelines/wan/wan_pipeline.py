@@ -200,6 +200,42 @@ def create_sharded_logical_transformer(
       val_on_host = jax.experimental.multihost_utils.process_allgather(val, tiled=True)
       state[path].value = device_put_replicated(val_on_host, sharding)
       del val_on_host
+
+  # Materialize params absent from the checkpoint (e.g. LoRA adapters) that
+  # nnx.eval_shape left as abstract ShapeDtypeStruct. Without this they reach
+  # the trainer as ShapeDtypeStruct and crash jnp.asarray.
+  # Matches PEFT/DiffSynth LoRA init (init_lora_weights=True):
+  #   lora_B kernel -> zeros  (up-proj zero -> LoRA delta == 0 at init, model == base)
+  #   lora_A kernel -> falls through to the generic 'kernel' branch below, i.e.
+  #     U(-1/sqrt(fan_in), 1/sqrt(fan_in)) == nn.init.kaiming_uniform_(a=sqrt(5)),
+  #     fan_in = prod(shape[:-1]) = in_features (NOT rank).
+  #   scale -> ones, bias -> zeros, other kernel -> LeCun uniform,
+  #   remaining -> scaled normal (matches WanTransformerBlock table init)
+  fresh_key = jax.random.PRNGKey(0)
+  for path, var in state.items():
+    if isinstance(var.value, jax.Array):
+      continue
+    fresh_key, subkey = jax.random.split(fresh_key)
+    sds = var.value  # jax.ShapeDtypeStruct
+    sharding = logical_state_sharding[path].value
+    path_str = "/".join(str(p) for p in path)
+    name = path[-1]
+    if "lora_B" in path_str:
+      init_val = jnp.zeros(sds.shape, dtype=sds.dtype)
+    elif name == "scale":
+      init_val = jnp.ones(sds.shape, dtype=sds.dtype)
+    elif name == "bias":
+      init_val = jnp.zeros(sds.shape, dtype=sds.dtype)
+    elif name == "kernel":
+      fan_in = max(1, int(math.prod(sds.shape[:-1])))
+      bound = 1.0 / math.sqrt(fan_in)
+      init_val = jax.random.uniform(subkey, sds.shape, dtype=jnp.float32, minval=-bound, maxval=bound).astype(sds.dtype)
+    else:
+      std = 1.0 / math.sqrt(max(1, sds.shape[-1]))
+      init_val = (jax.random.normal(subkey, sds.shape, dtype=jnp.float32) * std).astype(sds.dtype)
+    state[path].value = device_put_replicated(init_val, sharding)
+    max_logging.log(f"fresh-init ({name}): {path} shape={sds.shape}")
+
   state = nnx.from_flat_state(state)
 
   wan_transformer = nnx.merge(graphdef, state, rest_of_state)
