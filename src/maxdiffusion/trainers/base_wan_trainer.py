@@ -425,6 +425,19 @@ class BaseWanTrainer(abc.ABC):
           _debug_training_loop_log(self.config, f"step {step}: after p_train_step dispatch, before loss block_until_ready")
           train_metric["scalar"]["learning/loss"].block_until_ready()
           _debug_training_loop_log(self.config, f"step {step}: after loss block_until_ready")
+          # Hard-stop on non-finite (NaN/Inf) loss so a diverged or misconfigured
+          # run fails loudly instead of silently burning compute. Trainers that
+          # intentionally skip bad batches (frame_concat_skip_nonfinite_update)
+          # opt out; disable globally with stop_on_nonfinite_loss=False.
+          _stop_on_nonfinite = str(getattr(self.config, "stop_on_nonfinite_loss", True)).lower() == "true"
+          _skip_nonfinite = str(getattr(self.config, "frame_concat_skip_nonfinite_update", False)).lower() == "true"
+          if _stop_on_nonfinite and not _skip_nonfinite:
+            _loss_value = float(train_metric["scalar"]["learning/loss"])
+            if not np.isfinite(_loss_value):
+              raise RuntimeError(
+                  f"Non-finite training loss ({_loss_value}) at step {step}; stopping training. "
+                  "Disable this guard with stop_on_nonfinite_loss=False."
+              )
         last_step_completion = datetime.datetime.now()
 
         if max_utils.profiler_enabled(self.config) and step == last_profiling_step:

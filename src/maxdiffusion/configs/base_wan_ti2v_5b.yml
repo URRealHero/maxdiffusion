@@ -289,6 +289,11 @@ max_grad_value: 1.0
 opt_enable_grad_global_norm_clipping: False
 max_grad_norm: 1.0
 
+# Hard-stop training (raise RuntimeError) if the loss becomes non-finite
+# (NaN/Inf), instead of silently continuing. Trainers using
+# frame_concat_skip_nonfinite_update opt out automatically.
+stop_on_nonfinite_loss: True
+
 enable_profiler: False
 # Skip first n steps for profiling, to omit things like compilation and to give
 # the iteration time a chance to stabilize.

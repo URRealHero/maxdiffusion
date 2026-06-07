@@ -98,7 +98,9 @@ class WanVACETransformerBlock(nnx.Module):
     self.apply_input_projection = apply_input_projection
     self.apply_output_projection = apply_output_projection
 
-    # 1. Input projection
+    # 1. Input projection ("before_proj"): ZERO-init the kernel (bias defaults to
+    # zeros) so the VACE branch starts as a clean no-op (c = 0 + hidden_states).
+    # Matches official Wan VACE `nn.init.zeros_(before_proj.{weight,bias})`.
     self.proj_in = nnx.data([None])
     if apply_input_projection:
       self.proj_in = nnx.Linear(
@@ -108,7 +110,7 @@ class WanVACETransformerBlock(nnx.Module):
           dtype=dtype,
           param_dtype=weights_dtype,
           precision=precision,
-          kernel_init=nnx.with_partitioning(nnx.initializers.xavier_uniform(), ("embed", None)),
+          kernel_init=nnx.with_partitioning(nnx.initializers.zeros, ("embed", None)),
       )
 
     # 2. Self-attention
@@ -177,7 +179,11 @@ class WanVACETransformerBlock(nnx.Module):
 
     self.norm3 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=False)
 
-    # 5. Output projection
+    # 5. Output projection ("after_proj"): ZERO-init the kernel (bias defaults to
+    # zeros) so the control branch contributes nothing at init (ControlNet
+    # zero-conv). Without this the fresh branch injects random residuals at full
+    # scale across all vace_layers and overflows to NaN in bf16. Matches official
+    # Wan VACE `nn.init.zeros_(after_proj.{weight,bias})`.
     self.proj_out = nnx.data([None])
     if apply_output_projection:
       self.proj_out = nnx.Linear(
@@ -187,7 +193,7 @@ class WanVACETransformerBlock(nnx.Module):
           dtype=dtype,
           param_dtype=weights_dtype,
           precision=precision,
-          kernel_init=nnx.with_partitioning(nnx.initializers.xavier_uniform(), ("embed", None)),
+          kernel_init=nnx.with_partitioning(nnx.initializers.zeros, ("embed", None)),
       )
 
     key = rngs.params()
