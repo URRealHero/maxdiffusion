@@ -233,6 +233,8 @@ class ApproximateGELU(nnx.Module):
       dtype: jnp.dtype = jnp.float32,
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
   ):
     self.proj = nnx.Linear(
         rngs=rngs,
@@ -251,11 +253,18 @@ class ApproximateGELU(nnx.Module):
         ),
         bias_init=nnx.with_partitioning(nnx.initializers.zeros, ("mlp",)),
     )
+    # ffn.0 LoRA: applied to the output of this linear, before GELU.
+    self.lora_rank = lora_rank
+    if lora_rank > 0:
+      effective_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+      self.lora_ffn0 = WanLoRAAdapter(dim_in, dim_out, lora_rank, effective_alpha, dtype, weights_dtype, precision, rngs)
 
   def __call__(self, x: jax.Array) -> jax.Array:
     with jax.named_scope("gelu"):
-      x = self.proj(x)
-    return nnx.gelu(x)
+      h = self.proj(x)
+      if self.lora_rank > 0:
+        h = h + self.lora_ffn0(x)
+    return nnx.gelu(h)
 
 
 class WanFeedForward(nnx.Module):
@@ -275,6 +284,8 @@ class WanFeedForward(nnx.Module):
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
       enable_jax_named_scopes: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
   ):
     if inner_dim is None:
       inner_dim = int(dim * mult)
@@ -291,6 +302,8 @@ class WanFeedForward(nnx.Module):
           dtype=dtype,
           weights_dtype=weights_dtype,
           precision=precision,
+          lora_rank=lora_rank,
+          lora_alpha=lora_alpha,
       )
     else:
       raise NotImplementedError(f"{activation_fn} is not implemented.")
@@ -312,6 +325,11 @@ class WanFeedForward(nnx.Module):
             ),
         ),
     )
+    # ffn.2 LoRA: applied to the output of proj_out.
+    self.lora_rank = lora_rank
+    if lora_rank > 0:
+      effective_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+      self.lora_ffn2 = WanLoRAAdapter(inner_dim, dim_out, lora_rank, effective_alpha, dtype, weights_dtype, precision, rngs)
 
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
@@ -323,12 +341,15 @@ class WanFeedForward(nnx.Module):
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
   ) -> jax.Array:
-    hidden_states = self.act_fn(hidden_states)  # Output is (4, 75600, 13824)
+    hidden_states = self.act_fn(hidden_states)
     hidden_states = checkpoint_name(hidden_states, "ffn_activation")
     if self.drop_out.rate > 0:
       hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
     with jax.named_scope("proj_out"):
-      return self.proj_out(hidden_states)  # output is (4, 75600, 5120)
+      out = self.proj_out(hidden_states)
+      if self.lora_rank > 0:
+        out = out + self.lora_ffn2(hidden_states)
+      return out
 
 
 class WanTransformerBlock(nnx.Module):
@@ -384,9 +405,11 @@ class WanTransformerBlock(nnx.Module):
         enable_jax_named_scopes=enable_jax_named_scopes,
         use_base2_exp=use_base2_exp,
         use_experimental_scheduler=use_experimental_scheduler,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
     )
 
-    # 1. Cross-attention
+    # 2. Cross-attention
     self.attn2 = FlaxWanAttention(
         rngs=rngs,
         query_dim=dim,
@@ -410,6 +433,8 @@ class WanTransformerBlock(nnx.Module):
         enable_jax_named_scopes=enable_jax_named_scopes,
         use_base2_exp=use_base2_exp,
         use_experimental_scheduler=use_experimental_scheduler,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
     )
     assert cross_attn_norm is True
     self.norm2 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=True)
@@ -425,6 +450,8 @@ class WanTransformerBlock(nnx.Module):
         precision=precision,
         dropout=dropout,
         enable_jax_named_scopes=enable_jax_named_scopes,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
     )
     self.norm3 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=False)
 
@@ -432,12 +459,6 @@ class WanTransformerBlock(nnx.Module):
     self.adaln_scale_shift_table = nnx.Param(
         jax.random.normal(key, (1, 6, dim)) / dim**0.5,
     )
-
-    self.lora_rank = lora_rank
-    if lora_rank > 0:
-      self.lora_attn1 = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
-      self.lora_attn2 = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
-      self.lora_ffn   = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
 
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
@@ -501,8 +522,7 @@ class WanTransformerBlock(nnx.Module):
               rngs=rngs,
           )
         with self.conditional_named_scope("self_attn_residual"):
-          lora_delta = self.lora_attn1(norm_hidden_states).astype(jnp.float32) if self.lora_rank > 0 else 0
-          hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa + lora_delta).astype(hidden_states.dtype)
+          hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(hidden_states.dtype)
 
       # 2. Cross-attention
       with self.conditional_named_scope("cross_attn"):
@@ -518,8 +538,7 @@ class WanTransformerBlock(nnx.Module):
               cached_kv=cached_kv,
           )
         with self.conditional_named_scope("cross_attn_residual"):
-          lora_delta = self.lora_attn2(norm_hidden_states) if self.lora_rank > 0 else 0
-          hidden_states = hidden_states + attn_output + lora_delta
+          hidden_states = hidden_states + attn_output
 
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
@@ -530,8 +549,7 @@ class WanTransformerBlock(nnx.Module):
         with self.conditional_named_scope("mlp_ffn"):
           ff_output = self.ffn(norm_hidden_states, deterministic=deterministic, rngs=rngs)
         with self.conditional_named_scope("mlp_residual"):
-          lora_delta = self.lora_ffn(norm_hidden_states).astype(jnp.float32) if self.lora_rank > 0 else 0
-          hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa + lora_delta).astype(
+          hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa).astype(
               hidden_states.dtype
           )
       return hidden_states

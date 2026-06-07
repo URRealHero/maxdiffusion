@@ -14,33 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""LoRA adapter primitives for WAN transformers.
+"""LoRA adapter for WAN transformers — standard matrix LoRA.
 
-Design
-------
-Each ``WanLoRAAdapter`` is a single (A, B) low-rank pair that can be added
-**in parallel** with any sub-block inside ``WanTransformerBlock``:
+Matches the official DiffSynth / Captain-Safari recipe:
+  target modules: q, k, v, o  (self-attn + cross-attn), ffn.0, ffn.2
+  rank:   32  (default)
+  alpha:  32  (= rank → effective scale = 1.0)
+  init:   A ~ N(0, 1/sqrt(rank)),  B = 0  → delta starts at zero
 
-    output = sub_block(x) + lora_adapter(norm_x)
+The adapter is applied INSIDE each targeted linear layer:
+  output = W(x) + lora_B(lora_A(x)) * scale
 
-where ``norm_x`` is the layer-normed input to the sub-block.  This is the
-standard parallel-adapter pattern used in many LoRA variants (it is equivalent
-to adding LoRA on the residual stream at that position).
-
-Three adapters are added per block:
-  * ``lora_attn1`` — self-attention residual stream
-  * ``lora_attn2`` — cross-attention residual stream
-  * ``lora_ffn``   — feed-forward residual stream
-
-Trainable param paths all start with ``lora_``, so the existing
-``_make_trainable_grad_mask`` in ``wan_vace_trainer.py`` can freeze everything
-else when ``lora_trainable_param_substrings = "lora_"``.
-
-Checkpoint compatibility
-------------------------
-LoRA weights are saved under ``lora_attn1.lora_A.kernel``,
-``lora_attn1.lora_B.kernel``, etc.  At inference the saved weights are merged
-into the base model via the existing ``lora_nnx.merge_lora`` utility.
+Trainable param paths all contain "lora_", so
+  lora_trainable_param_substrings: "lora_"
+in the training config freezes all base weights automatically.
 """
 
 import jax
@@ -49,13 +36,15 @@ from flax import nnx
 
 
 class WanLoRAAdapter(nnx.Module):
-  """One (A, B) LoRA pair for a single residual-stream position.
+  """One (A, B) LoRA pair for a single linear layer.
 
   Parameters
   ----------
-  dim:          Hidden dimension of the residual stream (e.g. 3072 for 5B).
+  in_features:  Input dimension of the target linear layer.
+  out_features: Output dimension of the target linear layer.
   rank:         LoRA rank (e.g. 32).
   alpha:        LoRA alpha; effective scale = alpha / rank.
+                Set alpha = rank for scale = 1.0 (DiffSynth default).
   dtype:        Activation dtype.
   weights_dtype: Parameter storage dtype.
   precision:    JAX matmul precision.
@@ -64,7 +53,8 @@ class WanLoRAAdapter(nnx.Module):
 
   def __init__(
       self,
-      dim: int,
+      in_features: int,
+      out_features: int,
       rank: int,
       alpha: float,
       dtype: jnp.dtype,
@@ -74,11 +64,11 @@ class WanLoRAAdapter(nnx.Module):
   ):
     self.scale = alpha / rank
 
-    # A: down-project to rank.  Normal init (std = 1/sqrt(rank)).
-    # B: up-project back to dim.  Zero init → delta starts at 0.
-    # Both are replicated (None, None) because rank is small (~32).
+    # A: down-project to rank.  Kaiming/LeCun normal init (std = 1/sqrt(rank)).
+    # B: up-project to out_features.  Zero init → delta starts at 0.
+    # Both replicated (None, None) — rank is small (~32) so no sharding needed.
     self.lora_A = nnx.Linear(
-        in_features=dim,
+        in_features=in_features,
         out_features=rank,
         use_bias=False,
         dtype=dtype,
@@ -92,7 +82,7 @@ class WanLoRAAdapter(nnx.Module):
     )
     self.lora_B = nnx.Linear(
         in_features=rank,
-        out_features=dim,
+        out_features=out_features,
         use_bias=False,
         dtype=dtype,
         param_dtype=weights_dtype,
@@ -105,5 +95,5 @@ class WanLoRAAdapter(nnx.Module):
     )
 
   def __call__(self, x: jax.Array) -> jax.Array:
-    """Return lora_B(lora_A(x)) * scale.  x shape: (B, seq, dim)."""
+    """Return lora_B(lora_A(x)) * scale."""
     return self.lora_B(self.lora_A(x)) * self.scale

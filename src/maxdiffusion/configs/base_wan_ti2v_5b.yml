@@ -381,7 +381,7 @@ vace_debug_forward_only: False
 vace_debug_print: False
 # LoRA fine-tuning. rank=0 disables LoRA (full fine-tune or frozen).
 lora_rank: 0
-lora_alpha: 1.0
+lora_alpha: 0  # 0 = use rank as alpha (scale=1.0, matching DiffSynth default)
 # Substrings that identify trainable params for LoRA training.
 # Set to "lora_" to freeze all base weights and train only adapter kernels.
 # Empty string = no override (fall back to frame_concat_trainable_param_substrings).

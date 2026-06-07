@@ -1375,6 +1375,8 @@ class FlaxWanAttention(nnx.Module):
       image_seq_len: Optional[int] = None,  # New for I2V
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
   ):
     if attention_kernel in {"flash", "cudnn_flash_te"} and mesh is None:
       raise ValueError(f"The flash attention kernel requires a value for mesh, but mesh is {self.mesh}")
@@ -1553,6 +1555,18 @@ class FlaxWanAttention(nnx.Module):
           ),
       )
 
+    # Standard matrix LoRA on q, k, v, o — matches DiffSynth / Captain-Safari.
+    # alpha=0 sentinel means "use rank as alpha" (scale = 1.0), same as DiffSynth default.
+    self.lora_rank = lora_rank
+    if lora_rank > 0:
+      from maxdiffusion.models.wan.wan_lora import WanLoRAAdapter
+      effective_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+      _lora = lambda: WanLoRAAdapter(self.inner_dim, self.inner_dim, lora_rank, effective_alpha, dtype, weights_dtype, precision, rngs)
+      self.lora_q = _lora()
+      self.lora_k = _lora()
+      self.lora_v = _lora()
+      self.lora_o = _lora()
+
   def _apply_rope(self, xq: jax.Array, xk: jax.Array, freqs_cis: jax.Array) -> Tuple[jax.Array, jax.Array]:
     # 1. Extract cos and sin, keeping them in native bfloat16
     cos = jnp.real(freqs_cis).astype(xq.dtype)
@@ -1611,6 +1625,8 @@ class FlaxWanAttention(nnx.Module):
     if not is_i2v_cross_attention:
       with jax.named_scope("query_proj"):
         query_proj = self.query(hidden_states)
+      if self.lora_rank > 0:
+        query_proj = query_proj + self.lora_q(hidden_states)
 
       if self.qk_norm:
         with self.conditional_named_scope("attn_q_norm"):
@@ -1621,8 +1637,12 @@ class FlaxWanAttention(nnx.Module):
       else:
         with jax.named_scope("key_proj"):
           key_proj = self.key(encoder_hidden_states)
+        if self.lora_rank > 0:
+          key_proj = key_proj + self.lora_k(encoder_hidden_states)
         with jax.named_scope("value_proj"):
           value_proj = self.value(encoder_hidden_states)
+        if self.lora_rank > 0:
+          value_proj = value_proj + self.lora_v(encoder_hidden_states)
 
         if self.qk_norm:
           with self.conditional_named_scope("attn_k_norm"):
@@ -1744,6 +1764,8 @@ class FlaxWanAttention(nnx.Module):
 
     with jax.named_scope("proj_attn"):
       hidden_states = self.proj_attn(attn_output)
+      if self.lora_rank > 0:
+        hidden_states = hidden_states + self.lora_o(attn_output)
       if self.drop_out.rate > 0:
         hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
     return hidden_states
