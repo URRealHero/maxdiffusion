@@ -337,6 +337,8 @@ class WanVACEModel(WanModel):
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
       debug_vace_numerics: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
   ):
     """Initializes the VACE model.
 
