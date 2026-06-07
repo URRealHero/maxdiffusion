@@ -93,7 +93,7 @@ def create_sharded_animate_transformer(
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
-  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 1.0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
 
   # 2. eval_shape – creates the model structure without allocating HBM.
   p_model_factory = partial(_create_model, wan_config=wan_config)

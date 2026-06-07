@@ -21,7 +21,10 @@ Usage
 Add to your training config::
 
     lora_rank: 32
-    lora_alpha: 1.0
+    lora_alpha: 0       # 0 (or any value <= 0) is a sentinel meaning "use rank",
+                        # giving effective scale = alpha/rank = 1.0 (DiffSynth default).
+                        # Set lora_alpha: 32 to get the same scale explicitly; a
+                        # value like 1.0 would yield scale 1/32 -- a 32x weaker delta.
     lora_trainable_param_substrings: "lora_"
 
 This freezes all base transformer weights and trains only the lora_A / lora_B

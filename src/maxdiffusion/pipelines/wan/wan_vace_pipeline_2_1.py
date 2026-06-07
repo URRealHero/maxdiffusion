@@ -86,7 +86,7 @@ def create_sharded_logical_transformer(
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["debug_vace_numerics"] = str(getattr(config, "vace_debug_print", False)).lower() == "true"
   wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
-  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 1.0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
 
   wan_config["scan_layers"] = config.scan_layers
 

@@ -121,6 +121,9 @@ def write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step
 
   _buffered_step = step
   _buffered_metrics = metrics
+  # write_metrics_for_gcs resets running_gcs_metrics to a fresh list on flush,
+  # so the caller must capture the (possibly new) list to keep accumulating.
+  return running_gcs_metrics
 
 
 def write_metrics_to_tensorboard(writer, metrics, step, config):

@@ -676,13 +676,6 @@ class WanDupUp3D(nnx.Module):
     # x: (N, D, H, W, C)
     n, d, h, w, c_total = x.shape
     c = c_total // self.factor
-    jax.debug.print(
-        "DEBUG DupUp: c_total={ct}, factor={f}, c={c}, d={d}",
-        ct=c_total,
-        f=self.factor,
-        c=c,
-        d=d,
-    )
     # Interleave logic: (N, D, H, W, C_out, f_t, f_s, f_s)
     x = x.reshape(n, d, h, w, c, self.factor_t, self.factor_s, self.factor_s)
     # Permute to (N, D, f_t, H, f_s, W, f_s, C_out)

@@ -143,7 +143,7 @@ def create_sharded_logical_transformer(
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
-  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 1.0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
@@ -267,7 +267,14 @@ class WanPipeline:
     self.vae_logical_axis_rules = kwargs.get("vae_logical_axis_rules", config.logical_axis_rules)
 
     self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
-    self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+    # The WAN 2.2 VAE (AutoencoderKLWan2p2) applies an extra spatial pixel-shuffle
+    # patchify on top of the conv down-blocks, so its true spatial compression is
+    # 2**len(temperal_downsample) * patch_size (=16), not 8. The 2.1 VAE has no
+    # patch_size attribute, so this is a no-op there.
+    vae_spatial_patch = getattr(self.vae, "patch_size", 1) if getattr(self, "vae", None) else 1
+    self.vae_scale_factor_spatial = (
+        (2 ** len(self.vae.temperal_downsample)) * vae_spatial_patch if getattr(self, "vae", None) else 8
+    )
     self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
     self.p_run_inference = None

@@ -307,7 +307,7 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
     elif model_key == WAN2_2:
       if model_type == "I2V":
         checkpoint_loader = WanCheckpointerI2V_2_2(config=config)
-      elif model_type == "TI2V":
+      elif model_type in ("TI2V", "TI2V-CC"):
         checkpoint_loader = WanCheckpointer2_2_Dense(config=config)
       else:
         checkpoint_loader = WanCheckpointer2_2(config=config)

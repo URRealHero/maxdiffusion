@@ -102,7 +102,7 @@ def _create_sharded_logical_transformer_2_2_dense(
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["debug_vace_numerics"] = str(getattr(config, "vace_debug_print", False)).lower() == "true"
   wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
-  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 1.0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
 
   p_model_factory = partial(create_model, wan_config=wan_config)
   wan_vace_transformer = nnx.eval_shape(p_model_factory, rngs=rngs)

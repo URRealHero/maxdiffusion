@@ -427,7 +427,11 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
 
     cond_frames = cond_latents.shape[2]
     noise = jax.random.normal(key=rng, shape=latents.shape, dtype=latents.dtype)
-    noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
+    noisy_latents, training_target, _ = scheduler.apply_flow_match(noise, latents, timesteps)
+    # Use the same global per-timestep weighting as train_step (not
+    # apply_flow_match's batch-renormalized weight), so eval loss is on the
+    # same scale as the training loss and independent of eval batch composition.
+    training_weight = scheduler.training_weight(scheduler_state, timesteps)
     hidden_states = jnp.concatenate([cond_latents, noisy_latents], axis=2)
     # Get the model's prediction for the combined condition+target sequence,
     # then train only on the target slice.
@@ -464,12 +468,12 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
     cond_latents = data["cond_latents"][start:end, :].astype(config.weights_dtype)
     encoder_hidden_states = data["encoder_hidden_states"][start:end, :].astype(config.weights_dtype)
     timesteps = data["timesteps"][start:end].astype("int64")
-    _, new_rng = jax.random.split(rng, num=2)
-    loss = loss_fn(state.params, latents, cond_latents, encoder_hidden_states, timesteps, new_rng)
+    rng, sub_rng = jax.random.split(rng, num=2)
+    loss = loss_fn(state.params, latents, cond_latents, encoder_hidden_states, timesteps, sub_rng)
     losses = losses.at[start:end].set(loss)
 
   # Structure the metrics for logging and aggregation
   metrics = {"scalar": {"learning/eval_loss": losses}}
 
-  # Return the computed metrics and the new RNG key for the next eval step
-  return metrics, new_rng
+  # Return the computed metrics and the advanced RNG key for the next eval step
+  return metrics, rng

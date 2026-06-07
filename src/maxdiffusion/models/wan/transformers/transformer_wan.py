@@ -378,7 +378,7 @@ class WanTransformerBlock(nnx.Module):
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
       lora_rank: int = 0,
-      lora_alpha: float = 1.0,
+      lora_alpha: float = 0.0,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
 
@@ -603,7 +603,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
       lora_rank: int = 0,
-      lora_alpha: float = 1.0,
+      lora_alpha: float = 0.0,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels

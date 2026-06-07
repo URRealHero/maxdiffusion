@@ -143,18 +143,37 @@ def _make_tfrecord_iterator(
     # iterator_get_next (confirmed via py-spy). Sharding the file list first
     # means each host only opens its own files (e.g. 256 files / 64 hosts = 4).
     files_ds = tf.data.Dataset.from_tensor_slices(filenames)
-    files_ds = files_ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
-    files_ds = files_ds.shuffle(len(filenames))  # reshuffle file order each epoch
-    ds = files_ds.interleave(
-        lambda f: tf.data.TFRecordDataset(f),
-        cycle_length=4,
-        num_parallel_calls=4,  # bounded; avoids AUTOTUNE opening many GCS connections
-        deterministic=False,
-    )
+    if len(filenames) >= dataloading_host_count:
+      # Enough files to give every host a non-empty slice.
+      files_ds = files_ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+      files_ds = files_ds.shuffle(len(filenames))  # reshuffle file order each epoch
+      ds = files_ds.interleave(
+          lambda f: tf.data.TFRecordDataset(f),
+          cycle_length=4,
+          num_parallel_calls=4,  # bounded; avoids AUTOTUNE opening many GCS connections
+          deterministic=False,
+      )
+      ds = ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE).map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+    else:
+      # Fewer files than hosts: file-level sharding would leave some hosts with
+      # zero files -> an infinite empty dataset -> multi-host desync/hang at the
+      # collective. The file count is small here, so opening all files per host
+      # is cheap; shard at the record level instead (correctness over throughput).
+      max_logging.log(
+          f"Found {len(filenames)} TFRecord file(s) for {dataloading_host_count} dataloading host(s); "
+          "falling back to record-level sharding to avoid starving hosts."
+      )
+      files_ds = files_ds.shuffle(len(filenames))
+      ds = files_ds.interleave(
+          lambda f: tf.data.TFRecordDataset(f),
+          cycle_length=4,
+          num_parallel_calls=4,
+          deterministic=False,
+      )
+      ds = ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE).map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+      ds = ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
     ds = (
-        ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
-        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
-        .shuffle(global_batch_size * 10)
+        ds.shuffle(global_batch_size * 10)
         .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
         .repeat(-1)
         .prefetch(AUTOTUNE)

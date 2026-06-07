@@ -180,10 +180,9 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
 
     return loss, (jnp.min(timesteps), jnp.max(timesteps), jnp.mean(timesteps))
 
-  grad_fn = nnx.value_and_grad(loss_fn)
-  loss, grads = grad_fn(state.params)
-  max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
+  grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
   (loss, timestep_stats), grads = grad_fn(state.params)
+  max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
   timestep_min, timestep_max, timestep_mean = timestep_stats
   max_abs_grad = jax.tree_util.tree_reduce(
       lambda max_val, arr: jnp.maximum(max_val, jnp.max(jnp.abs(arr))),
