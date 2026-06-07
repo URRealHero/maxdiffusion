@@ -245,6 +245,9 @@ names_which_can_be_offloaded: []
 # checkpoint every number of samples, -1 means don't checkpoint.
 checkpoint_every: -1
 checkpoint_dir: ""
+# Inference only: load this specific Orbax step instead of the latest.
+# -1 (default) loads the latest step in checkpoint_dir.
+checkpoint_step: -1
 # enables one replica to read the ckpt then broadcast to the rest
 enable_single_replica_ckpt_restoring: False
 
@@ -306,6 +309,15 @@ width: 832
 num_frames: 81
 guidance_scale: 5.0
 flow_shift: 5.0
+
+# TI2V conditioning video (frame-concat inference).
+# Path to a local or GCS video file (.mp4) used as the conditioning sequence.
+# Leave empty ("") for unconditional (pure text-driven) generation.
+cond_video_path: ""
+# Number of frames to uniformly resample from the cond video before VAE encoding.
+# Must match the num_frames used when encoding the training TFRecords (e.g. 165).
+# Set to 0 to use all frames as-is (no resampling).
+cond_num_frames: 0
 
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
 use_cfg_cache: False

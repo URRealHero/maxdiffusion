@@ -86,6 +86,28 @@ class WanPipeline2_2_Dense(WanPipeline):
   def _get_num_channel_latents(self) -> int:
     return self.transformer.config.in_channels
 
+  def _encode_cond_video(self, video: jax.Array, dtype) -> jax.Array:
+    """VAE-encode a pixel-space video to normalized channel-first latents.
+
+    Args:
+      video: float32 array in [-1, 1], shape [B, C, F, H, W] (channel-first,
+             matching the WAN VAE encoder's expected input format).
+      dtype: target dtype for the returned latent.
+
+    Returns:
+      Latent array in channel-first format [B, C, F_lat, H_lat, W_lat].
+    """
+    vae_dtype = getattr(self.vae, "dtype", jnp.float32)
+    video = video.astype(vae_dtype)
+    with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      # VAE encodes [B, C, F, H, W] → [B, F_lat, H_lat, W_lat, C] (channel-last output)
+      encoded = self.vae.encode(video, self.vae_cache)[0].mode()
+    latents_mean = jnp.array(self.vae.latents_mean).reshape(1, 1, 1, 1, self.vae.z_dim)
+    latents_std = jnp.array(self.vae.latents_std).reshape(1, 1, 1, 1, self.vae.z_dim)
+    latents = (encoded - latents_mean) / latents_std  # [B, F_lat, H_lat, W_lat, C]
+    latents = jnp.transpose(latents, (0, 4, 1, 2, 3))  # → [B, C, F_lat, H_lat, W_lat]
+    return latents.astype(dtype)
+
   def __call__(
       self,
       prompt: Union[str, List[str]] = None,
@@ -107,6 +129,7 @@ class WanPipeline2_2_Dense(WanPipeline):
       magcache_K: Optional[int] = None,
       retention_ratio: Optional[float] = None,
       use_kv_cache: bool = False,
+      cond_latents: Optional[jax.Array] = None,
   ):
     config = getattr(self, "config", None)
     if magcache_thresh is None:
@@ -120,6 +143,11 @@ class WanPipeline2_2_Dense(WanPipeline):
       raise ValueError(
           f"use_cfg_cache=True requires guidance_scale > 1.0 (got {guidance_scale}). "
           "CFG cache accelerates classifier-free guidance, which is disabled when guidance_scale <= 1.0."
+      )
+    if cond_latents is not None and (use_cfg_cache or use_magcache):
+      raise ValueError(
+          "cond_latents (frame-concat conditioning) is not supported with use_cfg_cache or use_magcache. "
+          "Set use_cfg_cache=False and use_magcache=False."
       )
     trace = {}
     t_cond_start = time.perf_counter()
@@ -159,6 +187,7 @@ class WanPipeline2_2_Dense(WanPipeline):
         mag_ratios_base=getattr(config, "mag_ratios_base", None),
         config=self.config,
         use_kv_cache=use_kv_cache,
+        cond_latents=cond_latents,
     )
 
     t_denoise_start = time.perf_counter()
@@ -204,6 +233,7 @@ def run_inference_2_2_dense(
     mag_ratios_base: Optional[List[float]] = None,
     config=None,
     use_kv_cache: bool = False,
+    cond_latents: Optional[jnp.ndarray] = None,
 ):
   """Denoising loop for Wan2.2 dense single-transformer models."""
   do_cfg = guidance_scale > 1.0
@@ -259,10 +289,29 @@ def run_inference_2_2_dense(
 
   transformer_obj = nnx.merge(graphdef, sharded_state, rest_of_state)
 
-  # Compute RoPE once as it only depends on shape
+  num_cond = cond_latents.shape[2] if cond_latents is not None else 0
+
+  # Helpers for prepending cond frames and slicing noise predictions.
+  def _prepend_cond(x):
+    """Prepend cond_latents to x along temporal axis (axis=2)."""
+    if num_cond == 0:
+      return x
+    # x may be [B, C, T, H, W] or [2B, C, T, H, W] for CFG-doubled inputs.
+    batch_mult = x.shape[0] // latents.shape[0]
+    cond_rep = jnp.concatenate([cond_latents] * batch_mult, axis=0)
+    return jnp.concatenate([cond_rep, x], axis=2)
+
+  def _slice_target(pred):
+    """Remove cond-frame positions from a noise prediction."""
+    if num_cond == 0:
+      return pred
+    return pred[:, :, num_cond:, :, :]
+
+  # Compute RoPE once; use full temporal dim (cond + target) when conditioning.
+  T_full = num_cond + latents.shape[2]
   dummy_hidden_states = jnp.zeros((
       latents.shape[0],
-      latents.shape[2],
+      T_full,
       latents.shape[3],
       latents.shape[4],
       latents.shape[1],
@@ -295,6 +344,11 @@ def run_inference_2_2_dense(
   scan_diffusion_loop = getattr(config, "scan_diffusion_loop", False) if config else False
 
   if scan_diffusion_loop and not use_magcache and not use_cfg_cache:
+    if num_cond > 0:
+      raise ValueError(
+          "scan_diffusion_loop=True is not supported with cond_latents. "
+          "Set scan_diffusion_loop=False."
+      )
     timesteps = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)
 
     scheduler_state = scheduler_state.replace(last_sample=jnp.zeros_like(latents), step_index=jnp.array(0, dtype=jnp.int32))
@@ -366,11 +420,12 @@ def run_inference_2_2_dense(
           skip_warmup,
       )
 
+      latents_for_magcache = _prepend_cond(jnp.concatenate([latents] * 2) if do_cfg else latents)
       noise_pred, latents, residual_x_cur = transformer_forward_pass(
           graphdef,
           sharded_state,
           rest_of_state,
-          jnp.concatenate([latents] * 2) if do_cfg else latents,
+          latents_for_magcache,
           timestep,
           prompt_embeds_combined if do_cfg else prompt_cond_embeds,
           do_classifier_free_guidance=do_cfg,
@@ -382,6 +437,9 @@ def run_inference_2_2_dense(
           rotary_emb=rotary_emb,
           encoder_attention_mask=encoder_attention_mask,
       )
+      noise_pred = _slice_target(noise_pred)
+      latents = _slice_target(latents)
+      residual_x_cur = _slice_target(residual_x_cur)
 
       if not skip_blocks:
         cached_residual = residual_x_cur
@@ -398,7 +456,7 @@ def run_inference_2_2_dense(
             graphdef,
             sharded_state,
             rest_of_state,
-            latents,
+            _prepend_cond(latents),
             timestep,
             prompt_cond_embeds,
             cached_noise_cond,
@@ -410,6 +468,8 @@ def run_inference_2_2_dense(
             rotary_emb=rotary_emb,
             encoder_attention_mask=encoder_attention_mask_cond,
         )
+        noise_pred = _slice_target(noise_pred)
+        cached_noise_cond = _slice_target(cached_noise_cond)
 
       elif do_cfg:
         latents_doubled = jnp.concatenate([latents] * 2)
@@ -422,7 +482,7 @@ def run_inference_2_2_dense(
             graphdef,
             sharded_state,
             rest_of_state,
-            latents_doubled,
+            _prepend_cond(latents_doubled),
             timestep,
             prompt_embeds_combined,
             guidance_scale=guidance_scale,
@@ -430,6 +490,9 @@ def run_inference_2_2_dense(
             rotary_emb=rotary_emb,
             encoder_attention_mask=encoder_attention_mask,
         )
+        noise_pred = _slice_target(noise_pred)
+        cached_noise_cond = _slice_target(cached_noise_cond)
+        cached_noise_uncond = _slice_target(cached_noise_uncond)
 
       else:
         timestep = jnp.broadcast_to(t, bsz)
@@ -437,7 +500,7 @@ def run_inference_2_2_dense(
             graphdef,
             sharded_state,
             rest_of_state,
-            latents,
+            _prepend_cond(latents),
             timestep,
             prompt_cond_embeds,
             do_classifier_free_guidance=False,
@@ -446,6 +509,8 @@ def run_inference_2_2_dense(
             rotary_emb=rotary_emb,
             encoder_attention_mask=encoder_attention_mask,
         )
+        noise_pred = _slice_target(noise_pred)
+        latents = _slice_target(latents)
 
     latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
 

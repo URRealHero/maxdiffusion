@@ -14,9 +14,11 @@
 
 from typing import Sequence
 import jax
+import jax.numpy as jnp
 import time
 import os
 import subprocess
+import tempfile
 import numpy as np
 from maxdiffusion import pyconfig, max_logging, max_utils
 from maxdiffusion.checkpointing.wan_checkpointer_2_1 import WanCheckpointer2_1
@@ -189,6 +191,21 @@ def call_pipeline(config, pipeline, prompt, negative_prompt):
       raise ValueError(f"Unsupported model_name for I2V in config: {model_key}")
   elif model_type in ("TI2V", "TI2V-CC"):
     if model_key == WAN2_2:
+      # Encode conditioning video if a path is provided.
+      cond_latents = None
+      cond_video_path = getattr(config, "cond_video_path", "")
+      if cond_video_path:
+        cond_num_frames = getattr(config, "cond_num_frames", 0)
+        max_logging.log(f"Loading cond video from: {cond_video_path}" + (f" (resampled to {cond_num_frames} frames)" if cond_num_frames > 0 else ""))
+        pixel_video = _load_video_frames(cond_video_path, config.height, config.width, num_frames=cond_num_frames)
+        cond_jnp = jnp.asarray(pixel_video)  # [1, 3, F, H, W] channel-first
+        activations_dtype = getattr(config, "activations_dtype", jnp.bfloat16)
+        cond_latents = pipeline._encode_cond_video(cond_jnp, dtype=activations_dtype)
+        # Tile to match batch size.
+        bsz = len(prompt)
+        if bsz > 1:
+          cond_latents = jnp.concatenate([cond_latents] * bsz, axis=0)
+        max_logging.log(f"Encoded cond_latents shape: {cond_latents.shape}")
       return pipeline(
           prompt=prompt,
           negative_prompt=negative_prompt,
@@ -203,6 +220,7 @@ def call_pipeline(config, pipeline, prompt, negative_prompt):
           magcache_K=config.magcache_K,
           retention_ratio=config.retention_ratio,
           use_kv_cache=config.use_kv_cache,
+          cond_latents=cond_latents,
       )
     else:
       raise ValueError(f"Unsupported model_name for TI2V in config: {model_key}")
@@ -284,9 +302,64 @@ def inference_generate_video(config, pipeline, filename_prefix="", writer=None, 
   return
 
 
+def _load_video_frames(path: str, height: int, width: int, num_frames: int = 0) -> np.ndarray:
+  """Load a video file (local or GCS) and return float32 frames in [-1, 1].
+
+  Args:
+    num_frames: if > 0, uniformly resample (or pad) the decoded frames to this
+                count, matching encode_tv2v.py's sample_mode="uniform" logic.
+                Set to 0 to use all decoded frames as-is.
+  Returns:
+    np.ndarray of shape [1, 3, F, H, W] float32, channel-first.
+    Matches the WAN VAE encoder's expected input format.
+  """
+  import cv2
+
+  if path.startswith("gs://"):
+    suffix = os.path.splitext(path)[-1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    subprocess.run(["gsutil", "-q", "cp", path, tmp.name], check=True)
+    local_path = tmp.name
+  else:
+    local_path = path
+
+  cap = cv2.VideoCapture(local_path)
+  frames = []
+  while True:
+    ret, frame = cap.read()
+    if not ret:
+      break
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if frame.shape[0] != height or frame.shape[1] != width:
+      frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    frames.append(frame)
+  cap.release()
+  if path.startswith("gs://"):
+    os.unlink(local_path)
+
+  if num_frames > 0:
+    # Uniform resample: matches encode_tv2v.py sample_frames(mode="uniform").
+    # If video is shorter than num_frames, last frame is repeated (padding).
+    n = len(frames)
+    if n >= num_frames:
+      indices = np.linspace(0, n - 1, num_frames).round().astype(np.int64)
+    else:
+      indices = list(range(n)) + [n - 1] * (num_frames - n)
+    frames = [frames[i] for i in indices]
+
+  frames = np.stack(frames, axis=0).astype(np.float32) / 127.5 - 1.0  # [F, H, W, 3]
+  frames = np.transpose(frames, (3, 0, 1, 2))  # [3, F, H, W] channel-first
+  return frames[np.newaxis]  # [1, 3, F, H, W]
+
+
 def run(config, pipeline=None, filename_prefix="", commit_hash=None):
   model_key = config.model_name # WAN 2.1 / WAN 2.2
-  writer = max_utils.initialize_summary_writer(config) # tensorboard logging 
+  try:
+    writer = max_utils.initialize_summary_writer(config) # tensorboard logging
+  except AttributeError:
+    writer = None
+    max_logging.log("TensorBoard disabled: tensorboard_dir not set (run_name is empty).")
   if jax.process_index() == 0 and writer: # process 0 writes.
     max_logging.log(f"TensorBoard logs will be written to: {config.tensorboard_dir}")
 
@@ -313,7 +386,11 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
         checkpoint_loader = WanCheckpointer2_2(config=config)
     else:
       raise ValueError(f"Unsupported model_name for checkpointer: {model_key}")
-    pipeline, _, _ = checkpoint_loader.load_checkpoint() # loading
+    ckpt_step = getattr(config, "checkpoint_step", -1)
+    ckpt_step = int(ckpt_step) if ckpt_step is not None and int(ckpt_step) >= 0 else None
+    if ckpt_step is not None:
+      max_logging.log(f"Loading specific checkpoint step: {ckpt_step}")
+    pipeline, _, _ = checkpoint_loader.load_checkpoint(step=ckpt_step) # loading
     load_time = time.perf_counter() - load_start
     max_logging.log(f"load_time: {load_time:.1f}s")
   else:
@@ -391,7 +468,8 @@ def run(config, pipeline=None, filename_prefix="", commit_hash=None):
     export_to_video(videos[i], video_path, fps=config.fps)
     saved_video_path.append(video_path)
     if config.output_dir.startswith("gs://"):
-      upload_video_to_gcs(os.path.join(config.output_dir, config.run_name), video_path)
+      gcs_out_dir = os.path.join(config.output_dir, config.run_name) if config.run_name else config.output_dir
+      upload_video_to_gcs(gcs_out_dir, video_path)
 
   s0 = time.perf_counter()
   outputs = call_pipeline(config, pipeline, prompt, negative_prompt)
