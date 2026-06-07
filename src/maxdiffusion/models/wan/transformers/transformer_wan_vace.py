@@ -444,8 +444,11 @@ class WanVACEModel(WanModel):
         blocks.append(block)
       self.blocks = blocks
 
-    if scan_layers and list(self.config.vace_layers) != list(range(num_layers)):
-      raise NotImplementedError("scan_layers=True for VACE currently requires vace_layers to cover every layer")
+    # Sparse VACE scan: scan_layers=True but only a subset of layers have VACE
+    # blocks. Main blocks stay vmapped (scan-efficient), VACE blocks are kept as
+    # an nnx.List and run sequentially before the main-block scan (only 6 of them
+    # so the extra collective count is negligible vs the 40 scanned main blocks).
+    self._is_sparse_vace = scan_layers and (list(self.config.vace_layers) != list(range(num_layers)))
 
     @nnx.split_rngs(splits=num_layers)
     @nnx.vmap(
@@ -478,9 +481,11 @@ class WanVACEModel(WanModel):
           use_experimental_scheduler=use_experimental_scheduler,
       )
 
-    if scan_layers:
+    if scan_layers and not self._is_sparse_vace:
+      # Dense VACE scan: every layer has a VACE block; use vmapped blocks.
       self.vace_blocks = init_vace_block(rngs)
     else:
+      # Non-scan path or sparse-VACE-scan: VACE blocks as plain nnx.List.
       vace_blocks = nnx.List([])
       for vace_block_id in self.config.vace_layers:
         vace_block = WanVACETransformerBlock(
@@ -592,7 +597,20 @@ class WanVACEModel(WanModel):
       def _compute_kv(block, enc_states, enc_mask):
         return block.compute_kv(enc_states, enc_mask)
 
-      vace_kv_cache = _compute_kv(self.vace_blocks, encoder_hidden_states, encoder_attention_mask)
+      if self._is_sparse_vace:
+        # VACE blocks are nnx.List (not vmapped); compute KV caches with a loop.
+        vace_kv_cache_list = []
+        for block in self.vace_blocks:
+          vace_kv_cache_list.append(block.compute_kv(encoder_hidden_states, encoder_attention_mask))
+        vace_kv_cache = {}
+        if vace_kv_cache_list:
+          for k in vace_kv_cache_list[0].keys():
+            vace_kv_cache[k] = (
+                jnp.stack([d[k][0] for d in vace_kv_cache_list], axis=0),
+                jnp.stack([d[k][1] for d in vace_kv_cache_list], axis=0),
+            )
+      else:
+        vace_kv_cache = _compute_kv(self.vace_blocks, encoder_hidden_states, encoder_attention_mask)
       main_kv_cache = _compute_kv(self.blocks, encoder_hidden_states, encoder_attention_mask)
     else:
       vace_kv_cache_list = []
@@ -703,62 +721,167 @@ class WanVACEModel(WanModel):
 
     if self.scan_layers:
       control_scales = control_hidden_states_scale.astype(hidden_states.dtype)
-      layer_indices = jnp.arange(self.num_layers, dtype=jnp.int32)
 
-      def scan_fn(carry, block_input):
-        hidden_states_carry, control_hidden_states_carry, rngs_carry = carry
+      if self._is_sparse_vace:
+        # ---- Sparse VACE scan ----
+        # Phase 1: run the small VACE block set sequentially (only len(vace_layers)
+        # blocks, e.g. 6). control_hidden_states flows through as a chain carry.
+        conditioning_states_list = []
+        ctrl = control_hidden_states
+        for i, vace_block in enumerate(self.vace_blocks):
+          _vb = vace_block
+          _vkvc = jax.tree.map(lambda x, _i=i: x[_i], vace_kv_cache) if vace_kv_cache is not None else None
+
+          def _vace_fwd(hidden_states, ctrl, rngs, _vb=_vb, _vkvc=_vkvc):
+            return _vb(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                control_hidden_states=ctrl,
+                temb=timestep_proj,
+                rotary_emb=rotary_emb,
+                kv_cache=_vkvc,
+                encoder_attention_mask=encoder_attention_mask,
+                deterministic=deterministic,
+                rngs=rngs,
+            )
+
+          rematted_vace = self.gradient_checkpoint.apply(
+              _vace_fwd,
+              self.names_which_can_be_saved,
+              self.names_which_can_be_offloaded,
+              prevent_cse=not self.scan_layers,
+          )
+          conditioning_state, ctrl = rematted_vace(vace_base_hidden_states, ctrl, rngs)
+          self.debug_finite(f"sparse_vace_block_{i}_conditioning", conditioning_state)
+          conditioning_states_list.append(conditioning_state)
+
+        # Stack all conditioning outputs: [num_vace_layers, B, S, D]
+        vace_skips = jnp.stack(conditioning_states_list, axis=0)
+
+        # Build static per-main-layer lookup arrays (Python loops over static config).
+        vace_layers_list = list(self.config.vace_layers)
+        vace_layers_set = set(vace_layers_list)
+        _vace_idx, _is_vace, _ctrl_scale = [], [], []
+        for j in range(self.num_layers):
+          if j in vace_layers_set:
+            vi = vace_layers_list.index(j)
+            _vace_idx.append(vi)
+            _is_vace.append(True)
+            _ctrl_scale.append(control_scales[vi])
+          else:
+            _vace_idx.append(0)  # safe index — unused when is_vace=False
+            _is_vace.append(False)
+            _ctrl_scale.append(jnp.zeros((), dtype=hidden_states.dtype))
+        layer_vace_idx = jnp.array(_vace_idx, dtype=jnp.int32)    # [num_layers]
+        layer_is_vace = jnp.array(_is_vace, dtype=jnp.bool_)       # [num_layers]
+        layer_ctrl_scale = jnp.stack(_ctrl_scale, axis=0)           # [num_layers]
+
+        # Phase 2: scan all main blocks with conditional VACE skip injection.
+        def scan_fn_sparse(carry, block_input):
+          hidden_states_carry, rngs_carry = carry
+          if main_kv_cache is not None:
+            main_block, main_layer_kv_cache, vace_idx, is_vace, ctrl_scale = block_input
+          else:
+            main_block, vace_idx, is_vace, ctrl_scale = block_input
+            main_layer_kv_cache = None
+
+          hidden_states_out = main_block(
+              hidden_states_carry,
+              encoder_hidden_states,
+              timestep_proj,
+              rotary_emb,
+              deterministic,
+              rngs_carry,
+              encoder_attention_mask=encoder_attention_mask,
+              cached_kv=main_layer_kv_cache,
+          )
+          # Dynamic index into pre-computed conditioning states; safe-index (0)
+          # for non-VACE layers (masked out by is_vace below).
+          skip = jnp.take(vace_skips, vace_idx, axis=0)
+          hidden_states_out = jnp.where(
+              is_vace,
+              hidden_states_out + skip * ctrl_scale.astype(skip.dtype),
+              hidden_states_out,
+          )
+          return (hidden_states_out, rngs_carry), None
+
+        rematted_block_forward = self.gradient_checkpoint.apply(
+            scan_fn_sparse,
+            self.names_which_can_be_saved,
+            self.names_which_can_be_offloaded,
+            prevent_cse=not self.scan_layers,
+        )
+        initial_carry = (hidden_states, rngs)
         if main_kv_cache is not None:
-          main_block, vace_block, main_layer_kv_cache, vace_layer_kv_cache, layer_idx, control_scale = block_input
+          scan_input = (self.blocks, main_kv_cache, layer_vace_idx, layer_is_vace, layer_ctrl_scale)
         else:
-          main_block, vace_block, layer_idx, control_scale = block_input
-          main_layer_kv_cache = None
-          vace_layer_kv_cache = None
+          scan_input = (self.blocks, layer_vace_idx, layer_is_vace, layer_ctrl_scale)
+        final_carry, _ = nnx.scan(
+            rematted_block_forward,
+            length=self.num_layers,
+            in_axes=(nnx.Carry, 0),
+            out_axes=(nnx.Carry, 0),
+        )(initial_carry, scan_input)
+        hidden_states, _ = final_carry
 
-        input_projection_scale = (layer_idx == 0).astype(control_hidden_states_carry.dtype)
-        conditioning_states, control_hidden_states_out = vace_block(
-            hidden_states=vace_base_hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            control_hidden_states=control_hidden_states_carry,
-            temb=timestep_proj,
-            rotary_emb=rotary_emb,
-            kv_cache=vace_layer_kv_cache,
-            encoder_attention_mask=encoder_attention_mask,
-            deterministic=deterministic,
-            rngs=rngs_carry,
-            input_projection_scale=input_projection_scale,
-        )
-
-        hidden_states_out = main_block(
-            hidden_states_carry,
-            encoder_hidden_states,
-            timestep_proj,
-            rotary_emb,
-            deterministic,
-            rngs_carry,
-            encoder_attention_mask=encoder_attention_mask,
-            cached_kv=main_layer_kv_cache,
-        )
-        hidden_states_out = hidden_states_out + conditioning_states * control_scale.astype(conditioning_states.dtype)
-        return (hidden_states_out, control_hidden_states_out, rngs_carry), None
-
-      rematted_block_forward = self.gradient_checkpoint.apply(
-          scan_fn,
-          self.names_which_can_be_saved,
-          self.names_which_can_be_offloaded,
-          prevent_cse=not self.scan_layers,
-      )
-      initial_carry = (hidden_states, control_hidden_states, rngs)
-      if main_kv_cache is not None:
-        scan_input = (self.blocks, self.vace_blocks, main_kv_cache, vace_kv_cache, layer_indices, control_scales)
       else:
-        scan_input = (self.blocks, self.vace_blocks, layer_indices, control_scales)
-      final_carry, _ = nnx.scan(
-          rematted_block_forward,
-          length=self.num_layers,
-          in_axes=(nnx.Carry, 0),
-          out_axes=(nnx.Carry, 0),
-      )(initial_carry, scan_input)
-      hidden_states, _, _ = final_carry
+        # ---- Dense VACE scan (every layer has a VACE block) ----
+        layer_indices = jnp.arange(self.num_layers, dtype=jnp.int32)
+
+        def scan_fn(carry, block_input):
+          hidden_states_carry, control_hidden_states_carry, rngs_carry = carry
+          if main_kv_cache is not None:
+            main_block, vace_block, main_layer_kv_cache, vace_layer_kv_cache, layer_idx, control_scale = block_input
+          else:
+            main_block, vace_block, layer_idx, control_scale = block_input
+            main_layer_kv_cache = None
+            vace_layer_kv_cache = None
+
+          input_projection_scale = (layer_idx == 0).astype(control_hidden_states_carry.dtype)
+          conditioning_states, control_hidden_states_out = vace_block(
+              hidden_states=vace_base_hidden_states,
+              encoder_hidden_states=encoder_hidden_states,
+              control_hidden_states=control_hidden_states_carry,
+              temb=timestep_proj,
+              rotary_emb=rotary_emb,
+              kv_cache=vace_layer_kv_cache,
+              encoder_attention_mask=encoder_attention_mask,
+              deterministic=deterministic,
+              rngs=rngs_carry,
+              input_projection_scale=input_projection_scale,
+          )
+
+          hidden_states_out = main_block(
+              hidden_states_carry,
+              encoder_hidden_states,
+              timestep_proj,
+              rotary_emb,
+              deterministic,
+              rngs_carry,
+              encoder_attention_mask=encoder_attention_mask,
+              cached_kv=main_layer_kv_cache,
+          )
+          hidden_states_out = hidden_states_out + conditioning_states * control_scale.astype(conditioning_states.dtype)
+          return (hidden_states_out, control_hidden_states_out, rngs_carry), None
+
+        rematted_block_forward = self.gradient_checkpoint.apply(
+            scan_fn,
+            self.names_which_can_be_saved,
+            self.names_which_can_be_offloaded,
+            prevent_cse=not self.scan_layers,
+        )
+        initial_carry = (hidden_states, control_hidden_states, rngs)
+        if main_kv_cache is not None:
+          scan_input = (self.blocks, self.vace_blocks, main_kv_cache, vace_kv_cache, layer_indices, control_scales)
+        else:
+          scan_input = (self.blocks, self.vace_blocks, layer_indices, control_scales)
+        final_carry, _ = nnx.scan(
+            rematted_block_forward,
+            length=self.num_layers,
+            in_axes=(nnx.Carry, 0),
+            out_axes=(nnx.Carry, 0),
+        )(initial_carry, scan_input)
+        hidden_states, _, _ = final_carry
     else:
       # Prepare VACE hints.
       control_hidden_states_list = []

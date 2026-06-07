@@ -36,6 +36,7 @@ from ...embeddings_flax import (
 from ...normalization_flax import FP32LayerNorm
 from ...attention_flax import FlaxWanAttention
 from ...gradient_checkpoint import GradientCheckpointType
+from ..wan_lora import WanLoRAAdapter
 
 BlockSizes = common_types.BlockSizes
 
@@ -355,6 +356,8 @@ class WanTransformerBlock(nnx.Module):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 1.0,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
 
@@ -430,6 +433,12 @@ class WanTransformerBlock(nnx.Module):
         jax.random.normal(key, (1, 6, dim)) / dim**0.5,
     )
 
+    self.lora_rank = lora_rank
+    if lora_rank > 0:
+      self.lora_attn1 = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
+      self.lora_attn2 = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
+      self.lora_ffn   = WanLoRAAdapter(dim, lora_rank, lora_alpha, dtype, weights_dtype, precision, rngs)
+
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
@@ -492,7 +501,8 @@ class WanTransformerBlock(nnx.Module):
               rngs=rngs,
           )
         with self.conditional_named_scope("self_attn_residual"):
-          hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(hidden_states.dtype)
+          lora_delta = self.lora_attn1(norm_hidden_states).astype(jnp.float32) if self.lora_rank > 0 else 0
+          hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa + lora_delta).astype(hidden_states.dtype)
 
       # 2. Cross-attention
       with self.conditional_named_scope("cross_attn"):
@@ -508,7 +518,8 @@ class WanTransformerBlock(nnx.Module):
               cached_kv=cached_kv,
           )
         with self.conditional_named_scope("cross_attn_residual"):
-          hidden_states = hidden_states + attn_output
+          lora_delta = self.lora_attn2(norm_hidden_states) if self.lora_rank > 0 else 0
+          hidden_states = hidden_states + attn_output + lora_delta
 
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
@@ -519,7 +530,8 @@ class WanTransformerBlock(nnx.Module):
         with self.conditional_named_scope("mlp_ffn"):
           ff_output = self.ffn(norm_hidden_states, deterministic=deterministic, rngs=rngs)
         with self.conditional_named_scope("mlp_residual"):
-          hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa).astype(
+          lora_delta = self.lora_ffn(norm_hidden_states).astype(jnp.float32) if self.lora_rank > 0 else 0
+          hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa + lora_delta).astype(
               hidden_states.dtype
           )
       return hidden_states
@@ -572,6 +584,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 1.0,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -639,6 +653,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           image_seq_len=image_seq_len,
           use_base2_exp=use_base2_exp,
           use_experimental_scheduler=use_experimental_scheduler,
+          lora_rank=lora_rank,
+          lora_alpha=lora_alpha,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -667,6 +683,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             precision=precision,
             attention=attention,
             enable_jax_named_scopes=enable_jax_named_scopes,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
         )
         blocks.append(block)
       self.blocks = nnx.data(blocks)

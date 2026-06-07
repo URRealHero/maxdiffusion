@@ -177,7 +177,8 @@ class WanVaceTrainer(BaseWanTrainer):
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
 
     def make_vace_conditioning(cond_latents):
-      # VACE expects 96 channels: 32 latent-condition channels + 64 mask channels.
+      # VACE conditioning: inactive(C) + reactive(C) + mask(64) channels.
+      # For WAN 2.2 TI2V-5B with 48-ch latents: 48+48+64 = 160 = vace_in_channels.
       # For HM-World TV2V smoke data, approximate this as inactive=zeros,
       # reactive=cond_latents, and an all-active mask.
       inactive_latents = tf.zeros_like(cond_latents)

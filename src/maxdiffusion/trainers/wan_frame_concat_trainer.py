@@ -189,7 +189,12 @@ def _tree_all_finite(tree):
   return all_finite
 
 def _make_trainable_grad_mask(grads, config):
-  substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
+  # lora_trainable_param_substrings takes priority when set (e.g. "lora_").
+  lora_substrings = _csv_config(getattr(config, "lora_trainable_param_substrings", ""))
+  if lora_substrings:
+    substrings = lora_substrings
+  else:
+    substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
   if not substrings:
     return None
 
@@ -238,7 +243,8 @@ def _mask_fraction(trainable_mask):
 def _debug_print_trainable_paths(params, config):
   if not _as_bool(getattr(config, "frame_concat_print_trainable_params", False)):
     return
-  substrings = _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
+  lora_substrings = _csv_config(getattr(config, "lora_trainable_param_substrings", ""))
+  substrings = lora_substrings if lora_substrings else _csv_config(getattr(config, "frame_concat_trainable_param_substrings", ""))
   if not substrings or jax.process_index() != 0:
     return
   print("FrameConcat trainable parameter substrings:", ",".join(substrings))

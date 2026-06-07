@@ -23,6 +23,7 @@ WAN 2.2 TI2V-5B model.  This pipeline therefore bootstraps the VACE model by:
 """
 
 from functools import partial
+import math
 from typing import Optional
 
 import flax
@@ -100,6 +101,8 @@ def _create_sharded_logical_transformer_2_2_dense(
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["debug_vace_numerics"] = str(getattr(config, "vace_debug_print", False)).lower() == "true"
+  wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 1.0))
 
   p_model_factory = partial(create_model, wan_config=wan_config)
   wan_vace_transformer = nnx.eval_shape(p_model_factory, rngs=rngs)
@@ -151,20 +154,33 @@ def _create_sharded_logical_transformer_2_2_dense(
       del val_on_host
 
   # Materialize VACE params absent from the HF checkpoint.
-  # nnx.eval_shape leaves them as ShapeDtypeStruct; initialize them so the
-  # optimizer can treat them as real arrays.  Scale/norm params get ones
-  # (correct identity), everything else gets zeros (VACE output starts at 0
-  # and grows via gradients — safe for training stability).
+  # nnx.eval_shape leaves them as ShapeDtypeStruct; initialize them to match
+  # DiffSynth's official VACE init (PyTorch defaults = LeCun / Kaiming uniform).
+  #   kernel → LeCun uniform: U(-1/√fan_in, 1/√fan_in), fan_in = ∏ shape[:-1]
+  #   bias   → zeros
+  #   scale  → ones  (LayerNorm / RMSNorm identity)
+  #   other (adaln_scale_shift_table) → N(0, 1/√dim)
+  key = jax.random.PRNGKey(0)
   for path, var in state.items():
     if not isinstance(var.value, jax.Array):
+      key, subkey = jax.random.split(key)
       sds = var.value  # jax.ShapeDtypeStruct
       sharding = logical_state_sharding[path].value
-      if path[-1] == "scale":
+      name = path[-1]
+      if name == "scale":
         init_val = jnp.ones(sds.shape, dtype=sds.dtype)
-      else:
+      elif name == "bias":
         init_val = jnp.zeros(sds.shape, dtype=sds.dtype)
+      elif name == "kernel":
+        fan_in = max(1, int(math.prod(sds.shape[:-1])))
+        bound = 1.0 / math.sqrt(fan_in)
+        init_val = jax.random.uniform(subkey, sds.shape, dtype=jnp.float32, minval=-bound, maxval=bound).astype(sds.dtype)
+      else:
+        # adaln_scale_shift_table: scaled normal matching WanTransformerBlock init
+        std = 1.0 / math.sqrt(max(1, sds.shape[-1]))
+        init_val = (jax.random.normal(subkey, sds.shape, dtype=jnp.float32) * std).astype(sds.dtype)
       state[path].value = device_put_replicated(init_val, sharding)
-      max_logging.log(f"VACE fresh-init: {path} shape={sds.shape}")
+      max_logging.log(f"VACE fresh-init ({name}): {path} shape={sds.shape}")
 
   state = nnx.from_flat_state(state)
   return nnx.merge(graphdef, state, rest_of_state)

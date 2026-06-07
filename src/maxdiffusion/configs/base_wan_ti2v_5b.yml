@@ -371,7 +371,7 @@ eval_data_dir: ""
 
 # VACE architecture: comma-separated layer indices and input channel count.
 vace_layers: '0,5,10,15,20,25'
-vace_in_channels: 96
+vace_in_channels: 160
 # Comma-separated path substrings that are trainable. Empty means full finetune.
 vace_trainable_param_substrings: 'vace'
 # Print matching trainable parameter leaves on host 0.
@@ -379,6 +379,13 @@ vace_print_trainable_params: False
 # VACE debug: run forward/loss only and skip grad/update.
 vace_debug_forward_only: False
 vace_debug_print: False
+# LoRA fine-tuning. rank=0 disables LoRA (full fine-tune or frozen).
+lora_rank: 0
+lora_alpha: 1.0
+# Substrings that identify trainable params for LoRA training.
+# Set to "lora_" to freeze all base weights and train only adapter kernels.
+# Empty string = no override (fall back to frame_concat_trainable_param_substrings).
+lora_trainable_param_substrings: ""
 # Training-loop debug: log around first batch, JIT dispatch, execution barriers, metrics, and async input waits.
 debug_training_loop: False
 debug_training_loop_wait_seconds: 60
