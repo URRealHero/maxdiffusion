@@ -438,6 +438,14 @@ class BaseWanTrainer(abc.ABC):
                   f"Non-finite training loss ({_loss_value}) at step {step}; stopping training. "
                   "Disable this guard with stop_on_nonfinite_loss=False."
               )
+            _trainable_grads_all_finite = train_metric["scalar"].get(
+                "debug/trainable_grads_all_finite_before_sanitize", None
+            )
+            if _trainable_grads_all_finite is not None and float(_trainable_grads_all_finite) == 0.0:
+              raise RuntimeError(
+                  f"Non-finite trainable gradients at step {step}; stopping training. "
+                  "Disable this guard with stop_on_nonfinite_loss=False."
+              )
         last_step_completion = datetime.datetime.now()
 
         if max_utils.profiler_enabled(self.config) and step == last_profiling_step:

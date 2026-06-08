@@ -57,19 +57,20 @@ import PIL
 
 def cast_with_exclusion(path, x, dtype_to_cast):
   """
-  Casts arrays to dtype_to_cast, but keeps params from any 'norm' layer in float32.
+  Casts arrays to dtype_to_cast, but keeps numerically sensitive params in float32.
   """
 
   exclusion_keywords = [
       "norm",  # For all LayerNorm/GroupNorm layers
       "condition_embedder",  # The entire time/text conditioning module
       "scale_shift_table",  # Catches both the final and the AdaLN tables
+      "lora_",  # Keep trainable LoRA adapters in fp32 for TPU mixed-precision stability
   ]
 
   path_str = ".".join(str(k.key) if isinstance(k, jax.tree_util.DictKey) else str(k) for k in path)
 
   if any(keyword in path_str.lower() for keyword in exclusion_keywords):
-    # Keep LayerNorm/GroupNorm weights and biases in full precision
+    # Keep these weights and biases in full precision
     return x.astype(jnp.float32)
   else:
     # Cast everything else to dtype_to_cast

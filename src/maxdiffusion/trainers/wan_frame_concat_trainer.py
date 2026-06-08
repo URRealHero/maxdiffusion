@@ -188,8 +188,21 @@ def _tree_all_finite(tree):
 
   return all_finite
 
+def _trainable_path_matches(path_str, patterns):
+  for pattern in patterns:
+    # Plain pattern keeps the old behavior. A pattern like "attn1+lora_" means
+    # every piece must be present, which lets us select self-attn LoRA without
+    # also training base attn1 weights or cross-attn/FFN LoRA weights.
+    pieces = tuple(piece.strip() for piece in pattern.split("+") if piece.strip())
+    if pieces and all(piece in path_str for piece in pieces):
+      return True
+  return False
+
+
 def _make_trainable_grad_mask(grads, config):
-  # lora_trainable_param_substrings takes priority when set (e.g. "lora_").
+  # lora_trainable_param_substrings takes priority when set. Examples:
+  #   "lora_"       -> all LoRA adapters
+  #   "attn1+lora_" -> LoRA adapters under self-attention only
   lora_substrings = _csv_config(getattr(config, "lora_trainable_param_substrings", ""))
   if lora_substrings:
     substrings = lora_substrings
@@ -200,7 +213,7 @@ def _make_trainable_grad_mask(grads, config):
 
   def make_mask(path, grad):
     path_str = _tree_path_to_str(path)
-    is_trainable = any(substring in path_str for substring in substrings)
+    is_trainable = _trainable_path_matches(path_str, substrings)
     return jnp.ones_like(grad, dtype=jnp.bool_) if is_trainable else jnp.zeros_like(grad, dtype=jnp.bool_)
 
   path_leaves, treedef = jax.tree_util.tree_flatten_with_path(grads)
@@ -281,7 +294,7 @@ def _debug_print_trainable_paths(params, config):
   matched = []
   for path, value in jax.tree_util.tree_flatten_with_path(params)[0]:
     path_str = _tree_path_to_str(path)
-    if any(substring in path_str for substring in substrings):
+    if _trainable_path_matches(path_str, substrings):
       matched.append((path_str, getattr(value, "shape", None)))
   print(f"FrameConcat trainable parameter leaves: {len(matched)}")
   for path_str, shape in matched[:200]:
@@ -402,25 +415,26 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   grads_finite_frac = _finite_fraction(grads)
 
   grads_all_finite = _tree_all_finite(grads)
-  update_is_finite = jnp.isfinite(loss) & grads_all_finite
+  update_grads_all_finite = trainable_grads_all_finite_before_sanitize if trainable_grad_mask is not None else grads_all_finite
+  update_is_finite = jnp.isfinite(loss) & update_grads_all_finite
   skip_nonfinite_update = _as_bool(getattr(config, "frame_concat_skip_nonfinite_update", False))
 
-  if skip_nonfinite_update:
-    new_state = jax.lax.cond(
-        update_is_finite,
-        lambda _: state.apply_gradients(grads=grads),
-        lambda _: state,
-        operand=None,
-    )
-  else:
-    new_state = state.apply_gradients(grads=grads)
+  # Never apply an optimizer step with non-finite selected gradients. In strict
+  # mode the outer training loop raises immediately after this metric is returned;
+  # in non-strict mode this keeps params clean and allows debugging to continue.
+  new_state = jax.lax.cond(
+      update_is_finite,
+      lambda _: state.apply_gradients(grads=grads),
+      lambda _: state,
+      operand=None,
+  )
 
   new_state = _restore_frozen_params(state, new_state, trainable_grad_mask)
 
   params_finite_frac_after_update = _finite_fraction(new_state.params)
   params_all_finite_after_update = _tree_all_finite(new_state.params)
   params_max_abs_after_update = _tree_max_abs(new_state.params)
-  update_skipped = jnp.asarray(skip_nonfinite_update, dtype=jnp.bool_) & ~update_is_finite
+  update_skipped = ~update_is_finite
 
   if _as_bool(getattr(config, "frame_concat_debug_print", False)):
     jax.debug.print(
