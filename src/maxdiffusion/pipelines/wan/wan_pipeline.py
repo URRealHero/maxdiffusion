@@ -102,6 +102,25 @@ def _add_sharding_rule(vs: nnx.VariableState, logical_axis_rules) -> nnx.Variabl
   return vs
 
 
+def _normalize_wan_fun_config_aliases(wan_config: dict) -> dict:
+  """Normalize DiffSynth/Fun WAN config aliases to MaxDiffusion WanModel args."""
+  wan_config = dict(wan_config)
+  if "dim" in wan_config:
+    dim = int(wan_config.pop("dim"))
+    num_heads = int(wan_config.get("num_heads", wan_config.get("num_attention_heads", 1)))
+    wan_config.setdefault("num_attention_heads", num_heads)
+    wan_config.setdefault("attention_head_dim", dim // num_heads)
+  if "num_heads" in wan_config:
+    wan_config.setdefault("num_attention_heads", int(wan_config.pop("num_heads")))
+  if "in_dim" in wan_config:
+    wan_config.setdefault("in_channels", int(wan_config.pop("in_dim")))
+  if "out_dim" in wan_config:
+    wan_config.setdefault("out_channels", int(wan_config.pop("out_dim")))
+  for ignored in ("text_len", "add_ref_conv", "_class_name", "_diffusers_version"):
+    wan_config.pop(ignored, None)
+  return wan_config
+
+
 # For some reason, jitting this function increases the memory significantly, so instead manually move weights to device.
 def create_sharded_logical_transformer(
     devices_array: np.array,
@@ -119,7 +138,17 @@ def create_sharded_logical_transformer(
   if restored_checkpoint:
     wan_config = restored_checkpoint["wan_config"]
   else:
-    wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
+    try:
+      wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
+    except (OSError, EnvironmentError) as exc:
+      if os.path.isdir(config.pretrained_model_name_or_path) and subfolder:
+        max_logging.log(
+            f"Could not load WAN config from subfolder '{subfolder}' ({exc}); falling back to checkpoint root."
+        )
+        wan_config = WanModel.load_config(config.pretrained_model_name_or_path)
+      else:
+        raise
+  wan_config = _normalize_wan_fun_config_aliases(wan_config)
   if config.model_type == "I2V":
     # WAN 2.1 I2V uses image embeddings via CLIP encoder (image_dim and added_kv_proj_dim are set)
     # WAN 2.2 I2V uses VAE-encoded latent conditioning (image_dim and added_kv_proj_dim are None in the transformer config)
@@ -145,6 +174,17 @@ def create_sharded_logical_transformer(
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
   wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
   wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
+  wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
+  wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
+  wan_config["downscale_factor_control_adapter"] = int(
+      getattr(config, "downscale_factor_control_adapter", wan_config.get("downscale_factor_control_adapter", 8))
+  )
+  in_channels_override = int(getattr(config, "wan_transformer_in_channels_override", -1))
+  out_channels_override = int(getattr(config, "wan_transformer_out_channels_override", -1))
+  if in_channels_override > 0:
+    wan_config["in_channels"] = in_channels_override
+  if out_channels_override > 0:
+    wan_config["out_channels"] = out_channels_override
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
@@ -982,6 +1022,7 @@ def transformer_forward_pass(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   wan_transformer = nnx.merge(graphdef, sharded_state, rest_of_state)
   outputs = wan_transformer(
@@ -995,6 +1036,7 @@ def transformer_forward_pass(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
 
   if return_residual:
@@ -1028,6 +1070,7 @@ def transformer_forward_pass_full_cfg(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   """Full CFG forward pass.
 
@@ -1049,6 +1092,7 @@ def transformer_forward_pass_full_cfg(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
   noise_cond = noise_pred[:bsz]
   noise_uncond = noise_pred[bsz:]
@@ -1073,6 +1117,7 @@ def transformer_forward_pass_cfg_cache(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   """CFG-Cache forward pass with FFT frequency-domain compensation.
 
@@ -1101,6 +1146,7 @@ def transformer_forward_pass_cfg_cache(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
 
   # FFT over spatial dims (H, W) — last 2 dims of [B, C, F, H, W]

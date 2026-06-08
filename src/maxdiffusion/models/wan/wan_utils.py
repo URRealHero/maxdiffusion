@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import glob
 import json
 import torch
 import jax
@@ -74,6 +75,7 @@ def rename_for_custom_trasformer(key):
   renamed_pt_key = renamed_pt_key.replace("time_projection_1", "condition_embedder.time_proj")
 
   renamed_pt_key = renamed_pt_key.replace("blocks_", "blocks.")
+  renamed_pt_key = renamed_pt_key.replace("control_adapter.residual_blocks.", "control_adapter.residual_blocks_")
   renamed_pt_key = renamed_pt_key.replace("self_attn", "attn1")
   renamed_pt_key = renamed_pt_key.replace("cross_attn", "attn2")
   renamed_pt_key = renamed_pt_key.replace(".q.", ".query.")
@@ -119,6 +121,28 @@ def _build_random_flax_state_dict(eval_shapes):
 
 
 def _rename_common_wan_transformer_key(renamed_pt_key: str) -> str:
+  # DiffSynth/Captain-Safari / PAI Fun checkpoint aliases. These are no-ops
+  # for ordinary Diffusers keys and let the same loader handle official Fun
+  # camera-control safetensors.
+  renamed_pt_key = renamed_pt_key.replace("model.diffusion_model.", "")
+  renamed_pt_key = renamed_pt_key.replace("head.modulation", "scale_shift_table")
+  renamed_pt_key = renamed_pt_key.replace("head.head", "proj_out")
+  renamed_pt_key = renamed_pt_key.replace("text_embedding_0", "condition_embedder.text_embedder.linear_1")
+  renamed_pt_key = renamed_pt_key.replace("text_embedding_2", "condition_embedder.text_embedder.linear_2")
+  renamed_pt_key = renamed_pt_key.replace("time_embedding_0", "condition_embedder.time_embedder.linear_1")
+  renamed_pt_key = renamed_pt_key.replace("time_embedding_2", "condition_embedder.time_embedder.linear_2")
+  renamed_pt_key = renamed_pt_key.replace("time_projection_1", "condition_embedder.time_proj")
+  renamed_pt_key = renamed_pt_key.replace("self_attn", "attn1")
+  renamed_pt_key = renamed_pt_key.replace("cross_attn", "attn2")
+  renamed_pt_key = renamed_pt_key.replace(".q.", ".query.")
+  renamed_pt_key = renamed_pt_key.replace(".k.", ".key.")
+  renamed_pt_key = renamed_pt_key.replace(".v.", ".value.")
+  renamed_pt_key = renamed_pt_key.replace(".o.", ".proj_attn.")
+  renamed_pt_key = renamed_pt_key.replace("ffn_0", "ffn.act_fn.proj")
+  renamed_pt_key = renamed_pt_key.replace("ffn_2", "ffn.proj_out")
+  renamed_pt_key = renamed_pt_key.replace(".modulation", ".adaln_scale_shift_table")
+  renamed_pt_key = renamed_pt_key.replace("norm3", "norm2.layer_norm")
+
   if "condition_embedder" in renamed_pt_key:
     renamed_pt_key = renamed_pt_key.replace("time_embedding_0", "time_embedder.linear_1")
     renamed_pt_key = renamed_pt_key.replace("time_embedding_2", "time_embedder.linear_2")
@@ -139,11 +163,13 @@ def _rename_common_wan_transformer_key(renamed_pt_key: str) -> str:
       renamed_pt_key = renamed_pt_key.replace("kernel", "scale")
 
   renamed_pt_key = renamed_pt_key.replace("blocks_", "blocks.")
+  renamed_pt_key = renamed_pt_key.replace("control_adapter.residual_blocks.", "control_adapter.residual_blocks_")
   renamed_pt_key = renamed_pt_key.replace(".scale_shift_table", ".adaln_scale_shift_table")
   renamed_pt_key = renamed_pt_key.replace("to_out_0", "proj_attn")
   renamed_pt_key = renamed_pt_key.replace("ffn.net_2", "ffn.proj_out")
   renamed_pt_key = renamed_pt_key.replace("ffn.net_0", "ffn.act_fn")
-  renamed_pt_key = renamed_pt_key.replace("norm2", "norm2.layer_norm")
+  if "norm2" in renamed_pt_key and "norm2.layer_norm" not in renamed_pt_key:
+    renamed_pt_key = renamed_pt_key.replace("norm2", "norm2.layer_norm")
 
   return renamed_pt_key
 
@@ -297,33 +323,62 @@ def load_base_wan_transformer(
   device = jax.local_devices(backend=device)[0]
   filename = "diffusion_pytorch_model.safetensors.index.json"
   local_files = False
+  local_model_files_are_absolute = False
   if os.path.isdir(pretrained_model_name_or_path):
-    index_file_path = os.path.join(pretrained_model_name_or_path, subfolder, filename)
-    if not os.path.isfile(index_file_path):
-      raise FileNotFoundError(f"File {index_file_path} not found for local directory.")
     local_files = True
-  elif hf_download:
-    # download the index file for sharded models.
-    index_file_path = hf_hub_download(
-        pretrained_model_name_or_path,
-        subfolder=subfolder,
-        filename=filename,
-    )
+    search_dir = os.path.join(pretrained_model_name_or_path, subfolder)
+    index_file_path = os.path.join(search_dir, filename)
+    if os.path.isfile(index_file_path):
+      with open(index_file_path, "r") as f:
+        index_dict = json.load(f)
+      model_files = sorted(set(index_dict["weight_map"].values()))
+    else:
+      model_files = sorted(glob.glob(os.path.join(search_dir, "diffusion_pytorch_model*.safetensors")))
+      if not model_files and subfolder:
+        model_files = sorted(glob.glob(os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model*.safetensors")))
+      if not model_files:
+        raise FileNotFoundError(
+            f"Could not find {filename} or diffusion_pytorch_model*.safetensors under "
+            f"{search_dir} (or repo root fallback)."
+        )
+      local_model_files_are_absolute = True
+  else:
+    remote_subfolder = subfolder
+  if hf_download and not local_files:
+    # Prefer the standard diffusers sharded index under subfolder, but Fun camera
+    # checkpoints are commonly published as a single safetensors file at repo root.
+    try:
+      index_file_path = hf_hub_download(
+          pretrained_model_name_or_path,
+          subfolder=subfolder,
+          filename=filename,
+      )
+      with open(index_file_path, "r") as f:
+        index_dict = json.load(f)
+      model_files = sorted(set(index_dict["weight_map"].values()))
+    except Exception as exc:
+      single_file = "diffusion_pytorch_model.safetensors"
+      try:
+        hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder, filename=single_file)
+        model_files = [single_file]
+      except Exception:
+        remote_subfolder = ""
+        try:
+          hf_hub_download(pretrained_model_name_or_path, filename=single_file)
+          model_files = [single_file]
+        except Exception:
+          raise exc
   with jax.default_device(device):
-    # open the index file.
-    with open(index_file_path, "r") as f:
-      index_dict = json.load(f)
-    model_files = set()
-    for key in index_dict["weight_map"].keys():
-      model_files.add(index_dict["weight_map"][key])
-
-    model_files = list(model_files)
     tensors = {}
     for model_file in model_files:
       if local_files:
-        ckpt_shard_path = os.path.join(pretrained_model_name_or_path, subfolder, model_file)
+        ckpt_shard_path = model_file if local_model_files_are_absolute else os.path.join(pretrained_model_name_or_path, subfolder, model_file)
       else:
-        ckpt_shard_path = hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder, filename=model_file)
+        ckpt_shard_path = hf_hub_download(
+            pretrained_model_name_or_path,
+            subfolder=remote_subfolder or None,
+            filename=model_file,
+        )
       # now get all the filenames for the model that need downloading
       max_logging.log(f"Load and port {pretrained_model_name_or_path} {subfolder} on {device}")
 
