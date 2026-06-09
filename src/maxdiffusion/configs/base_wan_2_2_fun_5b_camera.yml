@@ -27,7 +27,7 @@ gcs_metrics: False
 save_config_to_gcs: False
 log_period: 100
 
-pretrained_model_name_or_path: 'Wan-AI/Wan2.2-TI2V-5B-Diffusers'
+pretrained_model_name_or_path: 'alibaba-pai/Wan2.2-Fun-5B-Control-Camera'
 model_name: wan2.2
 model_type: 'TI2V-CC'
 
@@ -436,8 +436,13 @@ enable_ondemand_xprof: False
 
 
 # Wan2.2-Fun-5B-Control-Camera official/Captain-Safari path.
-# Keep pretrained_model_name_or_path on Wan-AI Diffusers for tokenizer/T5/VAE.
-# Set wan_transformer_pretrained_model_name_or_path to the local PAI/Fun camera checkpoint root.
+# PAI publishes the transformer, T5, VAE, and tokenizer in one repo root.
+# Leave wan_transformer_pretrained_model_name_or_path empty to use pretrained_model_name_or_path.
+wan_tokenizer_subfolder: 'google/umt5-xxl'
+wan_text_encoder_filename: 'models_t5_umt5-xxl-enc-bf16.pth'
+wan_vae_subfolder: ''
+wan_vae_filename: 'Wan2.2_VAE.pth'
+wan_use_local_flow_scheduler: True
 add_control_adapter: True
 in_dim_control_adapter: 24
 downscale_factor_control_adapter: 16

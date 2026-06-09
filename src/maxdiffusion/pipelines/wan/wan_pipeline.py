@@ -34,6 +34,7 @@ from ...models.wan.wan_utils import load_wan_transformer, load_wan_vae
 from ...models.wan.transformers.transformer_wan import WanModel
 from ...models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
 from ...models.wan.autoencoder_kl_wan_2p2 import AutoencoderKLWan2p2
+from ...models.wan.wan_text_encoder_pytorch import WanTextEncoderForMaxDiffusion
 from maxdiffusion.video_processor import VideoProcessor
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler, UniPCMultistepSchedulerState
 from transformers import AutoTokenizer, UMT5EncoderModel
@@ -141,7 +142,7 @@ def create_sharded_logical_transformer(
     try:
       wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
     except (OSError, EnvironmentError) as exc:
-      if os.path.isdir(config.pretrained_model_name_or_path) and subfolder:
+      if subfolder:
         max_logging.log(
             f"Could not load WAN config from subfolder '{subfolder}' ({exc}); falling back to checkpoint root."
         )
@@ -360,6 +361,14 @@ class WanPipeline:
   def load_text_encoder(cls, config: HyperParameters):
     text_encoder_dtype = getattr(config, "text_encoder_dtype", "float32")
     torch_dtype = getattr(torch, str(text_encoder_dtype), torch.float32)
+    if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_text_encoder_filename", ""):
+      text_encoder = WanTextEncoderForMaxDiffusion.from_pretrained(
+          config.pretrained_model_name_or_path,
+          filename=config.wan_text_encoder_filename,
+          torch_dtype=torch_dtype,
+          compile_text_encoder=getattr(config, "compile_text_encoder", False),
+      )
+      return text_encoder
     text_encoder = UMT5EncoderModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="text_encoder",
@@ -371,9 +380,10 @@ class WanPipeline:
 
   @classmethod
   def load_tokenizer(cls, config: HyperParameters):
+    tokenizer_subfolder = getattr(config, "wan_tokenizer_subfolder", "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(
         config.pretrained_model_name_or_path,
-        subfolder="tokenizer",
+        subfolder=tokenizer_subfolder,
     )
     return tokenizer
 
@@ -405,14 +415,25 @@ class WanPipeline:
     
     def create_model(rngs: nnx.Rngs, config: HyperParameters):
       vae_cls = AutoencoderKLWan2p2 if use_wan_2p2_vae else AutoencoderKLWan
-      wan_vae = vae_cls.from_config(
-        config.pretrained_model_name_or_path,
-        subfolder="vae",
-        rngs=rngs,
-        mesh=mesh,
-        dtype=jnp.float32,
-        weights_dtype=jnp.float32,
-      )
+      if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_vae_filename", ""):
+        # PAI/Captain-Safari repos publish the VAE as Wan2.2_VAE.pth at repo
+        # root, so the root config.json belongs to the transformer, not VAE.
+        # Build the native Wan2.2 VAE from defaults and load the PAI weights below.
+        wan_vae = vae_cls(
+            rngs=rngs,
+            mesh=mesh,
+            dtype=jnp.float32,
+            weights_dtype=jnp.float32,
+        )
+      else:
+        wan_vae = vae_cls.from_config(
+          config.pretrained_model_name_or_path,
+          subfolder="vae",
+          rngs=rngs,
+          mesh=mesh,
+          dtype=jnp.float32,
+          weights_dtype=jnp.float32,
+        )
       return wan_vae
 
     # 1. eval shape
@@ -436,6 +457,8 @@ class WanPipeline:
       params,
       "cpu",
       is_wan_2p2=use_wan_2p2_vae,
+      subfolder=getattr(config, "wan_vae_subfolder", "vae"),
+      filename=getattr(config, "wan_vae_filename", "diffusion_pytorch_model.safetensors"),
     )
     params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
     for path, val in flax.traverse_util.flatten_dict(params).items():
@@ -554,6 +577,17 @@ class WanPipeline:
 
   @classmethod
   def load_scheduler(cls, config):
+    if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_use_local_flow_scheduler", True):
+      scheduler = FlaxUniPCMultistepScheduler(
+          prediction_type="flow_prediction",
+          use_flow_sigmas=True,
+          flow_shift=config.flow_shift,
+          solver_order=2,
+          timestep_spacing="linspace",
+          final_sigmas_type="zero",
+          dtype=jnp.float32,
+      )
+      return scheduler, scheduler.create_state()
     scheduler, scheduler_state = FlaxUniPCMultistepScheduler.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="scheduler",

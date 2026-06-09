@@ -230,7 +230,7 @@ def run_inference_2_2_fun_camera(
     if do_cfg:
       latents_doubled = jnp.concatenate([latents] * 2)
       transformer_input = _append_y(latents_doubled)
-      timestep = jnp.broadcast_to(t, bsz * 2)
+      timestep = jnp.broadcast_to(t, (bsz * 2,))
       noise_pred, _, _ = transformer_forward_pass_full_cfg(
           graphdef,
           sharded_state,
@@ -246,7 +246,7 @@ def run_inference_2_2_fun_camera(
       )
     else:
       transformer_input = _append_y(latents)
-      timestep = jnp.broadcast_to(t, bsz)
+      timestep = jnp.broadcast_to(t, (bsz,))
       noise_pred, _ = transformer_forward_pass(
           graphdef,
           sharded_state,

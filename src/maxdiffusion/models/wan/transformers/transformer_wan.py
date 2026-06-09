@@ -446,7 +446,12 @@ class WanCameraSimpleAdapter(nnx.Module):
     if height % factor != 0 or width % factor != 0:
       raise ValueError(f"Camera control spatial shape {(height, width)} must be divisible by {factor}.")
     x = x.reshape(bf, height // factor, factor, width // factor, factor, channels)
-    x = jnp.transpose(x, (0, 1, 3, 2, 4, 5))
+    # Match PyTorch nn.PixelUnshuffle channel order [C, r, r] (channel-major), not
+    # [r, r, C]. The checkpoint's control_adapter.conv weights assume PyTorch order;
+    # using [r, r, C] permutes the conv's input channels and scrambles the camera
+    # control signal (model ignores camera -> falls back to prompt-default motion).
+    # dims here are (bf, h, i, w, j, c) -> reorder to (bf, h, w, c, i, j).
+    x = jnp.transpose(x, (0, 1, 3, 5, 2, 4))
     return x.reshape(bf, height // factor, width // factor, channels * factor * factor)
 
   def __call__(self, x: jax.Array) -> jax.Array:

@@ -518,34 +518,107 @@ def _remap_wan_2p2_vae_key(key: str) -> str:
   return key
 
 
+def _map_middle_index(prefix: str, idx: str, suffix: str) -> str:
+  if idx == "0":
+    return f"{prefix}.mid_block.resnets.0.{suffix}"
+  if idx == "1":
+    return f"{prefix}.mid_block.attentions.0.{suffix}"
+  if idx == "2":
+    return f"{prefix}.mid_block.resnets.1.{suffix}"
+  return f"{prefix}.mid_block.{idx}.{suffix}"
+
+
+def _remap_wan_2p2_pth_vae_key(key: str) -> str:
+  """Map original Wan2.2_VAE.pth keys to the NNX VAE tree.
+
+  PAI/Captain-Safari publish the original DiffSynth-style VAE weights where
+  blocks are named `downsamples/middle/head`. MaxDiffusion's JAX port names the
+  same modules `down_blocks/mid_block/norm_out/conv_out`.
+  """
+  if key.startswith("model."):
+    key = key[len("model.") :]
+  if key.startswith("conv1."):
+    key = "quant_conv." + key[len("conv1.") :]
+  elif key.startswith("conv2."):
+    key = "post_quant_conv." + key[len("conv2.") :]
+
+  parts = key.split(".")
+  if len(parts) >= 2 and parts[0] in ("encoder", "decoder"):
+    prefix = parts[0]
+    if parts[1] == "conv1":
+      parts[1] = "conv_in"
+    elif parts[1] == "head" and len(parts) >= 3:
+      if parts[2] == "0":
+        parts = [prefix, "norm_out"] + parts[3:]
+      elif parts[2] == "2":
+        parts = [prefix, "conv_out"] + parts[3:]
+    elif parts[1] == "middle" and len(parts) >= 4:
+      key = _map_middle_index(prefix, parts[2], ".".join(parts[3:]))
+      parts = key.split(".")
+    elif prefix == "encoder" and parts[1] == "downsamples" and len(parts) >= 5:
+      block_idx = parts[2]
+      if parts[3] == "downsamples":
+        parts = ["encoder", "down_blocks", block_idx, "resnets", parts[4]] + parts[5:]
+      elif parts[3] == "avg_shortcut":
+        parts = ["encoder", "down_blocks", block_idx, "avg_shortcut"] + parts[4:]
+    elif prefix == "decoder" and parts[1] == "upsamples" and len(parts) >= 5:
+      block_idx = parts[2]
+      if parts[3] == "upsamples":
+        parts = ["decoder", "up_blocks", block_idx, "resnets", parts[4]] + parts[5:]
+      elif parts[3] == "avg_shortcut":
+        parts = ["decoder", "up_blocks", block_idx, "avg_shortcut"] + parts[4:]
+
+  key = ".".join(parts)
+  key = key.replace(".residual.0.", ".norm1.")
+  key = key.replace(".residual.2.", ".conv1.")
+  key = key.replace(".residual.3.", ".norm2.")
+  key = key.replace(".residual.6.", ".conv2.")
+  key = key.replace(".shortcut.", ".conv_shortcut.")
+  return key
+
+
 def load_wan_vae(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,
     device: str,
     hf_download: bool = True,
     is_wan_2p2: bool = False,
+    subfolder: str = "vae",
+    filename: str = "diffusion_pytorch_model.safetensors",
 ):
   device = jax.devices(device)[0]
-  subfolder = "vae"
-  filename = "diffusion_pytorch_model.safetensors"
-  if os.path.isdir(pretrained_model_name_or_path):
-    ckpt_path = os.path.join(pretrained_model_name_or_path, subfolder, filename)
+  ckpt_path = None
+  if os.path.isfile(pretrained_model_name_or_path):
+    ckpt_path = pretrained_model_name_or_path
+  elif os.path.isdir(pretrained_model_name_or_path):
+    ckpt_path = os.path.join(pretrained_model_name_or_path, subfolder, filename) if subfolder else os.path.join(pretrained_model_name_or_path, filename)
     if not os.path.isfile(ckpt_path):
       raise FileNotFoundError(f"File {ckpt_path} not found for local directory.")
   elif hf_download:
-    ckpt_path = hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder, filename=filename)
+    ckpt_path = hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder or None, filename=filename)
   max_logging.log(f"Load and port {pretrained_model_name_or_path} VAE on {device}")
   with jax.default_device(device):
     if ckpt_path is not None:
       tensors = {}
-      with safe_open(ckpt_path, framework="pt") as f:
-        for k in f.keys():
-          tensors[k] = torch2jax(f.get_tensor(k))
+      is_pth_vae = ckpt_path.endswith(".pth")
+      if is_pth_vae:
+        loaded = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(loaded, dict) and "model_state" in loaded:
+          loaded = loaded["model_state"]
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+          loaded = loaded["state_dict"]
+        for k, v in loaded.items():
+          if torch.is_tensor(v):
+            tensors[k] = torch2jax(v)
+      else:
+        with safe_open(ckpt_path, framework="pt") as f:
+          for k in f.keys():
+            tensors[k] = torch2jax(f.get_tensor(k))
       flax_state_dict = {}
       cpu = jax.local_devices(backend="cpu")[0]
       for pt_key, tensor in tensors.items():
-        renamed_pt_key = rename_key(pt_key)
-        if is_wan_2p2:
+        renamed_pt_key = _remap_wan_2p2_pth_vae_key(pt_key) if is_pth_vae else rename_key(pt_key)
+        if is_wan_2p2 and not is_pth_vae:
           renamed_pt_key = _remap_wan_2p2_vae_key(renamed_pt_key)
         # Order matters
         renamed_pt_key = renamed_pt_key.replace("up_blocks_", "up_blocks.")
