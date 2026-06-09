@@ -389,6 +389,13 @@ eval_data_dir: ""
 # VACE architecture: comma-separated layer indices and input channel count.
 vace_layers: '0,5,10,15,20,25'
 vace_in_channels: 160
+# VACE inference: control/conditioning video (.mp4, local or gs://). Encoded to
+# cond_latents then expanded to the 160-ch VACE conditioning at generation time.
+vace_control_video_path: ""
+# VACE inference: where to write generated videos. Needed because checkpoint_dir
+# is derived as output_dir/run_name/checkpoints (so output_dir/run_name must point
+# at the trained checkpoint, not the video destination).
+vace_output_video_dir: ""
 # Comma-separated path substrings that are trainable. Empty means full finetune.
 vace_trainable_param_substrings: 'vace'
 # Print matching trainable parameter leaves on host 0.
