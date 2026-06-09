@@ -447,5 +447,4 @@ input_image_path: ""
 camera_control_direction: "Left"
 camera_control_speed: 0.01
 camera_control_origin: ""
-camera_control_reference_path: "/home/spu9/Captain-Safari/captain_safari"
 output_video_name: "wan22_fun_camera_output.mp4"

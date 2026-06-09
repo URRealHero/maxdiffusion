@@ -13,7 +13,6 @@ if _REPO_SRC not in sys.path:
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from absl import app
 from maxdiffusion import max_logging, max_utils, pyconfig
@@ -22,50 +21,19 @@ from maxdiffusion.common_types import WAN2_2
 from maxdiffusion.train_utils import transformer_engine_context
 from maxdiffusion.utils import export_to_video
 from maxdiffusion.utils.loading_utils import load_image
+from maxdiffusion.pipelines.wan.wan_fun_camera_utils import build_fun_camera_latents
 
 
-def _parse_camera_origin(origin):
-  if origin in (None, "", "None", "none"):
-    return None
-  if isinstance(origin, str):
-    return tuple(float(x.strip()) for x in origin.split(",") if x.strip())
-  return origin
 
-
-def build_fun_camera_latents_from_reference(direction, num_frames, height, width, speed, origin, reference_path):
-  """Build packed Plucker latents exactly like Captain-Safari/DiffSynth."""
-  if reference_path and reference_path not in sys.path:
-    sys.path.insert(0, reference_path)
-  try:
-    import torch
-    from diffsynth.models.wan_video_camera_controller import SimpleAdapter
-  except Exception as exc:
-    raise ImportError(
-        "Could not import Captain-Safari/DiffSynth camera helper. Set "
-        "camera_control_reference_path to a directory containing diffsynth/."
-    ) from exc
-
-  adapter = SimpleAdapter(24, 1, kernel_size=(2, 2), stride=(2, 2), downscale_factor=16)
-  plucker = adapter.process_camera_coordinates(
-      direction,
-      num_frames,
-      height,
-      width,
-      speed,
-      _parse_camera_origin(origin),
+def build_fun_camera_latents_from_config(config):
+  return build_fun_camera_latents(
+      direction=config.camera_control_direction,
+      num_frames=config.num_frames,
+      height=config.height,
+      width=config.width,
+      speed=float(config.camera_control_speed),
+      origin=getattr(config, "camera_control_origin", None),
   )
-  control_camera_video = plucker[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0)
-  control_camera_latents = torch.concat(
-      [
-          torch.repeat_interleave(control_camera_video[:, :, 0:1], repeats=4, dim=2),
-          control_camera_video[:, :, 1:],
-      ],
-      dim=2,
-  ).transpose(1, 2)
-  b, f, c, h, w = control_camera_latents.shape
-  control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, 4, c, h, w).transpose(2, 3)
-  control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, c * 4, h, w).transpose(1, 2)
-  return control_camera_latents.cpu().float().numpy()
 
 
 def run(config):
@@ -97,15 +65,7 @@ def run(config):
   )
   max_logging.log(f"Prepared y_latents shape: {y_latents.shape}")
 
-  camera_np = build_fun_camera_latents_from_reference(
-      direction=config.camera_control_direction,
-      num_frames=config.num_frames,
-      height=config.height,
-      width=config.width,
-      speed=float(config.camera_control_speed),
-      origin=getattr(config, "camera_control_origin", None),
-      reference_path=config.camera_control_reference_path,
-  )
+  camera_np = build_fun_camera_latents_from_config(config)
   control_camera_latents_input = jnp.asarray(camera_np, dtype=dtype)
   if control_camera_latents_input.shape[0] == 1 and len(prompt) > 1:
     control_camera_latents_input = jnp.concatenate([control_camera_latents_input] * len(prompt), axis=0)
