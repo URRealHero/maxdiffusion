@@ -21,11 +21,29 @@ from maxdiffusion.common_types import WAN2_2
 from maxdiffusion.train_utils import transformer_engine_context
 from maxdiffusion.utils import export_to_video
 from maxdiffusion.utils.loading_utils import load_image
-from maxdiffusion.pipelines.wan.wan_fun_camera_utils import build_fun_camera_latents
+import numpy as np
 
+from maxdiffusion.pipelines.wan.wan_fun_camera_utils import (
+    build_fun_camera_latents,
+    build_fun_camera_latents_from_matrices,
+)
 
 
 def build_fun_camera_latents_from_config(config):
+  ext_path = getattr(config, "extrinsic_clip_path", "") or ""
+  int_path = getattr(config, "intrinsic_clip_path", "") or ""
+  if ext_path and int_path:
+    # Explicit-trajectory path: extrinsic [N,3,4] (w2c), intrinsic [N,3,3] (pixels).
+    max_logging.log(f"Using explicit camera trajectory: {ext_path} / {int_path}")
+    return build_fun_camera_latents_from_matrices(
+        extrinsic=np.load(ext_path),
+        intrinsic=np.load(int_path),
+        num_frames=config.num_frames,
+        height=config.height,
+        width=config.width,
+        fps_in=float(getattr(config, "camera_clip_fps_in", 4.0)),
+        fps_out=float(getattr(config, "camera_clip_fps_out", 24.0)),
+    )
   return build_fun_camera_latents(
       direction=config.camera_control_direction,
       num_frames=config.num_frames,
@@ -43,8 +61,11 @@ def run(config):
     raise ValueError("Fun camera-control inference expects model_type=TI2V-CC")
   if not config.input_image_path:
     raise ValueError("Set input_image_path to the first/reference frame image.")
-  if not config.camera_control_direction:
-    raise ValueError("Set camera_control_direction, e.g. Left, Right, Up, Down, In, Out.")
+  has_clip = bool(getattr(config, "extrinsic_clip_path", "")) and bool(getattr(config, "intrinsic_clip_path", ""))
+  if not config.camera_control_direction and not has_clip:
+    raise ValueError(
+        "Set camera_control_direction (e.g. Left) OR both extrinsic_clip_path + intrinsic_clip_path."
+    )
 
   load_start = time.perf_counter()
   pipeline, _, _ = WanCheckpointer2_2_FunCamera(config=config).load_checkpoint()

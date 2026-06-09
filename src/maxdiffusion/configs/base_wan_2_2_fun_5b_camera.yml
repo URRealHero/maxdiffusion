@@ -449,7 +449,15 @@ downscale_factor_control_adapter: 16
 wan_transformer_in_channels_override: 100
 wan_transformer_out_channels_override: 48
 input_image_path: ""
-camera_control_direction: "Left"
-camera_control_speed: 0.01
+# Direction preset (leave empty to require an explicit choice: a direction on the
+# CLI, or the extrinsic/intrinsic clip paths below).
+camera_control_direction: ""
+camera_control_speed: 0.0
 camera_control_origin: ""
+# Explicit camera trajectory (if both set, overrides the direction preset above).
+# .npy files: extrinsic [N,3,4] in w2c convention, intrinsic [N,3,3] in pixel units.
+extrinsic_clip_path: ""
+intrinsic_clip_path: ""
+camera_clip_fps_in: 4.0
+camera_clip_fps_out: 24.0
 output_video_name: "wan22_fun_camera_output.mp4"
