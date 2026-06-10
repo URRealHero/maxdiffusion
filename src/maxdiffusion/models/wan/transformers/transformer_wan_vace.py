@@ -237,8 +237,11 @@ class WanVACETransformerBlock(nnx.Module):
   ) -> Tuple[jax.Array, jax.Array]:
     with self.conditional_named_scope("vace_transformer_block"):
       with self.conditional_named_scope("input_projection"):
+        self.debug_finite("pre_input_proj.control", control_hidden_states)
         if self.apply_input_projection:
-          projected_control_hidden_states = self.proj_in(control_hidden_states) + hidden_states
+          proj_in_out = self.proj_in(control_hidden_states)
+          self.debug_finite("proj_in.out", proj_in_out)
+          projected_control_hidden_states = proj_in_out + hidden_states
           if input_projection_scale is None:
             control_hidden_states = projected_control_hidden_states
           else:
