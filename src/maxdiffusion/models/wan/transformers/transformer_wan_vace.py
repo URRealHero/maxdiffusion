@@ -68,6 +68,7 @@ class WanVACETransformerBlock(nnx.Module):
       apply_output_projection: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      debug_vace_numerics: bool = False,
   ):
     """Sets up the model.
 
@@ -97,6 +98,7 @@ class WanVACETransformerBlock(nnx.Module):
     self.enable_jax_named_scopes = enable_jax_named_scopes
     self.apply_input_projection = apply_input_projection
     self.apply_output_projection = apply_output_projection
+    self.debug_vace_numerics = debug_vace_numerics
 
     # 1. Input projection ("before_proj"): ZERO-init the kernel (bias defaults to
     # zeros) so the VACE branch starts as a clean no-op (c = 0 + hidden_states).
@@ -205,6 +207,17 @@ class WanVACETransformerBlock(nnx.Module):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
 
+  def debug_finite(self, name: str, value: jax.Array):
+    """Per-sub-op finite/max-abs check inside the VACE block (jit + scan safe)."""
+    if self.debug_vace_numerics:
+      v = value.astype(jnp.float32)
+      jax.debug.print(
+          "VACE numerics block.{name}: finite={f} max_abs={m}",
+          name=name,
+          f=jnp.mean(jnp.isfinite(v)),
+          m=jnp.max(jnp.abs(v)),
+      )
+
   def compute_kv(self, encoder_hidden_states: jax.Array, encoder_attention_mask: Optional[jax.Array] = None):
     return self.attn2.compute_kv(encoder_hidden_states, encoder_attention_mask)
 
@@ -234,9 +247,15 @@ class WanVACETransformerBlock(nnx.Module):
                 projected_control_hidden_states * projection_scale + control_hidden_states * (1 - projection_scale)
             ).astype(control_hidden_states.dtype)
 
+      self.debug_finite("in.control", control_hidden_states)
+      self.debug_finite("in.hidden", hidden_states)
+      self.debug_finite("in.temb", temb)
+
       shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = jnp.split(
           (self.adaln_scale_shift_table + temb.astype(jnp.float32)), 6, axis=1
       )
+      self.debug_finite("adaln.scale_msa", scale_msa)
+      self.debug_finite("adaln.gate_msa", gate_msa)
 
       axis_names = nn.logical_to_mesh_axes(("activation_batch", "activation_length", "activation_heads"))
       control_hidden_states = jax.lax.with_sharding_constraint(control_hidden_states, axis_names)
@@ -250,6 +269,7 @@ class WanVACETransformerBlock(nnx.Module):
           norm_hidden_states = (self.norm1(control_hidden_states.astype(jnp.float32)) * (1 + scale_msa) + shift_msa).astype(
               control_hidden_states.dtype
           )
+        self.debug_finite("self_attn.norm", norm_hidden_states)
         with self.conditional_named_scope("self_attn_attn"):
           attn_output = self.attn1(
               hidden_states=norm_hidden_states,
@@ -258,10 +278,12 @@ class WanVACETransformerBlock(nnx.Module):
               deterministic=deterministic,
               rngs=rngs,
           )
+        self.debug_finite("self_attn.attn_out", attn_output)
         with self.conditional_named_scope("self_attn_residual"):
           control_hidden_states = (control_hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(
               control_hidden_states.dtype
           )
+        self.debug_finite("self_attn.residual", control_hidden_states)
 
       # 2. Cross-attention
       with self.conditional_named_scope("cross_attn"):
@@ -276,8 +298,10 @@ class WanVACETransformerBlock(nnx.Module):
               deterministic=deterministic,
               rngs=rngs,
           )
+        self.debug_finite("cross_attn.attn_out", attn_output)
         with self.conditional_named_scope("cross_attn_residual"):
           control_hidden_states = control_hidden_states + attn_output
+        self.debug_finite("cross_attn.residual", control_hidden_states)
 
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
@@ -292,10 +316,12 @@ class WanVACETransformerBlock(nnx.Module):
               control_hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa
           ).astype(control_hidden_states.dtype)
 
+      self.debug_finite("after_ffn", control_hidden_states)
       with self.conditional_named_scope("output_projection"):
         conditioning_states = None
         if self.apply_output_projection:
           conditioning_states = self.proj_out(control_hidden_states)
+          self.debug_finite("after_proj_out", conditioning_states)
 
       return conditioning_states, control_hidden_states
 
@@ -487,6 +513,7 @@ class WanVACEModel(WanModel):
           apply_output_projection=True,
           use_base2_exp=use_base2_exp,
           use_experimental_scheduler=use_experimental_scheduler,
+          debug_vace_numerics=debug_vace_numerics,
       )
 
     if scan_layers and not self._is_sparse_vace:
@@ -518,6 +545,7 @@ class WanVACEModel(WanModel):
             apply_output_projection=True,
             use_base2_exp=use_base2_exp,
             use_experimental_scheduler=use_experimental_scheduler,
+            debug_vace_numerics=debug_vace_numerics,
         )
         vace_blocks.append(vace_block)
       self.vace_blocks = vace_blocks
