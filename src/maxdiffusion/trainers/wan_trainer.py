@@ -164,10 +164,24 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
         loss = loss * training_weight
       loss = jnp.mean(loss)
 
-    return loss
+    # NaN-debugging aux (cheap scalars, logged as debug/*). Tells us whether the
+    # FORWARD output (model_pred) and the loss are finite BEFORE the backward, and the
+    # magnitudes of the inputs/prediction — so a step-0 NaN can be localized.
+    _f32 = jnp.float32
+    aux = {
+        "loss_finite": _f32(jnp.isfinite(loss)),
+        "model_pred_finite_frac": jnp.mean(jnp.isfinite(model_pred)),
+        "model_pred_max_abs": jnp.max(jnp.abs(model_pred.astype(_f32))),
+        "noisy_latents_finite_frac": jnp.mean(jnp.isfinite(noisy_latents)),
+        "training_target_finite_frac": jnp.mean(jnp.isfinite(training_target)),
+        "latents_max_abs": jnp.max(jnp.abs(latents.astype(_f32))),
+        "timestep_min": jnp.min(timesteps.astype(_f32)),
+        "timestep_max": jnp.max(timesteps.astype(_f32)),
+    }
+    return loss, aux
 
-  grad_fn = nnx.value_and_grad(loss_fn)
-  loss, grads = grad_fn(state.params)
+  grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+  (loss, aux), grads = grad_fn(state.params)
   max_grad_norm = jaxopt.tree_util.tree_l2_norm(grads)
 
   max_abs_grad = jax.tree_util.tree_reduce(
@@ -175,12 +189,30 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
       grads,
       initializer=-1.0,
   )
+  # Fraction of finite gradient ELEMENTS (1.0 = all finite). If this is < 1.0 at step 0
+  # while loss_finite=1, the BACKWARD produced non-finite grads (an op-level issue) —
+  # which a tiny lr/warmup cannot fix. If grads are finite but the model NaNs only at
+  # step>=1, the UPDATE is the culprit (then lr/warmup matters).
+  _finite = jax.tree_util.tree_reduce(
+      lambda acc, g: acc + jnp.sum(jnp.isfinite(g)).astype(jnp.float32), grads, jnp.float32(0.0)
+  )
+  _total = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.float32(g.size), grads, jnp.float32(0.0))
+  grad_finite_frac = _finite / _total
 
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
+          "debug/grad_finite_frac": grad_finite_frac,
+          "debug/loss_finite": aux["loss_finite"],
+          "debug/model_pred_finite_frac": aux["model_pred_finite_frac"],
+          "debug/model_pred_max_abs": aux["model_pred_max_abs"],
+          "debug/noisy_latents_finite_frac": aux["noisy_latents_finite_frac"],
+          "debug/training_target_finite_frac": aux["training_target_finite_frac"],
+          "debug/latents_max_abs": aux["latents_max_abs"],
+          "debug/timestep_min": aux["timestep_min"],
+          "debug/timestep_max": aux["timestep_max"],
       },
       "scalars": {},
   }
