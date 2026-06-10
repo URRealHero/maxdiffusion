@@ -136,6 +136,9 @@ skip_jax_distributed_system: False
 
 # Parallelism
 mesh_axes: ['data', 'fsdp', 'context', 'tensor']
+# Replicates vae across devices instead of using the model's sharding annotations for sharding.
+replicate_vae: False
+vae_spatial: -1 # default to total_device * 2 // (dp)
 
 # batch : batch dimension of data and activations
 # hidden :

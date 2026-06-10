@@ -53,6 +53,9 @@ def parse_args() -> argparse.Namespace:
   p.add_argument("--manifest", required=True, help="JSONL with sample_id + gs:// cond_video/tgt_video/camera (paths).")
   p.add_argument("--caption-manifest", required=True, help="JSONL with sample_id + caption (concat captions).")
   p.add_argument("--output-dir", required=True)
+  p.add_argument("--wan-version", default="2.2", choices=["2.1", "2.2"],
+                 help="VAE/pipeline: 2.2=TI2V-5B dense (48-ch latents); 2.1=1.3B (16-ch). "
+                      "Pass the matching --config (base_wan_1_3b.yml for 2.1).")
   p.add_argument("--caption-field", default="caption")
   # cond+tgt are read from GCS and concatenated in-memory (cond frames then tgt frames).
   p.add_argument("--cond-video-field", default="cond_video")
@@ -243,7 +246,13 @@ def main() -> int:
   if args.dry_run:
     return 0
 
-  pipeline = WanPipeline2_2_Dense.from_pretrained(config, load_transformer=False)
+  # Only the pipeline/VAE differ by version; encode_videos() is version-agnostic
+  # (reads pipeline.vae.z_dim / latents_mean/std; the 2.1 VAE shares the [0].mode() API).
+  if args.wan_version == "2.1":
+    from maxdiffusion.pipelines.wan.wan_pipeline_2_1 import WanPipeline2_1
+    pipeline = WanPipeline2_1.from_pretrained(config, load_transformer=False)  # 16-ch VAE
+  else:
+    pipeline = WanPipeline2_2_Dense.from_pretrained(config, load_transformer=False)  # 48-ch VAE
   if pipeline.text_encoder is not None:
     pipeline.text_encoder.eval()
 

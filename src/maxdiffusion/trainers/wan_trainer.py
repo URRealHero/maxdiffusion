@@ -199,12 +199,32 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   _total = jax.tree_util.tree_reduce(lambda acc, g: acc + jnp.float32(g.size), grads, jnp.float32(0.0))
   grad_finite_frac = _finite / _total
 
+  # Per-module grad-finite fractions, to localize WHICH parameter subtree holds the
+  # residual non-finite gradients. Grouping is by substring of the parameter path
+  # (known at trace time, so this compiles to plain reductions).
+  from jax.tree_util import tree_flatten_with_path, keystr
+
+  _grad_leaves = tree_flatten_with_path(grads)[0]
+  _grad_groups = [
+      "patch_embedding", "condition_embedder", "time", "text_embedder",
+      "attn1", "attn2", "ffn", "scale_shift", "norm1", "norm2", "norm3",
+      "norm_out", "proj_out", "rope", "freqs", "lora",
+  ]
+  _per_group_finite = {}
+  for _grp in _grad_groups:
+    _sel = [g for p, g in _grad_leaves if _grp in keystr(p).lower()]
+    if _sel:
+      _fin = sum((jnp.sum(jnp.isfinite(g)).astype(jnp.float32) for g in _sel), jnp.float32(0.0))
+      _tot = sum((jnp.float32(g.size) for g in _sel), jnp.float32(0.0))
+      _per_group_finite[f"debug/gradfin_{_grp}"] = _fin / _tot
+
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
           "debug/grad_finite_frac": grad_finite_frac,
+          **_per_group_finite,
           "debug/loss_finite": aux["loss_finite"],
           "debug/model_pred_finite_frac": aux["model_pred_finite_frac"],
           "debug/model_pred_max_abs": aux["model_pred_max_abs"],
