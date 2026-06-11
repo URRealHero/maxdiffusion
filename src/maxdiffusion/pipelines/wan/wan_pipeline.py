@@ -33,6 +33,7 @@ from ...max_utils import get_flash_block_sizes, get_precision, device_put_replic
 from ...models.wan.wan_utils import load_wan_transformer, load_wan_vae
 from ...models.wan.transformers.transformer_wan import WanModel
 from ...models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
+from ...models.wan.wan_text_encoder_pytorch import WanTextEncoderForMaxDiffusion
 from maxdiffusion.video_processor import VideoProcessor
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler, UniPCMultistepSchedulerState
 from transformers import AutoTokenizer, UMT5EncoderModel
@@ -63,19 +64,20 @@ TORCH_DTYPE_MAP = {
 
 def cast_with_exclusion(path, x, dtype_to_cast):
   """
-  Casts arrays to dtype_to_cast, but keeps params from any 'norm' layer in float32.
+  Casts arrays to dtype_to_cast, but keeps numerically sensitive params in float32.
   """
 
   exclusion_keywords = [
       "norm",  # For all LayerNorm/GroupNorm layers
       "condition_embedder",  # The entire time/text conditioning module
       "scale_shift_table",  # Catches both the final and the AdaLN tables
+      "lora_",  # Keep trainable LoRA adapters in fp32 for TPU mixed-precision stability
   ]
 
   path_str = ".".join(str(k.key) if isinstance(k, jax.tree_util.DictKey) else str(k) for k in path)
 
   if any(keyword in path_str.lower() for keyword in exclusion_keywords):
-    # Keep LayerNorm/GroupNorm weights and biases in full precision
+    # Keep these weights and biases in full precision
     return x.astype(jnp.float32)
   else:
     # Cast everything else to dtype_to_cast
@@ -131,6 +133,25 @@ def _select_restored_transformer_state(restored_checkpoint, subfolder: str):
   raise ValueError(f"Unsupported WAN checkpoint transformer subfolder `{subfolder}`.")
 
 
+def _normalize_wan_fun_config_aliases(wan_config: dict) -> dict:
+  """Normalize DiffSynth/Fun WAN config aliases to MaxDiffusion WanModel args."""
+  wan_config = dict(wan_config)
+  if "dim" in wan_config:
+    dim = int(wan_config.pop("dim"))
+    num_heads = int(wan_config.get("num_heads", wan_config.get("num_attention_heads", 1)))
+    wan_config.setdefault("num_attention_heads", num_heads)
+    wan_config.setdefault("attention_head_dim", dim // num_heads)
+  if "num_heads" in wan_config:
+    wan_config.setdefault("num_attention_heads", int(wan_config.pop("num_heads")))
+  if "in_dim" in wan_config:
+    wan_config.setdefault("in_channels", int(wan_config.pop("in_dim")))
+  if "out_dim" in wan_config:
+    wan_config.setdefault("out_channels", int(wan_config.pop("out_dim")))
+  for ignored in ("text_len", "add_ref_conv", "_class_name", "_diffusers_version"):
+    wan_config.pop(ignored, None)
+  return wan_config
+
+
 # For some reason, jitting this function increases the memory significantly, so instead manually move weights to device.
 def create_sharded_logical_transformer(
     devices_array: np.array,
@@ -148,7 +169,17 @@ def create_sharded_logical_transformer(
   if restored_checkpoint:
     wan_config = restored_checkpoint["wan_config"]
   else:
-    wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
+    try:
+      wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
+    except (OSError, EnvironmentError) as exc:
+      if subfolder:
+        max_logging.log(
+            f"Could not load WAN config from subfolder '{subfolder}' ({exc}); falling back to checkpoint root."
+        )
+        wan_config = WanModel.load_config(config.pretrained_model_name_or_path)
+      else:
+        raise
+  wan_config = _normalize_wan_fun_config_aliases(wan_config)
   if config.model_type == "I2V":
     # WAN 2.1 I2V uses image embeddings via CLIP encoder (image_dim and added_kv_proj_dim are set)
     # WAN 2.2 I2V uses VAE-encoded latent conditioning (image_dim and added_kv_proj_dim are None in the transformer config)
@@ -172,6 +203,19 @@ def create_sharded_logical_transformer(
   wan_config["enable_jax_named_scopes"] = config.enable_jax_named_scopes
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
+  # Camera-control adapter + Fun checkpoint channel overrides (lora_rank/alpha
+  # deliberately NOT plumbed yet — LoRA port is a later phase).
+  wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
+  wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
+  wan_config["downscale_factor_control_adapter"] = int(
+      getattr(config, "downscale_factor_control_adapter", wan_config.get("downscale_factor_control_adapter", 8))
+  )
+  in_channels_override = int(getattr(config, "wan_transformer_in_channels_override", -1))
+  out_channels_override = int(getattr(config, "wan_transformer_out_channels_override", -1))
+  if in_channels_override > 0:
+    wan_config["in_channels"] = in_channels_override
+  if out_channels_override > 0:
+    wan_config["out_channels"] = out_channels_override
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
@@ -310,6 +354,18 @@ class WanPipeline:
       raise ValueError(f"Unsupported text_encoder_dtype: {dtype_str}. Supported values are: {list(TORCH_DTYPE_MAP.keys())}")
     torch_dtype = TORCH_DTYPE_MAP[dtype_str]
 
+    # PAI Fun camera-control checkpoints ship the original umT5 .pth instead of a
+    # diffusers text_encoder subfolder; load it through the ported PyTorch encoder.
+    if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_text_encoder_filename", ""):
+      text_encoder = WanTextEncoderForMaxDiffusion.from_pretrained(
+          config.pretrained_model_name_or_path,
+          filename=config.wan_text_encoder_filename,
+          torch_dtype=torch_dtype,
+          compile_text_encoder=getattr(config, "compile_text_encoder", False),
+      )
+      return text_encoder
+
+
     text_encoder = UMT5EncoderModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="text_encoder",
@@ -321,9 +377,10 @@ class WanPipeline:
 
   @classmethod
   def load_tokenizer(cls, config: HyperParameters):
+    tokenizer_subfolder = getattr(config, "wan_tokenizer_subfolder", "tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(
         config.pretrained_model_name_or_path,
-        subfolder="tokenizer",
+        subfolder=tokenizer_subfolder,
     )
     return tokenizer
 
@@ -497,6 +554,17 @@ class WanPipeline:
 
   @classmethod
   def load_scheduler(cls, config):
+    if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_use_local_flow_scheduler", True):
+      scheduler = FlaxUniPCMultistepScheduler(
+          prediction_type="flow_prediction",
+          use_flow_sigmas=True,
+          flow_shift=config.flow_shift,
+          solver_order=2,
+          timestep_spacing="linspace",
+          final_sigmas_type="zero",
+          dtype=jnp.float32,
+      )
+      return scheduler, scheduler.create_state()
     scheduler, scheduler_state = FlaxUniPCMultistepScheduler.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="scheduler",
@@ -969,6 +1037,7 @@ def transformer_forward_pass(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   wan_transformer = nnx.merge(graphdef, sharded_state, rest_of_state)
   outputs = wan_transformer(
@@ -982,6 +1051,7 @@ def transformer_forward_pass(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
 
   if return_residual:
@@ -1015,6 +1085,7 @@ def transformer_forward_pass_full_cfg(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   """Full CFG forward pass.
 
@@ -1036,6 +1107,7 @@ def transformer_forward_pass_full_cfg(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
   noise_cond = noise_pred[:bsz]
   noise_uncond = noise_pred[bsz:]
@@ -1060,6 +1132,7 @@ def transformer_forward_pass_cfg_cache(
     kv_cache=None,
     rotary_emb=None,
     encoder_attention_mask=None,
+    control_camera_latents_input=None,
 ):
   """CFG-Cache forward pass with FFT frequency-domain compensation.
 
@@ -1088,6 +1161,7 @@ def transformer_forward_pass_cfg_cache(
       kv_cache=kv_cache,
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
+      control_camera_latents_input=control_camera_latents_input,
   )
 
   # FFT over spatial dims (H, W) — last 2 dims of [B, C, F, H, W]

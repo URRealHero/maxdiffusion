@@ -136,6 +136,16 @@ def write_metrics_to_tensorboard(writer, metrics, step, config):
           float(metrics["scalar"]["learning/loss"]),
       )
   )
+  # Echo any debug/* scalars (e.g. NaN-localization probes) to the text log too;
+  # otherwise they only land in TensorBoard and never show up in the worker log.
+  debug_scalars = {k: v for k, v in metrics["scalar"].items() if k.startswith("debug/")}
+  if debug_scalars:
+    max_logging.log(
+        "  step {} debug: {}".format(
+            step,
+            "  ".join(f"{k.split('/', 1)[1]}={float(v):.6g}" for k, v in sorted(debug_scalars.items())),
+        )
+    )
   if jax.process_index() == 0:
     for metric_name in metrics.get("scalar", []):
       writer.add_scalar(metric_name, np.array(metrics["scalar"][metric_name]), step)

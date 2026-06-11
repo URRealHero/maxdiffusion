@@ -338,6 +338,27 @@ class BaseWanTrainer(abc.ABC):
         ):
           state, scheduler_state, train_metric, rng = p_train_step(state, example_batch, rng, scheduler_state)
           train_metric["scalar"]["learning/loss"].block_until_ready()
+          # Hard-stop on non-finite (NaN/Inf) loss so a diverged or misconfigured
+          # run fails loudly instead of silently burning compute. Trainers that
+          # intentionally skip bad batches (frame_concat_skip_nonfinite_update)
+          # opt out; disable globally with stop_on_nonfinite_loss=False.
+          _stop_on_nonfinite = str(getattr(self.config, "stop_on_nonfinite_loss", True)).lower() == "true"
+          _skip_nonfinite = str(getattr(self.config, "frame_concat_skip_nonfinite_update", False)).lower() == "true"
+          if _stop_on_nonfinite and not _skip_nonfinite:
+            _loss_value = float(train_metric["scalar"]["learning/loss"])
+            if not np.isfinite(_loss_value):
+              raise RuntimeError(
+                  f"Non-finite training loss ({_loss_value}) at step {step}; stopping training. "
+                  "Disable this guard with stop_on_nonfinite_loss=False."
+              )
+            _trainable_grads_all_finite = train_metric["scalar"].get(
+                "debug/trainable_grads_all_finite_before_sanitize", None
+            )
+            if _trainable_grads_all_finite is not None and float(_trainable_grads_all_finite) == 0.0:
+              raise RuntimeError(
+                  f"Non-finite trainable gradients at step {step}; stopping training. "
+                  "Disable this guard with stop_on_nonfinite_loss=False."
+              )
         last_step_completion = datetime.datetime.now()
 
         if max_utils.profiler_enabled(self.config) and step == last_profiling_step:

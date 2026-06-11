@@ -330,6 +330,120 @@ class WanFeedForward(nnx.Module):
       return self.proj_out(hidden_states)  # output is (4, 75600, 5120)
 
 
+class WanCameraResidualBlock(nnx.Module):
+  """DiffSynth/Captain-Safari residual block for camera Plucker features."""
+
+  def __init__(
+      self,
+      rngs: nnx.Rngs,
+      dim: int,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    kernel_init = nnx.with_partitioning(nnx.initializers.xavier_uniform(), (None, None, None, "conv_out"))
+    bias_init = nnx.with_partitioning(nnx.initializers.zeros, ("conv_out",))
+    self.conv1 = nnx.Conv(
+        dim,
+        dim,
+        rngs=rngs,
+        kernel_size=(3, 3),
+        strides=(1, 1),
+        padding="SAME",
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+        kernel_init=kernel_init,
+        bias_init=bias_init,
+    )
+    self.conv2 = nnx.Conv(
+        dim,
+        dim,
+        rngs=rngs,
+        kernel_size=(3, 3),
+        strides=(1, 1),
+        padding="SAME",
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+        kernel_init=kernel_init,
+        bias_init=bias_init,
+    )
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    residual = x
+    x = jax.nn.relu(self.conv1(x))
+    x = self.conv2(x)
+    return x + residual
+
+
+class WanCameraSimpleAdapter(nnx.Module):
+  """DiffSynth SimpleAdapter port for official WAN Fun camera-control.
+
+  Input: packed Plucker control latents [B, 24, T_lat, H, W].
+  Output: patch-token feature map [B, T_lat, H/32, W/32, dim] for PAI 5B
+  when downscale_factor=16 and patch stride=(2,2).
+  """
+
+  def __init__(
+      self,
+      rngs: nnx.Rngs,
+      in_dim: int,
+      out_dim: int,
+      kernel_size: Tuple[int, int],
+      stride: Tuple[int, int],
+      downscale_factor: int = 8,
+      num_residual_blocks: int = 1,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.downscale_factor = downscale_factor
+    kernel_init = nnx.with_partitioning(nnx.initializers.xavier_uniform(), (None, None, None, "conv_out"))
+    bias_init = nnx.with_partitioning(nnx.initializers.zeros, ("conv_out",))
+    self.conv = nnx.Conv(
+        in_dim * downscale_factor * downscale_factor,
+        out_dim,
+        rngs=rngs,
+        kernel_size=kernel_size,
+        strides=stride,
+        padding="VALID",
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+        kernel_init=kernel_init,
+        bias_init=bias_init,
+    )
+    self.num_residual_blocks = num_residual_blocks
+    for i in range(num_residual_blocks):
+      setattr(self, f"residual_blocks_{i}", WanCameraResidualBlock(rngs, out_dim, dtype, weights_dtype, precision))
+
+  def _pixel_unshuffle(self, x: jax.Array) -> jax.Array:
+    factor = self.downscale_factor
+    bf, height, width, channels = x.shape
+    if height % factor != 0 or width % factor != 0:
+      raise ValueError(f"Camera control spatial shape {(height, width)} must be divisible by {factor}.")
+    x = x.reshape(bf, height // factor, factor, width // factor, factor, channels)
+    # Match PyTorch nn.PixelUnshuffle channel order [C, r, r] (channel-major), not
+    # [r, r, C]. The checkpoint's control_adapter.conv weights assume PyTorch order;
+    # using [r, r, C] permutes the conv's input channels and scrambles the camera
+    # control signal (model ignores camera -> falls back to prompt-default motion).
+    # dims here are (bf, h, i, w, j, c) -> reorder to (bf, h, w, c, i, j).
+    x = jnp.transpose(x, (0, 1, 3, 5, 2, 4))
+    return x.reshape(bf, height // factor, width // factor, channels * factor * factor)
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    batch, channels, frames, height, width = x.shape
+    x = jnp.transpose(x, (0, 2, 3, 4, 1))
+    x = x.reshape(batch * frames, height, width, channels)
+    x = self._pixel_unshuffle(x)
+    x = self.conv(x)
+    for i in range(self.num_residual_blocks):
+      x = getattr(self, f"residual_blocks_{i}")(x)
+    out_height, out_width, out_channels = x.shape[1], x.shape[2], x.shape[3]
+    return x.reshape(batch, frames, out_height, out_width, out_channels)
+
+
 class WanTransformerBlock(nnx.Module):
 
   def __init__(
@@ -572,6 +686,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      add_control_adapter: bool = False,
+      in_dim_control_adapter: int = 24,
+      downscale_factor_control_adapter: int = 8,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -595,6 +712,22 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             (None, None, None, None, "conv_out"),
         ),
     )
+    # Camera control adapter (PAI WAN Fun camera-control). Plucker control
+    # latents are mapped to patch-token features and added to the patch
+    # embedding output before the transformer blocks.
+    self.control_adapter = nnx.data(None)
+    if add_control_adapter:
+      self.control_adapter = WanCameraSimpleAdapter(
+          rngs=rngs,
+          in_dim=in_dim_control_adapter,
+          out_dim=inner_dim,
+          kernel_size=patch_size[1:],
+          stride=patch_size[1:],
+          downscale_factor=downscale_factor_control_adapter,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
 
     # 2. Condition embeddings
     # image_embedding_dim=1280 for I2V model
@@ -763,6 +896,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       kv_cache: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
+      control_camera_latents_input: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
     hidden_states = nn.with_logical_constraint(hidden_states, ("batch", None, None, None, None))
     batch_size, _, num_frames, height, width = hidden_states.shape
@@ -777,6 +911,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
         rotary_emb = self.rope(hidden_states)
     with self.conditional_named_scope("patch_embedding"):
       hidden_states = self.patch_embedding(hidden_states)
+      if self.control_adapter is not None and control_camera_latents_input is not None:
+        camera_states = self.control_adapter(control_camera_latents_input)
+        hidden_states = hidden_states + camera_states.astype(hidden_states.dtype)
       hidden_states = jax.lax.collapse(hidden_states, 1, -1)
     per_token_t = timestep.ndim == 2  # [B, seq_len] for TI2V
     with self.conditional_named_scope("condition_embedder"):

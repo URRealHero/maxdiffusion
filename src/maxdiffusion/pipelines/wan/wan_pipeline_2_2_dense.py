@@ -113,14 +113,26 @@ class WanPipeline2_2_Dense(WanPipeline):
     base pipeline loads. Mirrors WanPipeline.load_vae otherwise."""
 
     def create_model(rngs: nnx.Rngs, config: HyperParameters):
-      wan_vae = AutoencoderKLWan2p2.from_config(
-          config.pretrained_model_name_or_path,
-          subfolder="vae",
-          rngs=rngs,
-          mesh=mesh,
-          dtype=config.vae_dtype,
-          weights_dtype=config.vae_weights_dtype,
-      )
+      if getattr(config, "model_type", "") == "TI2V-CC" and getattr(config, "wan_vae_filename", ""):
+        # PAI Fun camera-control repos publish the VAE as Wan2.2_VAE.pth at repo
+        # root (no diffusers vae/ subfolder; the root config.json belongs to the
+        # transformer). Build the native Wan2.2 VAE from class defaults and load
+        # the PAI weights via the filename override below.
+        wan_vae = AutoencoderKLWan2p2(
+            rngs=rngs,
+            mesh=mesh,
+            dtype=config.vae_dtype,
+            weights_dtype=config.vae_weights_dtype,
+        )
+      else:
+        wan_vae = AutoencoderKLWan2p2.from_config(
+            config.pretrained_model_name_or_path,
+            subfolder="vae",
+            rngs=rngs,
+            mesh=mesh,
+            dtype=config.vae_dtype,
+            weights_dtype=config.vae_weights_dtype,
+        )
       return wan_vae
 
     p_model_factory = partial(create_model, config=config)
@@ -134,7 +146,14 @@ class WanPipeline2_2_Dense(WanPipeline):
     params = state.to_pure_dict()
     state = dict(nnx.to_flat_state(state))
 
-    params = load_wan_vae(config.pretrained_model_name_or_path, params, "cpu", is_wan_2p2=True)
+    params = load_wan_vae(
+        config.pretrained_model_name_or_path,
+        params,
+        "cpu",
+        is_wan_2p2=True,
+        subfolder=getattr(config, "wan_vae_subfolder", "vae"),
+        filename=getattr(config, "wan_vae_filename", "") or "diffusion_pytorch_model.safetensors",
+    )
     params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
     for path, val in flax.traverse_util.flatten_dict(params).items():
       sharding = logical_state_sharding[path].value

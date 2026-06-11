@@ -171,7 +171,7 @@ class _HyperParameters:
           max_logging.log(
               f"Warning: Try setting num_inference_steps to less than 10 steps when using CausVid, currently you are setting {num_inference_steps} steps."
           )
-      else:
+      elif raw_keys.get("model_name") == "wan2.1":
         raise ValueError(f"{transformer_pretrained_model_name_or_path} transformer model is not supported for Wan 2.1")
     if "use_qwix_quantization" not in raw_keys:
       raise ValueError("use_qwix_quantization is not set.")
