@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler
+from ...video_processor import VideoProcessor
 import numpy as np
 import time
 from ... import max_utils
@@ -41,6 +42,13 @@ class WanPipeline2_2_Dense(WanPipeline):
   def __init__(self, config: HyperParameters, transformer: Optional[WanModel], **kwargs):
     super().__init__(config=config, **kwargs)
     self.transformer = transformer
+    # The WAN 2.2 VAE applies a 2x pixel-shuffle patchify on top of the conv
+    # down-blocks, so its true spatial compression is 8 * patch_size = 16. The
+    # base pipeline computes 8, which doubles the latent (and output) resolution.
+    if getattr(self, "vae", None) is not None:
+      vae_spatial_patch = getattr(self.vae, "patch_size", 1) or 1
+      self.vae_scale_factor_spatial = (2 ** len(self.vae.temperal_downsample)) * vae_spatial_patch
+      self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
   @classmethod
   def _load_and_init(cls, config, restored_checkpoint=None, vae_only=False, load_transformer=True):
