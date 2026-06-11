@@ -175,11 +175,15 @@ def load_camera(camera_uri, fov_deg, width, height, indices, expected_total):
   return ext_full[indices].astype(np.float32), intr_full[indices].astype(np.float32)
 
 
-def make_example(latent, hidden_state, extrinsic, intrinsic) -> bytes:
+def make_example(latent, latent_condition, hidden_state, extrinsic, intrinsic) -> bytes:
   import tensorflow as tf
 
   features = {
       "latents": bytes_feature(serialize_tensor(latent)),
+      # Fun camera-control y-conditioning: VAE encode of [first_frame, zeros x (F-1)].
+      # NOT derivable from `latents` (the VAE's temporal kernels mix the zero
+      # padding differently than real frames). The 4ch mask is built in-trainer.
+      "latent_condition": bytes_feature(serialize_tensor(latent_condition)),
       "encoder_hidden_states": bytes_feature(serialize_tensor(hidden_state)),
       "camera_extrinsic": bytes_feature(serialize_tensor(extrinsic)),
       "camera_intrinsic": bytes_feature(serialize_tensor(intrinsic)),
@@ -279,17 +283,26 @@ def main() -> int:
         cams.append(load_camera(camera_uri, args.camera_fov_deg, width, height, idx, total))
         prompts.append(str(caption))
 
-      latents = encode_videos(pipeline, np.concatenate(videos, axis=0))
+      video_batch = np.concatenate(videos, axis=0)
+      latents = encode_videos(pipeline, video_batch)
+      # Fun camera-control conditioning: encode the MASKED video (first frame
+      # kept, rest zeroed) through the exact same VAE + normalization path.
+      masked_batch = np.concatenate(
+          [video_batch[:, :, :1], np.zeros_like(video_batch[:, :, 1:])], axis=2)
+      latent_conditions = encode_videos(pipeline, masked_batch)
       hidden_states = encode_prompts(pipeline, prompts, args.max_sequence_length)
 
-      for (_, sample_id, record), latent, hidden, (ext, intr) in zip(records, latents, hidden_states, cams):
-        assert_finite(sample_id, ("latents", latent), ("encoder_hidden_states", hidden),
+      for (_, sample_id, record), latent, latent_condition, hidden, (ext, intr) in zip(
+          records, latents, latent_conditions, hidden_states, cams):
+        assert_finite(sample_id, ("latents", latent), ("latent_condition", latent_condition),
+                      ("encoder_hidden_states", hidden),
                       ("camera_extrinsic", ext), ("camera_intrinsic", intr))
-        writer.write(make_example(latent, hidden, ext, intr))
+        writer.write(make_example(latent, latent_condition, hidden, ext, intr))
         metadata_writer.write({
             "sample_id": sample_id,
             "caption": caption_map.get(sample_id),
             "latent_shape": list(latent.shape),
+            "latent_condition_shape": list(latent_condition.shape),
             "encoder_hidden_states_shape": list(hidden.shape),
             "camera_extrinsic_shape": list(ext.shape),
             "camera_intrinsic_shape": list(intr.shape),
