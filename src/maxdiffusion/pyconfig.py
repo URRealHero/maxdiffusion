@@ -41,7 +41,9 @@ from maxdiffusion.common_types import (
 )
 
 _ALLOWED_MODEL_NAMES = {WAN2_1, WAN2_2, LTX2_VIDEO, LTX2_3}
-_ALLOWED_TRAINING_MODEL_NAMES = {WAN2_1}
+# wan2.2 added for the TI2V-5B dense trainer (Wan2_2DenseTrainer): it reuses the
+# wan2.1 training step unchanged and only swaps the checkpointer/pipeline.
+_ALLOWED_TRAINING_MODEL_NAMES = {WAN2_1, WAN2_2}
 
 
 def _validate_model_name(model_name: str | None):
