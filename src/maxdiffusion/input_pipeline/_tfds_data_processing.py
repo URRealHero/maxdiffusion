@@ -125,7 +125,12 @@ def _make_tfrecord_iterator(
     clip_embeddings = tf.io.parse_tensor(tnp.asarray(features["clip_embeddings"]), out_type=tf.float32)
     return {"pixel_values": moments, "input_ids": clip_embeddings}
 
-  filenames = tf.io.gfile.glob(os.path.join(dataset_path, "*"))
+  # Prefer .tfrec files so sidecar metadata (manifest .jsonl, _done markers) in the
+  # same directory is not parsed as TFRecords. Sort for a deterministic order across
+  # hosts — ds.shard() below assumes every host sees the same record sequence.
+  filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*.tfrec")))
+  if not filenames:
+    filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*")))
   ds = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
 
   # --- PADDING LOGIC FOR EVALUATION ---

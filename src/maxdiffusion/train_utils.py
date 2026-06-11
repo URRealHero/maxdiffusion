@@ -125,15 +125,17 @@ def write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step
 
 def write_metrics_to_tensorboard(writer, metrics, step, config):
   """Writes metrics to tensorboard"""
-  if jax.process_index() == 0:
-    max_logging.log(
-        "completed step: {}, seconds: {:.3f}, TFLOP/s/device: {:.3f}, loss: {:.3f}".format(
-            step,
-            metrics["scalar"]["perf/step_time_seconds"],
-            metrics["scalar"]["perf/per_device_tflops_per_sec"],
-            float(metrics["scalar"]["learning/loss"]),
-        )
-    )
+  # Log on every host (not just process 0) so each worker's log shows training
+  # progress — on multihost a silent worker log is indistinguishable from a hang.
+  max_logging.log(
+      "[proc {}] completed step: {}, seconds: {:.3f}, TFLOP/s/device: {:.3f}, loss: {:.3f}".format(
+          jax.process_index(),
+          step,
+          metrics["scalar"]["perf/step_time_seconds"],
+          metrics["scalar"]["perf/per_device_tflops_per_sec"],
+          float(metrics["scalar"]["learning/loss"]),
+      )
+  )
   if jax.process_index() == 0:
     for metric_name in metrics.get("scalar", []):
       writer.add_scalar(metric_name, np.array(metrics["scalar"][metric_name]), step)

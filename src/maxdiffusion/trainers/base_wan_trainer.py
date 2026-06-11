@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import datetime
 import os
 import pprint
+import socket
 import threading
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
@@ -290,6 +291,10 @@ class BaseWanTrainer(abc.ABC):
     max_utils.add_text_to_summary_writer("libtpu_init_args", os.environ.get("LIBTPU_INIT_ARGS", ""), writer)
     max_utils.add_config_to_summary_writer(self.config, writer)
 
+    max_logging.log(
+        f"multihost: this host is jax process {jax.process_index()} of {jax.process_count()} "
+        f"(hostname {socket.gethostname()}); every host logs '[proc N] completed step' lines"
+    )
     if jax.process_index() == 0:
       max_logging.log("***** Running training *****")
       max_logging.log(f"  Instantaneous batch size per device = {self.config.per_device_batch_size}")
