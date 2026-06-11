@@ -228,13 +228,23 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     )
 
   def _calculate_training_weights(self, timesteps: jnp.ndarray, num_inference_steps: int) -> jnp.ndarray:
-    """Calculates the training weight for a given timestep."""
+    """Calculates the training weight for a given timestep.
+
+    Follows DiffSynth's bsmntw weighting, which normalizes over the FULL
+    training-timestep grid. Normalizing over the sampled batch instead (the
+    previous behavior) makes the mean weight — and therefore the reported loss
+    AND the gradient scale / effective learning rate — proportional to
+    1/batch_size, so runs with different batch sizes were not comparable.
+    """
+    n = num_inference_steps
+    grid = jnp.arange(n, dtype=jnp.float32)
+    y_grid = jnp.exp(-2 * ((grid - n / 2) / n) ** 2)
+    y_grid_min = jnp.min(y_grid)
+    grid_norm = jnp.sum(y_grid - y_grid_min)
+
     x = timesteps
-    y = jnp.exp(-2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2)
-    y_shifted = y - jnp.min(y)
-    bsmntw_weighing = y_shifted * (num_inference_steps / jnp.sum(y_shifted))
-    linear_timesteps_weights = bsmntw_weighing
-    return linear_timesteps_weights
+    y = jnp.exp(-2 * ((x - n / 2) / n) ** 2)
+    return (y - y_grid_min) * (n / grid_norm)
 
   def sample_timesteps(self, timestep_rng, batch_size):
     # 1. Sample continuous timesteps t in [0, 1]
