@@ -14,17 +14,25 @@
 
 from .wan_pipeline import WanPipeline, transformer_forward_pass, transformer_forward_pass_full_cfg, transformer_forward_pass_cfg_cache, init_magcache, magcache_step
 from ...models.wan.transformers.transformer_wan import WanModel
+from ...models.wan.autoencoder_kl_wan_2p2 import AutoencoderKLWan2p2
+from ...models.wan.autoencoder_kl_wan import AutoencoderKLWanCache
+from ...models.wan.wan_utils import load_wan_vae
 from typing import List, Union, Optional
 from ...pyconfig import HyperParameters
 from functools import partial
+import flax
+import flax.traverse_util
 from flax import nnx
+from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ...schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler
 import numpy as np
 import time
 from ... import max_utils
+from ...max_utils import device_put_replicated
 
 
 class WanPipeline2_2_Dense(WanPipeline):
@@ -82,6 +90,54 @@ class WanPipeline2_2_Dense(WanPipeline):
   ):
     pipeline, _ = cls._load_and_init(config, restored_checkpoint, vae_only, load_transformer)
     return pipeline
+
+  @classmethod
+  def load_vae(
+      cls,
+      devices_array: np.array,
+      mesh: Mesh,
+      rngs: nnx.Rngs,
+      config: HyperParameters,
+      vae_logical_axis_rules: tuple = None,
+  ):
+    """Override: the TI2V-5B dense model uses the WAN 2.2 high-compression VAE
+    (AutoencoderKLWan2p2, 48 latent channels, 16x spatial), not the 2.1 VAE the
+    base pipeline loads. Mirrors WanPipeline.load_vae otherwise."""
+
+    def create_model(rngs: nnx.Rngs, config: HyperParameters):
+      wan_vae = AutoencoderKLWan2p2.from_config(
+          config.pretrained_model_name_or_path,
+          subfolder="vae",
+          rngs=rngs,
+          mesh=mesh,
+          dtype=config.vae_dtype,
+          weights_dtype=config.vae_weights_dtype,
+      )
+      return wan_vae
+
+    p_model_factory = partial(create_model, config=config)
+    wan_vae = nnx.eval_shape(p_model_factory, rngs=rngs)
+    graphdef, state = nnx.split(wan_vae, nnx.Param)
+
+    logical_state_spec = nnx.get_partition_spec(state)
+    logical_rules = vae_logical_axis_rules if vae_logical_axis_rules is not None else config.logical_axis_rules
+    logical_state_sharding = nn.logical_to_mesh_sharding(logical_state_spec, mesh, logical_rules)
+    logical_state_sharding = dict(nnx.to_flat_state(logical_state_sharding))
+    params = state.to_pure_dict()
+    state = dict(nnx.to_flat_state(state))
+
+    params = load_wan_vae(config.pretrained_model_name_or_path, params, "cpu", is_wan_2p2=True)
+    params = jax.tree_util.tree_map(lambda x: x.astype(config.weights_dtype), params)
+    for path, val in flax.traverse_util.flatten_dict(params).items():
+      sharding = logical_state_sharding[path].value
+      if config.replicate_vae:
+        sharding = NamedSharding(mesh, P())
+      state[path].value = device_put_replicated(val, sharding)
+    state = nnx.from_flat_state(state)
+
+    wan_vae = nnx.merge(graphdef, state)
+    vae_cache = AutoencoderKLWanCache(wan_vae)
+    return wan_vae, vae_cache
 
   def _get_num_channel_latents(self) -> int:
     return self.transformer.config.in_channels
