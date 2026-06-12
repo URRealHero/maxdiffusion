@@ -18,6 +18,7 @@ from functools import partial
 from maxdiffusion.image_processor import PipelineImageInput
 import numpy as np
 import math
+import os
 import jax
 import jax.numpy as jnp
 import time
@@ -792,7 +793,15 @@ class WanPipeline:
 
   @classmethod
   def _create_common_components(cls, config, vae_only=False, i2v=False):
-    devices_array = max_utils.create_device_mesh(config)
+    # Per-host tools (e.g. tpu_tfrecord_encoder with --host-count) set this env
+    # var so each pod worker builds its mesh from its OWN chips instead of the
+    # global pod slice — on Cloud TPU every process sees all devices even
+    # without jax.distributed, so without this the encoder's per-host batches
+    # get judged against pod-wide (e.g. 256-way) sharding rules.
+    if os.environ.get("MAXDIFFUSION_FORCE_LOCAL_DEVICE_MESH", "0").lower() in {"1", "true", "yes"}:
+      devices_array = max_utils.create_device_mesh(config, devices=jax.local_devices())
+    else:
+      devices_array = max_utils.create_device_mesh(config)
     mesh = Mesh(devices_array, config.mesh_axes)
 
     vae_spatial = getattr(config, "vae_spatial", -1)
