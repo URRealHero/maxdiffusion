@@ -123,7 +123,11 @@ class Wan2_2FunCameraTrainer(WanTrainer):
     )
 
   def get_eval_step(self, pipeline, mesh, state_shardings, eval_data_shardings):
-    raise NotImplementedError("Fun camera eval step not wired yet; run with eval_every=-1.")
+    # The base training_loop builds the eval step unconditionally but only
+    # calls it when eval_every > 0 — so return a stub unless eval is enabled.
+    if int(getattr(self.config, "eval_every", -1)) > 0:
+      raise NotImplementedError("Fun camera eval step not wired yet; run with eval_every=-1.")
+    return None
 
 
 def _build_first_frame_mask(latents: jax.Array) -> jax.Array:
