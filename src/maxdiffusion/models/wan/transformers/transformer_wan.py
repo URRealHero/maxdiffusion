@@ -36,6 +36,7 @@ from ...embeddings_flax import (
 from ...normalization_flax import FP32LayerNorm
 from ...attention_flax import FlaxWanAttention
 from ...gradient_checkpoint import GradientCheckpointType
+from ..wan_lora import WanLoRAAdapter
 
 BlockSizes = common_types.BlockSizes
 
@@ -232,6 +233,9 @@ class ApproximateGELU(nnx.Module):
       dtype: jnp.dtype = jnp.float32,
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
+      lora_target_modules: Optional[tuple] = None,
   ):
     self.proj = nnx.Linear(
         rngs=rngs,
@@ -250,11 +254,19 @@ class ApproximateGELU(nnx.Module):
         ),
         bias_init=nnx.with_partitioning(nnx.initializers.zeros, ("mlp",)),
     )
+    # LoRA on ffn.0 (the first FFN linear); matches DiffSynth/Captain-Safari.
+    _targets = lora_target_modules if lora_target_modules is not None else ("ffn.0",)
+    self.lora_ffn0 = nnx.data(None)
+    if lora_rank > 0 and "ffn.0" in _targets:
+      effective_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+      self.lora_ffn0 = WanLoRAAdapter(dim_in, dim_out, lora_rank, effective_alpha, dtype, weights_dtype, precision, rngs)
 
   def __call__(self, x: jax.Array) -> jax.Array:
     with jax.named_scope("gelu"):
-      x = self.proj(x)
-    return nnx.gelu(x)
+      h = self.proj(x)
+      if self.lora_ffn0 is not None:
+        h = h + self.lora_ffn0(x)
+    return nnx.gelu(h)
 
 
 class WanFeedForward(nnx.Module):
@@ -274,6 +286,9 @@ class WanFeedForward(nnx.Module):
       weights_dtype: jnp.dtype = jnp.float32,
       precision: jax.lax.Precision = None,
       enable_jax_named_scopes: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
+      lora_target_modules: Optional[tuple] = None,
   ):
     if inner_dim is None:
       inner_dim = int(dim * mult)
@@ -290,6 +305,9 @@ class WanFeedForward(nnx.Module):
           dtype=dtype,
           weights_dtype=weights_dtype,
           precision=precision,
+          lora_rank=lora_rank,
+          lora_alpha=lora_alpha,
+          lora_target_modules=lora_target_modules,
       )
     else:
       raise NotImplementedError(f"{activation_fn} is not implemented.")
@@ -311,6 +329,12 @@ class WanFeedForward(nnx.Module):
             ),
         ),
     )
+    # LoRA on ffn.2 (proj_out); matches DiffSynth/Captain-Safari.
+    _ffn2_targets = lora_target_modules if lora_target_modules is not None else ("ffn.2",)
+    self.lora_ffn2 = nnx.data(None)
+    if lora_rank > 0 and "ffn.2" in _ffn2_targets:
+      effective_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+      self.lora_ffn2 = WanLoRAAdapter(inner_dim, dim_out, lora_rank, effective_alpha, dtype, weights_dtype, precision, rngs)
 
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
@@ -322,12 +346,15 @@ class WanFeedForward(nnx.Module):
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
   ) -> jax.Array:
-    hidden_states = self.act_fn(hidden_states)  # Output is (4, 75600, 13824)
-    hidden_states = checkpoint_name(hidden_states, "ffn_activation")
+    act = self.act_fn(hidden_states)  # Output is (4, 75600, 13824)
+    act = checkpoint_name(act, "ffn_activation")
     if self.drop_out.rate > 0:
-      hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
+      act = self.drop_out(act, deterministic=deterministic, rngs=rngs)
     with jax.named_scope("proj_out"):
-      return self.proj_out(hidden_states)  # output is (4, 75600, 5120)
+      out = self.proj_out(act)  # output is (4, 75600, 5120)
+      if self.lora_ffn2 is not None:
+        out = out + self.lora_ffn2(act)
+      return out
 
 
 class WanCameraResidualBlock(nnx.Module):
@@ -469,6 +496,9 @@ class WanTransformerBlock(nnx.Module):
       enable_jax_named_scopes: bool = False,
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
+      lora_target_modules: Optional[tuple] = None,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
 
@@ -495,6 +525,9 @@ class WanTransformerBlock(nnx.Module):
         enable_jax_named_scopes=enable_jax_named_scopes,
         use_base2_exp=use_base2_exp,
         use_experimental_scheduler=use_experimental_scheduler,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_target_modules=lora_target_modules,
     )
 
     # 1. Cross-attention
@@ -521,6 +554,9 @@ class WanTransformerBlock(nnx.Module):
         enable_jax_named_scopes=enable_jax_named_scopes,
         use_base2_exp=use_base2_exp,
         use_experimental_scheduler=use_experimental_scheduler,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_target_modules=lora_target_modules,
     )
     assert cross_attn_norm is True
     self.norm2 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=True)
@@ -536,6 +572,9 @@ class WanTransformerBlock(nnx.Module):
         precision=precision,
         dropout=dropout,
         enable_jax_named_scopes=enable_jax_named_scopes,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_target_modules=lora_target_modules,
     )
     self.norm3 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=False)
 
@@ -689,6 +728,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       add_control_adapter: bool = False,
       in_dim_control_adapter: int = 24,
       downscale_factor_control_adapter: int = 8,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
+      lora_target_modules: Optional[tuple] = None,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -772,6 +814,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           image_seq_len=image_seq_len,
           use_base2_exp=use_base2_exp,
           use_experimental_scheduler=use_experimental_scheduler,
+          lora_rank=lora_rank,
+          lora_alpha=lora_alpha,
+          lora_target_modules=lora_target_modules,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -800,6 +845,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             precision=precision,
             attention=attention,
             enable_jax_named_scopes=enable_jax_named_scopes,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_target_modules=lora_target_modules,
         )
         blocks.append(block)
       self.blocks = nnx.data(blocks)

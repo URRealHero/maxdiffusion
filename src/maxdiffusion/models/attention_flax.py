@@ -28,6 +28,7 @@ from maxdiffusion.kernels.splash_attention import splash_attention_mask as tokam
 from maxdiffusion.kernels.splash_attention import splash_attention_kernel as tokamax_splash_attention_kernel
 from maxdiffusion.kernels.splash_attention import ring_attention_kernel as tokamax_ring_attention_kernel
 from maxdiffusion.kernels.splash_attention import base as tokamax_splash_base
+from maxdiffusion.models.wan.wan_lora import WanLoRAAdapter
 from einops import rearrange
 from .. import common_types, max_logging
 from maxdiffusion.tpu_utils import get_tpu_type, TpuType
@@ -1369,6 +1370,9 @@ class FlaxWanAttention(nnx.Module):
       image_seq_len: Optional[int] = None,  # New for I2V
       use_base2_exp: bool = False,
       use_experimental_scheduler: bool = False,
+      lora_rank: int = 0,
+      lora_alpha: float = 0.0,
+      lora_target_modules: Optional[tuple] = None,
   ):
     if attention_kernel in {"flash", "cudnn_flash_te"} and mesh is None:
       raise ValueError(f"The flash attention kernel requires a value for mesh, but mesh is {self.mesh}")
@@ -1477,6 +1481,27 @@ class FlaxWanAttention(nnx.Module):
             ("embed",),
         ),
     )
+
+    # LoRA on the q/k/v/o projections, individually gated by lora_target_modules
+    # (DiffSynth/Captain-Safari names: "q","k","v","o"). Applies to both self-
+    # and cross-attention (CS targets by module suffix, not by attention type).
+    self.lora_rank = lora_rank
+    targets = lora_target_modules if lora_target_modules is not None else ("q", "k", "v", "o")
+    self.lora_q = self.lora_k = self.lora_v = self.lora_o = nnx.data(None)
+    if lora_rank > 0:
+      eff_alpha = float(lora_rank) if lora_alpha <= 0.0 else lora_alpha
+
+      def _mk():
+        return WanLoRAAdapter(self.inner_dim, self.inner_dim, lora_rank, eff_alpha, dtype, weights_dtype, precision, rngs)
+
+      if "q" in targets:
+        self.lora_q = _mk()
+      if "k" in targets:
+        self.lora_k = _mk()
+      if "v" in targets:
+        self.lora_v = _mk()
+      if "o" in targets:
+        self.lora_o = _mk()
 
     self.drop_out = nnx.Dropout(dropout, deterministic=False)
 
@@ -1605,6 +1630,8 @@ class FlaxWanAttention(nnx.Module):
     if not is_i2v_cross_attention:
       with jax.named_scope("query_proj"):
         query_proj = self.query(hidden_states)
+        if self.lora_q is not None:
+          query_proj = query_proj + self.lora_q(hidden_states)
 
       if self.qk_norm:
         with self.conditional_named_scope("attn_q_norm"):
@@ -1615,8 +1642,12 @@ class FlaxWanAttention(nnx.Module):
       else:
         with jax.named_scope("key_proj"):
           key_proj = self.key(encoder_hidden_states)
+          if self.lora_k is not None:
+            key_proj = key_proj + self.lora_k(encoder_hidden_states)
         with jax.named_scope("value_proj"):
           value_proj = self.value(encoder_hidden_states)
+          if self.lora_v is not None:
+            value_proj = value_proj + self.lora_v(encoder_hidden_states)
 
         if self.qk_norm:
           with self.conditional_named_scope("attn_k_norm"):
@@ -1738,6 +1769,8 @@ class FlaxWanAttention(nnx.Module):
 
     with jax.named_scope("proj_attn"):
       hidden_states = self.proj_attn(attn_output)
+      if self.lora_o is not None:
+        hidden_states = hidden_states + self.lora_o(attn_output)
       if self.drop_out.rate > 0:
         hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
     return hidden_states

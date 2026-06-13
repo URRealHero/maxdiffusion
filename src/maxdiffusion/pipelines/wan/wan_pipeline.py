@@ -204,8 +204,19 @@ def create_sharded_logical_transformer(
   wan_config["enable_jax_named_scopes"] = config.enable_jax_named_scopes
   wan_config["use_base2_exp"] = config.use_base2_exp
   wan_config["use_experimental_scheduler"] = config.use_experimental_scheduler
-  # Camera-control adapter + Fun checkpoint channel overrides (lora_rank/alpha
-  # deliberately NOT plumbed yet — LoRA port is a later phase).
+  # LoRA (matrix LoRA on q/k/v/o + ffn.0/ffn.2; DiffSynth/Captain-Safari recipe).
+  # rank<=0 disables it entirely (no adapters built -> identical to base model).
+  wan_config["lora_rank"] = int(getattr(config, "lora_rank", 0))
+  wan_config["lora_alpha"] = float(getattr(config, "lora_alpha", 0.0))
+  _lora_targets = getattr(config, "lora_target_modules", None)
+  if _lora_targets:
+    # accept comma-separated string or list; normalize to a tuple of suffixes
+    if isinstance(_lora_targets, str):
+      _lora_targets = tuple(t.strip() for t in _lora_targets.split(",") if t.strip())
+    else:
+      _lora_targets = tuple(_lora_targets)
+    wan_config["lora_target_modules"] = _lora_targets
+  # Camera-control adapter + Fun checkpoint channel overrides.
   wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
   wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
   wan_config["downscale_factor_control_adapter"] = int(
