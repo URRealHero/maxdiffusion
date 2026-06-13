@@ -6,15 +6,50 @@ import json
 from typing import Optional, Tuple
 
 import jax
+import optax
 import orbax.checkpoint as ocp
+from flax import nnx
 
 from maxdiffusion.checkpointing.checkpointing_utils import add_sharding_to_struct, get_cpu_mesh_and_sharding
 from maxdiffusion.checkpointing.wan_checkpointer import WanCheckpointer
-from maxdiffusion import max_logging
+from maxdiffusion import max_logging, max_utils
 from maxdiffusion.pipelines.wan.wan_pipeline_2_2_fun_camera import WanPipeline2_2_FunCamera
 
 
 class WanCheckpointer2_2_FunCamera(WanCheckpointer):
+
+  def _create_optimizer(self, model, config, learning_rate):
+    """Optimizer with optional parameter freezing for LoRA / partial fine-tune.
+
+    When `lora_trainable_param_substrings` is set (e.g. "lora_"), only params
+    whose path contains one of the (comma-separated) substrings are trained;
+    everything else is frozen via optax.set_to_zero (no optimizer state, so the
+    frozen base costs no Adam memory). Empty substrings => full fine-tune.
+    """
+    learning_rate_scheduler = max_utils.create_learning_rate_schedule(
+        learning_rate, config.learning_rate_schedule_steps, config.warmup_steps_fraction, config.max_train_steps
+    )
+    base_tx = max_utils.create_optimizer(config, learning_rate_scheduler)
+
+    substrings = [s.strip() for s in str(getattr(config, "lora_trainable_param_substrings", "")).split(",") if s.strip()]
+    if not substrings:
+      return base_tx, learning_rate_scheduler  # full fine-tune
+
+    _, params, _ = nnx.split(model, nnx.Param, ...)
+
+    def _label(path, _leaf):
+      ps = jax.tree_util.keystr(path)
+      return "train" if any(s in ps for s in substrings) else "freeze"
+
+    labels = jax.tree_util.tree_map_with_path(_label, params)
+    leaves = jax.tree_util.tree_leaves(labels)
+    n_train = sum(1 for v in leaves if v == "train")
+    max_logging.log(
+        f"LoRA/partial fine-tune: training {n_train}/{len(leaves)} param tensors "
+        f"(substrings={substrings}); base frozen via set_to_zero."
+    )
+    tx = optax.multi_transform({"train": base_tx, "freeze": optax.set_to_zero()}, labels)
+    return tx, learning_rate_scheduler
 
   def load_wan_configs_from_orbax(self, step: Optional[int]):
     if step is None:
