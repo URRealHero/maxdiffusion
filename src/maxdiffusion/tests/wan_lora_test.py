@@ -42,6 +42,35 @@ from ..models.wan.transformers.transformer_wan import (
 )
 from ..models.attention_flax import FlaxWanAttention
 from ..models.wan.wan_lora import WanLoRAAdapter
+from ..models.wan.wan_utils import _cs_lora_key_to_nnx_path
+
+
+class CSLoRAKeyRemapTest(unittest.TestCase):
+  """The DiffSynth/Captain-Safari PEFT key -> our nnx path mapping (F2)."""
+
+  def test_self_attn(self):
+    bi, path = _cs_lora_key_to_nnx_path("blocks.7.self_attn.q.lora_A.default.weight")
+    self.assertEqual(bi, 7)
+    self.assertEqual(path, ("blocks", "attn1", "lora_q", "lora_A", "kernel"))
+
+  def test_cross_attn(self):
+    bi, path = _cs_lora_key_to_nnx_path("blocks.0.cross_attn.v.lora_B.default.weight")
+    self.assertEqual((bi, path), (0, ("blocks", "attn2", "lora_v", "lora_B", "kernel")))
+
+  def test_ffn0_and_ffn2(self):
+    _, p0 = _cs_lora_key_to_nnx_path("blocks.3.ffn.0.lora_A.default.weight")
+    _, p2 = _cs_lora_key_to_nnx_path("blocks.3.ffn.2.lora_B.default.weight")
+    self.assertEqual(p0, ("blocks", "ffn", "act_fn", "lora_ffn0", "lora_A", "kernel"))
+    self.assertEqual(p2, ("blocks", "ffn", "lora_ffn2", "lora_B", "kernel"))
+
+  def test_memory_keys_skipped(self):
+    for k in (
+        "blocks.6.memory_cross_attn.k.bias",
+        "blocks.6.norm_memory.bias",
+        "memory_emb.0.weight",
+        "memory_retriever.learnable_query",
+    ):
+      self.assertIsNone(_cs_lora_key_to_nnx_path(k), f"{k} should be skipped")
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 

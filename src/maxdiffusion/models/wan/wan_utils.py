@@ -577,6 +577,121 @@ def _remap_wan_2p2_pth_vae_key(key: str) -> str:
   return key
 
 
+# ---------------------------------------------------------------------------
+# LoRA loading: DiffSynth/Captain-Safari PEFT safetensors -> our nnx LoRA params.
+#
+# CS keys (per layer N):
+#   blocks.N.self_attn.{q,k,v,o}.lora_{A,B}.default.weight   -> attn1.lora_{q,k,v,o}
+#   blocks.N.cross_attn.{q,k,v,o}.lora_{A,B}.default.weight  -> attn2.lora_{q,k,v,o}
+#   blocks.N.ffn.0.lora_{A,B}.default.weight                 -> ffn.act_fn.lora_ffn0
+#   blocks.N.ffn.2.lora_{A,B}.default.weight                 -> ffn.lora_ffn2
+# Every CS weight is PyTorch [out, in]; our nnx Linear kernel is [in, out] -> transpose.
+# Non-LoRA CS keys (memory_*, norm_memory, memory_cross_attn, memory_retriever,
+# memory_emb) belong to the Captain-Safari memory augmentation we do NOT model;
+# they are skipped.
+# ---------------------------------------------------------------------------
+_CS_ATTN_TO_NNX = {"self_attn": "attn1", "cross_attn": "attn2"}
+_CS_PROJ_TO_NNX = {"q": "lora_q", "k": "lora_k", "v": "lora_v", "o": "lora_o"}
+
+
+def _cs_lora_key_to_nnx_path(key: str):
+  """Map one CS LoRA tensor key -> (block_index, nnx_path_tuple) or None to skip."""
+  if "lora_" not in key:
+    return None
+  parts = key.split(".")
+  # expect blocks.N.<module...>.lora_{A,B}.default.weight
+  if parts[0] != "blocks" or parts[-1] != "weight" or parts[-2] != "default":
+    return None
+  ab = parts[-3]  # lora_A or lora_B
+  if ab not in ("lora_A", "lora_B"):
+    return None
+  try:
+    block_index = int(parts[1])
+  except (IndexError, ValueError):
+    return None
+  module = parts[2]
+  leaf = (ab, "kernel")
+  if module in _CS_ATTN_TO_NNX:  # self_attn / cross_attn
+    proj = parts[3]
+    if proj not in _CS_PROJ_TO_NNX:
+      return None
+    return block_index, ("blocks", _CS_ATTN_TO_NNX[module], _CS_PROJ_TO_NNX[proj]) + leaf
+  if module == "ffn":
+    which = parts[3]  # "0" or "2"
+    if which == "0":
+      return block_index, ("blocks", "ffn", "act_fn", "lora_ffn0") + leaf
+    if which == "2":
+      return block_index, ("blocks", "ffn", "lora_ffn2") + leaf
+    return None
+  # memory_cross_attn / norm_memory / memory_* etc. -> skip
+  return None
+
+
+def init_wan_lora_params(eval_shapes: dict, seed: int = 0):
+  """Fresh LoRA init for every lora_ param in the model (PEFT convention).
+
+  lora_A -> variance_scaling(1/3, fan_in, uniform) == U(-1/sqrt(fan_in), +...);
+  lora_B -> zeros (delta starts at 0). Returns {flat_path_tuple: jnp.array}.
+  These must be filled because eval_shape leaves them abstract and the base
+  checkpoint does not contain LoRA weights.
+  """
+  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
+  out = {}
+  key = jax.random.key(seed)
+  for path, shaped in shapes.items():
+    if "lora_A" in path and path[-1] == "kernel":
+      key, sub = jax.random.split(key)
+      fan_in = shaped.shape[-2]  # [.., in, rank] (or [L, in, rank] under scan)
+      bound = 1.0 / (fan_in ** 0.5)
+      out[path] = jax.random.uniform(sub, shaped.shape, jnp.float32, -bound, bound)
+    elif "lora_B" in path and path[-1] == "kernel":
+      out[path] = jnp.zeros(shaped.shape, dtype=jnp.float32)
+  return out
+
+
+def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, num_layers: int = 30):
+  """Load a DiffSynth/CS LoRA safetensors into a flax LoRA param dict.
+
+  Returns {nnx_path_tuple: jnp.array} with weights transposed to [in, out] and,
+  when scan_layers, stacked to [num_layers, in, out]. eval_shapes is the model's
+  param pytree (flattened) used to validate shapes and detect missing adapters.
+  """
+  if not os.path.isfile(lora_path):
+    raise FileNotFoundError(f"LoRA file not found: {lora_path} (expected a local .safetensors path)")
+  ckpt_path = lora_path
+  max_logging.log(f"Loading WAN LoRA from {ckpt_path}")
+
+  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
+
+  out = {}
+  skipped = 0
+  n_lora = 0
+  with safe_open(ckpt_path, framework="pt") as f:
+    for key in f.keys():
+      mapped = _cs_lora_key_to_nnx_path(key)
+      if mapped is None:
+        skipped += 1
+        continue
+      block_index, nnx_path = mapped
+      tensor = torch2jax(f.get_tensor(key)).astype(jnp.float32)
+      tensor = jnp.swapaxes(tensor, -1, -2)  # PyTorch [out,in] -> nnx [in,out]
+      n_lora += 1
+      if scan_layers:
+        target = shapes.get(nnx_path)
+        if target is None:
+          raise ValueError(f"LoRA target {nnx_path} not found in model params (lora_rank set?)")
+        if nnx_path not in out:
+          out[nnx_path] = jnp.zeros(target.shape, dtype=jnp.float32)  # [num_layers, in, out]
+        out[nnx_path] = out[nnx_path].at[block_index].set(tensor)
+      else:
+        # non-scan: per-layer modules live under blocks.<idx>.*
+        path = ("blocks", str(block_index)) + nnx_path[1:]
+        out[path] = tensor
+
+  max_logging.log(f"WAN LoRA: mapped {n_lora} tensors -> {len(out)} stacked params, skipped {skipped} non-LoRA keys")
+  return out
+
+
 def load_wan_vae(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,

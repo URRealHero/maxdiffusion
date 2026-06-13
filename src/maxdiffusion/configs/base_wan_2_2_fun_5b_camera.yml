@@ -414,6 +414,9 @@ lora_alpha: 0  # 0 = use rank as alpha (scale=1.0, matching DiffSynth default)
 # Comma-separated; default (empty) = the full CS set q,k,v,o,ffn.0,ffn.2.
 # q/k/v/o apply to BOTH self- and cross-attention.
 lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
+# Optional path to a LoRA safetensors (DiffSynth/Captain-Safari PEFT format) to
+# load on top of the base model at construction. Empty = fresh LoRA init.
+wan_lora_path: ""
 # Substrings that identify trainable params for LoRA training.
 # Set to "lora_" to freeze all base weights and train only adapter kernels.
 # Empty string = no override (fall back to frame_concat_trainable_param_substrings).

@@ -252,6 +252,9 @@ def create_sharded_logical_transformer(
     else:  # if not checkpointed with optimizer
       params = checkpoint_state
   else:
+    # the eval-shape tree (params) carries the abstract LoRA shapes; the base
+    # loader returns only base keys, so keep a reference for LoRA shape lookup.
+    eval_lora_shapes = params
     params = load_wan_transformer(
         config.wan_transformer_pretrained_model_name_or_path,
         params,
@@ -260,6 +263,21 @@ def create_sharded_logical_transformer(
         scan_layers=config.scan_layers,
         subfolder=subfolder,
     )
+
+    # LoRA params are NOT in the base checkpoint (separate adapter, or fresh).
+    # Fill them here, before the cast/device_put below, or they stay absent and
+    # the sharding/device_put loop has nothing to place. Fresh init first, then
+    # overlay a LoRA safetensors file if wan_lora_path is given.
+    if int(wan_config.get("lora_rank", 0)) > 0:
+      from ...models.wan.wan_utils import init_wan_lora_params, load_wan_lora
+      flat_params = flax.traverse_util.flatten_dict(params)
+      flat_params.update(init_wan_lora_params(eval_lora_shapes, seed=int(getattr(config, "seed", 0))))
+      lora_path = getattr(config, "wan_lora_path", "") or ""
+      if lora_path:
+        flat_params.update(
+            load_wan_lora(lora_path, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"])
+        )
+      params = flax.traverse_util.unflatten_dict(flat_params)
 
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),
