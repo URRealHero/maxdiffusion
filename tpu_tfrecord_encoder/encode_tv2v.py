@@ -298,10 +298,39 @@ def _debug_jax_array(name: str, value) -> None:
   )
 
 
+def _vae_redundant_axis_size(pipeline) -> int:
+  mesh = getattr(pipeline, "vae_mesh", None)
+  shape = getattr(mesh, "shape", {})
+  try:
+    return max(1, int(shape.get("redundant", 1)))
+  except AttributeError:
+    return 1
+
+
+def _pad_videos_for_vae_mesh(pipeline, videos: np.ndarray) -> tuple[np.ndarray, int]:
+  """Pad VAE encode batches so the batch axis satisfies VAE mesh sharding."""
+  original_batch = int(videos.shape[0])
+  redundant = _vae_redundant_axis_size(pipeline)
+  if original_batch <= 0 or redundant <= 1 or original_batch % redundant == 0:
+    return videos, original_batch
+
+  np = load_numpy()
+  pad = redundant - (original_batch % redundant)
+  padded = np.concatenate([videos, np.repeat(videos[-1:], pad, axis=0)], axis=0)
+  if os.environ.get("TPU_TFRECORD_ENCODER_DEBUG_VAE", "0").lower() in {"1", "true", "yes"}:
+    print(
+        f"encoder debug padded VAE batch {original_batch}->{padded.shape[0]} "
+        f"for vae_mesh redundant={redundant}",
+        flush=True,
+    )
+  return padded, original_batch
+
+
 def encode_videos(pipeline, videos: np.ndarray) -> np.ndarray:
   import jax.numpy as jnp
   from flax.linen import partitioning as nn_partitioning
 
+  videos, original_batch = _pad_videos_for_vae_mesh(pipeline, videos)
   video = jnp.asarray(videos, dtype=getattr(pipeline.vae, "dtype", jnp.float32))
   _debug_jax_array("input_video", video)
 
@@ -320,6 +349,7 @@ def encode_videos(pipeline, videos: np.ndarray) -> np.ndarray:
   _debug_jax_array("latents_after_transpose", latents)
   latents.block_until_ready()
   materialized = materialize_addressable_array(latents)
+  materialized = materialized[:original_batch]
   if os.environ.get("TPU_TFRECORD_ENCODER_DEBUG_VAE", "0").lower() in {"1", "true", "yes"}:
     np = load_numpy()
     print(

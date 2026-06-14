@@ -175,7 +175,8 @@ def load_camera(camera_uri, fov_deg, width, height, indices, expected_total):
   return ext_full[indices].astype(np.float32), intr_full[indices].astype(np.float32)
 
 
-def make_example(latent, latent_condition, hidden_state, extrinsic, intrinsic) -> bytes:
+def make_example(latent, latent_condition, hidden_state, extrinsic, intrinsic,
+                 sample_id=None, caption=None) -> bytes:
   import tensorflow as tf
 
   features = {
@@ -188,6 +189,13 @@ def make_example(latent, latent_condition, hidden_state, extrinsic, intrinsic) -
       "camera_extrinsic": bytes_feature(serialize_tensor(extrinsic)),
       "camera_intrinsic": bytes_feature(serialize_tensor(intrinsic)),
   }
+  # Self-identifying records: embed sample_id (+ caption) so a curated eval set
+  # can be named at generation time. Backward-compatible — the training parser
+  # requests only the 5 tensors above and ignores these extra string features.
+  if sample_id is not None:
+    features["sample_id"] = bytes_feature(str(sample_id).encode("utf-8"))
+  if caption is not None:
+    features["caption"] = bytes_feature(str(caption).encode("utf-8"))
   return tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()
 
 
@@ -297,7 +305,8 @@ def main() -> int:
         assert_finite(sample_id, ("latents", latent), ("latent_condition", latent_condition),
                       ("encoder_hidden_states", hidden),
                       ("camera_extrinsic", ext), ("camera_intrinsic", intr))
-        writer.write(make_example(latent, latent_condition, hidden, ext, intr))
+        writer.write(make_example(latent, latent_condition, hidden, ext, intr,
+                                   sample_id=sample_id, caption=caption_map.get(sample_id)))
         metadata_writer.write({
             "sample_id": sample_id,
             "caption": caption_map.get(sample_id),
