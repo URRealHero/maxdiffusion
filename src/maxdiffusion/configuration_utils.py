@@ -435,16 +435,16 @@ class ConfigMixin:
         )
 
     try:
-      # Load config dict
-      f = open(config_file)
-      diffusers_config_dict = json.load(f)
-      for k, v in diffusers_config_dict.items():
+      # Load config dict and remap diffusers->maxdiffusion module refs IN MEMORY.
+      # The previous version wrote the remapped dict back to config_file, which
+      # fails when config_file lives on a read-only cache (e.g. the model
+      # hyperdisk: "Read-only file system"). Rewriting in memory avoids that and
+      # is equivalent — we return the same remapped dict.
+      with open(config_file) as f:
+        config_dict = json.load(f)
+      for k, v in config_dict.items():
         if isinstance(v, list) and len(v) > 0 and v[0] == "diffusers":
           v[0] = "maxdiffusion"
-      with open(config_file, "w") as fp:
-        json.dump(diffusers_config_dict, fp)
-
-      config_dict = cls._dict_from_json_file(config_file)
 
       commit_hash = extract_commit_hash(config_file)
     except (json.JSONDecodeError, UnicodeDecodeError):

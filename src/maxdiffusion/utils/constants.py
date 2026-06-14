@@ -14,13 +14,22 @@
 import importlib
 import os
 
-from huggingface_hub.constants import HF_HOME, HUGGINGFACE_HUB_CACHE
+from huggingface_hub.constants import HF_HOME
 from packaging import version
 
 from .import_utils import is_peft_available
 
+# Prefer HF_HUB_CACHE (honors the HF_HUB_CACHE env var, e.g. our read-only model
+# hyperdisk). The legacy HUGGINGFACE_HUB_CACHE constant ignores that env var and
+# falls back to HF_HOME/hub (~/.cache/huggingface/hub), so diffusers' load_config
+# would miss models staged only under HF_HUB_CACHE. Fall back for old hub versions.
+try:
+  from huggingface_hub.constants import HF_HUB_CACHE as _DEFAULT_HF_CACHE
+except ImportError:  # older huggingface_hub
+  from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE as _DEFAULT_HF_CACHE
 
-default_cache_path = HUGGINGFACE_HUB_CACHE
+
+default_cache_path = _DEFAULT_HF_CACHE
 
 MIN_PEFT_VERSION = "0.5.0"
 
