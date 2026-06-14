@@ -421,6 +421,10 @@ wan_lora_path: ""
 # Set to "lora_" to freeze all base weights and train only adapter kernels.
 # Empty string = no override (fall back to frame_concat_trainable_param_substrings).
 lora_trainable_param_substrings: ""
+# When True (and lora_trainable_param_substrings is set), checkpoints save ONLY the
+# trainable adapter tensors (a few MB) instead of the full ~5B-param state; restore
+# loads the PAI base and overlays them. Default False = full-state save (unchanged).
+save_lora_only: False
 # Training-loop debug: log around first batch, JIT dispatch, execution barriers, metrics, and async input waits.
 debug_training_loop: False
 debug_training_loop_wait_seconds: 60
@@ -440,6 +444,13 @@ frame_concat_trainable_param_substrings: ""
 # Print matching trainable parameter leaves on host 0 when using frame_concat_trainable_param_substrings.
 frame_concat_print_trainable_params: False
 enable_generate_video_for_eval: False # This will increase the used TPU memory.
+# Camera-control eval generation (Fun camera trainer): every eval_every steps,
+# sample the current (shuffled) training batch and render videos with the SAME
+# conditioning training uses (y=[mask|latent_condition], Plucker camera, precomputed
+# text embeds), saving video + camera metadata under {output_dir}/{run_name}/eval/.
+eval_num_generate_samples: 2       # how many of the batch's records to save per eval
+eval_num_inference_steps: 0        # 0 => use num_inference_steps (fewer = faster eval)
+eval_guidance_scale: 1.0           # 1.0 => no CFG (no text encoder needed at eval)
 # Log generated eval samples into TensorBoard media summaries. MP4s are still uploaded separately.
 tensorboard_eval_video_max_outputs: 1
 tensorboard_eval_video_max_frames: 32

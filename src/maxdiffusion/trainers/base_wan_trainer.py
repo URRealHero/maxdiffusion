@@ -208,6 +208,14 @@ class BaseWanTrainer(abc.ABC):
       posttrained_video_path = generate_sample(self.config, pipeline, filename_prefix="post-training-")
       print_ssim(pretrained_video_path, posttrained_video_path)
 
+  def _generate_eval_videos(self, pipeline, mesh, example_batch, step):
+    """Generate eval videos mid-training. Default = prompt-only T2V.
+
+    Subclasses override to condition on a sampled dataset record (e.g. the Fun
+    camera trainer). `example_batch` is the current (shuffled) training batch.
+    """
+    inference_generate_video(self.config, pipeline, filename_prefix=f"{step}-train_steps-")
+
   def eval(self, mesh, eval_rng_key, step, p_eval_step, state, scheduler_state, writer):
     eval_data_iterator = self.load_dataset(mesh, is_training=False)
     eval_rng = eval_rng_key
@@ -374,10 +382,13 @@ class BaseWanTrainer(abc.ABC):
         if self.config.eval_every > 0 and (step + 1) % self.config.eval_every == 0:
           if self.config.enable_generate_video_for_eval:
             pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
-            inference_generate_video(self.config, pipeline, filename_prefix=f"{step+1}-train_steps-")
+            self._generate_eval_videos(pipeline, mesh, example_batch, step + 1)
           # Re-create the iterator each time you start evaluation to reset it
           # This assumes your data loading logic can be called to get a fresh iterator.
-          self.eval(mesh, eval_rng_key, step, p_eval_step, state, scheduler_state, writer)
+          # p_eval_step is None for trainers that don't compute eval-loss (e.g. the
+          # Fun camera trainer, whose dataset has no per-record `timesteps`).
+          if p_eval_step is not None:
+            self.eval(mesh, eval_rng_key, step, p_eval_step, state, scheduler_state, writer)
 
         example_batch = next_batch_future.result()
         if step != 0 and self.config.checkpoint_every != -1 and step % self.config.checkpoint_every == 0:

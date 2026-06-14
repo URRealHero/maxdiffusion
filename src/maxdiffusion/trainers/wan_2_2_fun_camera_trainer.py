@@ -31,18 +31,24 @@ limitations under the License.
 # verified WAN 2.1/2.2-dense training loop, unchanged. No dtype changes.
 
 import functools
+import json
+import os
+import time
 
 import jax
 import jax.numpy as jnp
 import jaxopt
+import numpy as np
 import tensorflow as tf
 from flax import nnx
+from jax.experimental import multihost_utils
 
 from maxdiffusion.checkpointing.wan_checkpointer_2_2_fun_camera import WanCheckpointer2_2_FunCamera
 from maxdiffusion.input_pipeline.input_pipeline_interface import make_data_iterator
 from maxdiffusion.models.wan.camera_plucker import build_control_camera_latents
 from maxdiffusion.trainers.wan_trainer import WanTrainer
-from maxdiffusion import max_utils
+from maxdiffusion import max_logging, max_utils
+from maxdiffusion.utils import export_to_video
 
 from jax.sharding import PartitionSpec as P
 
@@ -123,11 +129,77 @@ class Wan2_2FunCameraTrainer(WanTrainer):
     )
 
   def get_eval_step(self, pipeline, mesh, state_shardings, eval_data_shardings):
-    # The base training_loop builds the eval step unconditionally but only
-    # calls it when eval_every > 0 — so return a stub unless eval is enabled.
-    if int(getattr(self.config, "eval_every", -1)) > 0:
-      raise NotImplementedError("Fun camera eval step not wired yet; run with eval_every=-1.")
+    # We do NOT compute eval-loss: the encoded dataset has no per-record
+    # `timesteps` feature (only the is_training=False parser expects it). Eval =
+    # camera-conditioned video generation, done in `_generate_eval_videos`.
+    # Returning None makes the base loop skip the eval-loss path entirely.
     return None
+
+  def _generate_eval_videos(self, pipeline, mesh, example_batch, step):
+    """Camera-control eval generation from a sampled dataset record.
+
+    Reuses the current (shuffled) training batch — a random in-distribution
+    sample that already carries every conditioning tensor — and drives the
+    certified Fun-camera inference pipeline with the SAME conditioning the
+    training step builds (y = [mask | latent_condition], Plucker control,
+    precomputed text embeds). Saves the generated video + the sample's camera
+    trajectory/metadata under {output_dir}/{run_name}/eval/step_{step}/.
+    """
+    config = self.config
+    gbs = int(config.global_batch_size_to_train_on)
+    k = max(1, min(int(getattr(config, "eval_num_generate_samples", 2)), gbs))
+    dtype = getattr(config, "activations_dtype", jnp.bfloat16)
+    eval_steps = int(getattr(config, "eval_num_inference_steps", 0)) or int(config.num_inference_steps)
+    eval_gs = float(getattr(config, "eval_guidance_scale", 1.0))
+
+    # Slice the batch to the training global batch so input sharding matches the
+    # mesh exactly (size-1 batches can't shard over the data axis).
+    latents = example_batch["latents"][:gbs].astype(dtype)
+    latent_condition = example_batch["latent_condition"][:gbs].astype(dtype)
+    encoder_hidden_states = example_batch["encoder_hidden_states"][:gbs].astype(dtype)
+    camera_extrinsic = example_batch["camera_extrinsic"][:gbs]
+    camera_intrinsic = example_batch["camera_intrinsic"][:gbs]
+
+    # y-conditioning + Plucker camera latents — identical to the training step.
+    mask = _build_first_frame_mask(latent_condition)
+    y_latents = jnp.concatenate([mask, latent_condition], axis=1).astype(dtype)
+    control_camera_latents = build_control_camera_latents(
+        camera_extrinsic,
+        camera_intrinsic,
+        height=config.height,
+        width=config.width,
+        moment_scale=float(getattr(config, "camera_moment_scale", 1.0)),
+        dtype=dtype,
+    )
+    # Precomputed text embeds bypass the text encoder; zero negative is unused at
+    # guidance_scale<=1 (and is a no-text null otherwise).
+    negative_prompt_embeds = jnp.zeros_like(encoder_hidden_states)
+
+    max_logging.log(
+        f"[eval-gen] step {step}: generating {k} camera-control sample(s), {eval_steps} steps, gs={eval_gs}"
+    )
+    t0 = time.perf_counter()
+    videos, trace = pipeline(
+        prompt_embeds=encoder_hidden_states,
+        negative_prompt_embeds=negative_prompt_embeds,
+        height=config.height,
+        width=config.width,
+        num_frames=config.num_frames,
+        num_inference_steps=eval_steps,
+        guidance_scale=eval_gs,
+        y_latents=y_latents,
+        control_camera_latents_input=control_camera_latents,
+        use_kv_cache=config.use_kv_cache,
+    )
+    gen_s = time.perf_counter() - t0
+    # `videos` is already process_allgather'd to host in _decode_latents_to_video.
+    # Camera matrices are tiny — allgather the first k for metadata on host.
+    ext_host = jax.experimental.multihost_utils.process_allgather(camera_extrinsic[:k], tiled=True)
+    int_host = jax.experimental.multihost_utils.process_allgather(camera_intrinsic[:k], tiled=True)
+
+    if jax.process_index() == 0:
+      _save_eval_samples(config, step, k, videos, ext_host, int_host, eval_steps, eval_gs, gen_s)
+    max_logging.log(f"[eval-gen] step {step}: done in {gen_s:.1f}s ({trace})")
 
 
 def _build_first_frame_mask(latents: jax.Array) -> jax.Array:
@@ -154,6 +226,61 @@ def _per_token_timesteps(timesteps: jax.Array, f_lat: int, tokens_per_frame: int
   seq = f_lat * tokens_per_frame
   t_tok = jnp.broadcast_to(timesteps[:, None], (b, seq)).astype(jnp.float32)
   return t_tok.at[:, :tokens_per_frame].set(0.0)
+
+
+def _upload_file_to_gcs(gcs_dir: str, local_path: str):
+  """Upload one local file to gcs_dir/<basename> (gcs_dir = gs://bucket/prefix)."""
+  from google.cloud import storage
+
+  path_without_scheme = gcs_dir.removeprefix("gs://")
+  bucket_name, _, prefix = path_without_scheme.partition("/")
+  blob_name = os.path.join(prefix, os.path.basename(local_path))
+  storage.Client().bucket(bucket_name).blob(blob_name).upload_from_filename(local_path)
+
+
+def _save_eval_samples(config, step, k, videos, ext_host, int_host, eval_steps, eval_gs, gen_s):
+  """Process-0 only: write the first k generated videos + camera metadata, then
+  upload to {output_dir}/{run_name}/eval/step_{step}/."""
+  videos = np.asarray(videos)
+  out_root = os.path.join(config.output_dir, config.run_name, "eval", f"step_{step}")
+  local_dir = os.path.join("/tmp", "eval_gen", str(config.run_name), f"step_{step}")
+  os.makedirs(local_dir, exist_ok=True)
+  is_gcs = str(config.output_dir).startswith("gs://")
+
+  for i in range(k):
+    base = os.path.join(local_dir, f"sample_{i}")
+    mp4, ext_npy, int_npy, meta_json = base + ".mp4", base + "_extrinsic.npy", base + "_intrinsic.npy", base + ".json"
+    export_to_video(videos[i], mp4, fps=config.fps)
+
+    ext = np.asarray(ext_host[i])   # [F, 3, 4] world-to-camera extrinsics
+    intr = np.asarray(int_host[i])  # [F, 3, 3] intrinsics
+    np.save(ext_npy, ext)
+    np.save(int_npy, intr)
+    meta = {
+        "step": int(step),
+        "sample_index": int(i),
+        "run_name": str(config.run_name),
+        "height": int(config.height),
+        "width": int(config.width),
+        "num_frames": int(config.num_frames),
+        "num_inference_steps": int(eval_steps),
+        "guidance_scale": float(eval_gs),
+        "gen_seconds": round(float(gen_s), 2),
+        "camera_num_frames": int(ext.shape[0]),
+        "camera_translation_start": ext[0, :, 3].tolist(),
+        "camera_translation_end": ext[-1, :, 3].tolist(),
+        "camera_translation_delta": (ext[-1, :, 3] - ext[0, :, 3]).tolist(),
+        "intrinsic_first": intr[0].tolist(),
+    }
+    with open(meta_json, "w") as f:
+      json.dump(meta, f, indent=2)
+
+    if is_gcs:
+      for p in (mp4, ext_npy, int_npy, meta_json):
+        _upload_file_to_gcs(out_root, p)
+
+  dest = out_root if is_gcs else local_dir
+  max_logging.log(f"[eval-gen] step {step}: wrote {k} sample(s) -> {dest}")
 
 
 def train_step(state, data, rng, scheduler_state, scheduler, config, patch_hw):
