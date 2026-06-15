@@ -118,6 +118,40 @@ def patched(*args, **kw):
   return out
 pipe.model_fn = patched
 
+# ---- per-DiT-block output capture (+ block-stack input) for block-by-block parity ----
+# Hooks fire during the FIRST model_fn pass (cond, step 0) and only save once per block.
+blk_out = {}
+blk_in = {}
+
+def _save_np(name, arr):
+  np.save(os.path.join(OUT, f"{name}.npy"), arr)
+  print(f"  saved {name}: {tuple(arr.shape)} {arr.dtype}")
+
+def make_out_hook(i):
+  def hook(module, inp, out):
+    if i not in blk_out:
+      o = out[0] if isinstance(out, tuple) else out
+      blk_out[i] = o.detach().to(torch.float16).cpu().numpy()  # fp16 to keep size down
+  return hook
+
+def in_pre_hook(module, args, kwargs):
+  if blk_in:
+    return
+  # CS DiTBlock.forward(x, context, t_mod, freqs, memory_context=None)
+  for n, a in zip(["x", "context", "t_mod", "freqs"], args):
+    try:
+      if torch.is_tensor(a) and not torch.is_complex(a):
+        blk_in[n] = a.detach().float().cpu().numpy()
+    except Exception as e:
+      print(f"  [blkin warn] {n}: {e}")
+  mc = kwargs.get("memory_context", args[4] if len(args) > 4 else None)
+  if torch.is_tensor(mc):
+    blk_in["memory_context"] = mc.detach().float().cpu().numpy()
+
+for _i, _blk in enumerate(pipe.dit.blocks):
+  _blk.register_forward_hook(make_out_hook(_i))
+pipe.dit.blocks[0].register_forward_pre_hook(in_pre_hook, with_kwargs=True)
+
 NEG = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 print("[dump] running 1-step generation to trigger model_fn capture...")
 _ = pipe(
@@ -130,4 +164,11 @@ _ = pipe(
 # also dump the raw camera matrices so the JAX side encodes poses identically
 for c in ("intrinsic_query", "extrinsic_query", "intrinsic_key", "extrinsic_key"):
   _save(f"raw_{c}", torch.tensor(ld(c), dtype=torch.float32))
+
+# per-block outputs + block-stack input
+print(f"[dump] saving {len(blk_out)} block outputs (fp16) + {len(blk_in)} block-stack inputs")
+for i in sorted(blk_out):
+  _save_np(f"block_{i:02d}", blk_out[i])
+for n, a in blk_in.items():
+  _save_np(f"blkin_{n}", a)
 print(f"[dump] DONE -> {OUT}")
