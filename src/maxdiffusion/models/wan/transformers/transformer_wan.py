@@ -683,7 +683,8 @@ class WanTransformerBlock(nnx.Module):
       if self.use_memory and memory_context is not None:
         with self.conditional_named_scope("memory_cross_attn"):
           norm_hidden_states = self.norm_memory(hidden_states.astype(jnp.float32)).astype(hidden_states.dtype)
-          hidden_states = hidden_states + self.memory_cross_attn(norm_hidden_states, memory_context)
+          mem_out = self.memory_cross_attn(norm_hidden_states, memory_context).astype(hidden_states.dtype)
+          hidden_states = hidden_states + mem_out
 
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
