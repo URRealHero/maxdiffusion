@@ -5,8 +5,8 @@ Branch: `wan22-memory` (off `wan22-dense`). Goal: port Captain-Safari (CS) memor
 
 ## TL;DR current state
 - The full memory pipeline **runs end-to-end on TPU** and produces video (gs://data_us_central1_a/maxdiffusion/wan/cs_memory/gen/).
-- **Open bug:** our 704×1280×121 generation has **content but a noisy TAIL** (last few frames) vs CS's clean output. Does NOT change with any memory fix.
-- We are mid-investigation with a **stage-by-stage numerical parity** vs a CS GPU dump.
+- **RESOLVED (bfece212):** wrong output was the launcher loading memory but NOT the CS LoRA (wan_lora_path unset). With wan_lora_path=epoch-4 the full model (base+LoRA+memory) generates correctly, matching CS. See ROOT CAUSE section.
+- Generation now matches CS. ALWAYS load both LoRA (wan_lora_path) and memory (wan_memory_path) from epoch-4.
 
 ## What is DONE + VERIFIED CORRECT (committed)
 - `models/wan/memory_retriever.py` — nnx port of CS MemoryRetriever. Retriever parity vs CS = **rel 9e-5**.
