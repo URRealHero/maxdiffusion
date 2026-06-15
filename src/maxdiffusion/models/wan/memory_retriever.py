@@ -44,6 +44,14 @@ def precompute_freqs_cis_3d(head_dim: int, end: int = 2048, theta: float = 10000
   return f, h, w
 
 
+@functools.lru_cache(maxsize=8)
+def _cached_freqs_cis_3d(head_dim: int, end: int, theta: float):
+  """Memoized numpy 3D RoPE tables. Computed lazily at call time (not stored as a
+  module attribute) so they stay concrete numpy through nnx.eval_shape/split/merge —
+  storing arrays as plain attributes gets them abstracted to ShapeDtypeStruct."""
+  return precompute_freqs_cis_3d(head_dim, end, theta)
+
+
 def build_3d_freqs_unified(T, L, H, W, f_freqs, h_freqs, w_freqs,
                            include_pose_token=True, use_time_encoding=True) -> np.ndarray:
   """Per-token 3D freqs for the joint sequence -> [seq, head_dim//2] complex.
@@ -222,10 +230,12 @@ class MemoryRetriever(nnx.Module):
     ])
     self.memory_proj = nnx.Linear(dim, 1024, rngs=rngs)
 
-    # precompute 3D freqs (numpy, static) -> jnp complex constants
-    head_dim = dim // num_heads
-    f, h, w = precompute_freqs_cis_3d(head_dim, end=2048, theta=theta)
-    self._f, self._h, self._w = f, h, w
+    # 3D RoPE freqs are computed lazily at call time (see _cached_freqs_cis_3d): storing
+    # them as plain array attributes would get them abstracted to ShapeDtypeStruct by the
+    # pipeline's nnx.eval_shape. Keep only the scalar params (static -> survive eval_shape).
+    self._head_dim = dim // num_heads
+    self._theta = theta
+    self._freq_end = 2048
 
   def _embed_pose(self, p):
     return self.embed_2(nnx.gelu(self.embed_0(p)))
@@ -241,10 +251,11 @@ class MemoryRetriever(nnx.Module):
     q_tok = self._embed_pose(pose_token)                         # [B,1,dim]
     learnable_query = jnp.broadcast_to(self.learnable_query.value, (B, self.per_frame, self.dim))
 
+    _f, _h, _w = _cached_freqs_cis_3d(self._head_dim, self._freq_end, self._theta)
     qf = jnp.asarray(build_3d_freqs_unified(1, self.n_layers, self.grid_h, self.grid_w,
-                                            self._f, self._h, self._w, True, False))
+                                            _f, _h, _w, True, False))
     mf = jnp.asarray(build_3d_freqs_unified(T, self.n_layers, self.grid_h, self.grid_w,
-                                            self._f, self._h, self._w, True, True))
+                                            _f, _h, _w, True, True))
 
     joint_output = None
     for blk in self.retrieval_blocks_list:
