@@ -37,6 +37,7 @@ from ...normalization_flax import FP32LayerNorm
 from ...attention_flax import FlaxWanAttention
 from ...gradient_checkpoint import GradientCheckpointType
 from ..wan_lora import WanLoRAAdapter
+from ..memory_retriever import CrossAttention as MemoryCrossAttention, MemoryRetriever
 
 BlockSizes = common_types.BlockSizes
 
@@ -499,8 +500,10 @@ class WanTransformerBlock(nnx.Module):
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
+      use_memory: bool = False,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    self.use_memory = use_memory
 
     # 1. Self-attention
     self.norm1 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=False)
@@ -583,6 +586,16 @@ class WanTransformerBlock(nnx.Module):
         jax.random.normal(key, (1, 6, dim)) / dim**0.5,
     )
 
+    # Captain-Safari memory cross-attention (optional). Mirrors attn2 but reads
+    # the retrieved memory_context; structurally == CS DiTBlock.memory_cross_attn
+    # (a CrossAttention) + norm_memory (LayerNorm). Injected after text cross-attn.
+    if use_memory:
+      self.memory_cross_attn = MemoryCrossAttention(dim, num_heads, eps, rngs=rngs)
+      self.norm_memory = nnx.LayerNorm(dim, epsilon=eps, dtype=dtype, param_dtype=weights_dtype, rngs=rngs)
+    else:
+      self.memory_cross_attn = nnx.data(None)
+      self.norm_memory = nnx.data(None)
+
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
@@ -597,6 +610,7 @@ class WanTransformerBlock(nnx.Module):
       rngs: nnx.Rngs = None,
       encoder_attention_mask: Optional[jax.Array] = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      memory_context: Optional[jax.Array] = None,
   ):
     with self.conditional_named_scope("transformer_block"):
       # Support both global [B, 6, dim] and per-token [B, seq_len, 6, dim] temb.
@@ -662,6 +676,14 @@ class WanTransformerBlock(nnx.Module):
           )
         with self.conditional_named_scope("cross_attn_residual"):
           hidden_states = hidden_states + attn_output
+
+      # 2b. Memory cross-attention (Captain-Safari): video tokens attend to the
+      # retrieved 3D-memory tokens. norm_memory(x) is the query; memory_context
+      # is K/V. Added as a residual, same place as CS DiTBlock.
+      if self.use_memory and memory_context is not None:
+        with self.conditional_named_scope("memory_cross_attn"):
+          norm_hidden_states = self.norm_memory(hidden_states.astype(jnp.float32)).astype(hidden_states.dtype)
+          hidden_states = hidden_states + self.memory_cross_attn(norm_hidden_states, memory_context)
 
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
@@ -731,12 +753,17 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
+      use_memory: bool = False,
+      memory_dim: int = 1024,
+      memory_heads: int = 8,
+      memory_blocks: int = 1,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
     self.num_layers = num_layers
     self.scan_layers = scan_layers
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    self.use_memory = use_memory
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -817,6 +844,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           lora_rank=lora_rank,
           lora_alpha=lora_alpha,
           lora_target_modules=lora_target_modules,
+          use_memory=use_memory,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -848,9 +876,23 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
+            use_memory=use_memory,
         )
         blocks.append(block)
       self.blocks = nnx.data(blocks)
+
+    # Captain-Safari memory (optional): the pose-conditioned retriever + the
+    # memory_emb MLP (1024 -> inner_dim, SiLU) that lifts retrieved memory into
+    # the DiT token space for the per-block memory cross-attention.
+    if use_memory:
+      self.memory_retriever = MemoryRetriever(
+          dim=memory_dim, num_heads=memory_heads, num_blocks=memory_blocks, rngs=rngs)
+      self.memory_emb_0 = nnx.Linear(memory_dim, inner_dim, dtype=dtype, param_dtype=weights_dtype, rngs=rngs)
+      self.memory_emb_2 = nnx.Linear(inner_dim, inner_dim, dtype=dtype, param_dtype=weights_dtype, rngs=rngs)
+    else:
+      self.memory_retriever = nnx.data(None)
+      self.memory_emb_0 = nnx.data(None)
+      self.memory_emb_2 = nnx.data(None)
 
     self.norm_out = FP32LayerNorm(rngs=rngs, dim=inner_dim, eps=eps, elementwise_affine=False)
     self.proj_out = nnx.Linear(
@@ -945,6 +987,10 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
       control_camera_latents_input: Optional[jax.Array] = None,
+      memory: Optional[jax.Array] = None,
+      memory_pose_token: Optional[jax.Array] = None,
+      memory_key_pose_token: Optional[jax.Array] = None,
+      memory_context: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
     hidden_states = nn.with_logical_constraint(hidden_states, ("batch", None, None, None, None))
     batch_size, _, num_frames, height, width = hidden_states.shape
@@ -1017,6 +1063,12 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     else:
       encoder_hidden_states = encoder_hidden_states_out.astype(hidden_states.dtype)
 
+    # Captain-Safari memory: retrieve pose-aligned memory once, lift to DiT space.
+    # Block-constant (same for every layer), so it's closed over like the text states.
+    if self.use_memory and memory_context is None and memory is not None:
+      mem_pred = self.memory_retriever(memory_pose_token, memory_key_pose_token, memory)
+      memory_context = self.memory_emb_2(nnx.silu(self.memory_emb_0(mem_pred))).astype(hidden_states.dtype)
+
     def _run_all_blocks(h):
       if self.scan_layers:
 
@@ -1037,6 +1089,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
               rngs_carry,
               encoder_attention_mask,
               cached_kv=layer_kv_cache,
+              memory_context=memory_context,
           )
           new_carry = (hidden_states, rngs_carry)
           return new_carry, None
@@ -1079,6 +1132,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
                 rngs,
                 encoder_attention_mask=encoder_attention_mask,
                 cached_kv=l_kv,
+                memory_context=memory_context,
             )
 
           rematted_layer_forward = self.gradient_checkpoint.apply(
