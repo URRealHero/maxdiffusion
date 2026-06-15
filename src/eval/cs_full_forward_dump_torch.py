@@ -98,7 +98,7 @@ intr_k = torch.tensor(ld("intrinsic_key"), dtype=torch.bfloat16).unsqueeze(0)
 extr_k = torch.tensor(ld("extrinsic_key"), dtype=torch.bfloat16).unsqueeze(0)
 intr_c = torch.tensor(ld("intrinsic_clip"), dtype=torch.bfloat16).unsqueeze(0)
 extr_c = torch.tensor(ld("extrinsic_clip"), dtype=torch.bfloat16).unsqueeze(0)
-input_image = VideoData(f"{DATA}/videos/{video_name}", height=704, width=1280)[0]
+input_image = VideoData(os.path.join(DATA, str(row["video"])), height=704, width=1280)[0]
 
 # ---- capture the FIRST model_fn call ----
 captured = {}
