@@ -67,11 +67,17 @@ def run(config):
   dummy = jnp.zeros((1, 31, 44, 80, 100))
   rotary = t.rope(dummy)
 
+  # jit the block forward so XLA FUSES the naive memory-attn softmax (else the eager
+  # 27280x3128 fp32 matrix = 8GB OOMs; the real jitted/scan generation fuses it).
+  @nnx.jit
+  def _fwd(block, h, ctx, tb, rot, mc):
+    o = block(h, ctx, tb, rot, memory_context=mc)
+    return o[0] if isinstance(o, tuple) else o
+
   cur = jnp.asarray(x0, dtype=dtype)
   with pipeline.mesh:
     for i, blk in enumerate(blocks):
-      out = blk(cur, context, temb, rotary, memory_context=memory_context)
-      out = out[0] if isinstance(out, tuple) else out
+      out = _fwd(blk, cur, context, temb, rotary, memory_context)
       cs_i = _load(f"block_{i:02d}.npy")
       if cs_i is None:
         max_logging.log(f"  block {i:02d}: (no CS dump)")
