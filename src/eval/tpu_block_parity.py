@@ -45,7 +45,9 @@ def _cmp(name, ours, ref):
 
 
 def run(config):
-  dtype = jnp.float32
+  # bf16 matches real generation (and halves the naive memory-attn matrix so it fits HBM).
+  # CS block dumps are fp16; feeding CS's exact block input tests real per-block behavior.
+  dtype = jnp.bfloat16
   pipeline, _, _ = WanCheckpointer2_2_FunCamera(config=config).load_checkpoint()
   t = pipeline.transformer
   blocks = list(t.blocks)
