@@ -509,3 +509,12 @@ intrinsic_clip_path: ""
 camera_clip_fps_in: 4.0
 camera_clip_fps_out: 24.0
 output_video_name: "wan22_fun_camera_output.mp4"
+# Captain-Safari 3D memory inputs for generation (used when use_memory=True).
+# memory_path: StreamVGGT features .npy (>=memory_n_key keyframes, [K,4,782,1024]).
+# The query/key camera matrices feed the retriever's pose tokens (memory_pose.py).
+memory_path: ""
+memory_n_key: 4
+extrinsic_query_path: ""   # [3,4] target-frame extrinsic (w2c)
+intrinsic_query_path: ""   # [3,3] target-frame intrinsic (pixels)
+extrinsic_key_path: ""     # [>=K,3,4] key-frame extrinsics
+intrinsic_key_path: ""     # [>=K,3,3] key-frame intrinsics

@@ -54,6 +54,35 @@ def build_fun_camera_latents_from_config(config):
   )
 
 
+def build_memory_inputs_from_config(config, dtype):
+  """Load Captain-Safari 3D memory + pose tokens for memory-conditioned generation.
+
+  Returns (memory[1,K*4*782,1024], target_pose_token[1,1,9], key_pose_token[1,K,9])
+  or (None, None, None) when use_memory is off. Memory features are the first K
+  keyframes flattened; pose tokens are encoded host-side from the query/key camera
+  matrices (memory_pose.build_memory_pose_tokens), matching Captain-Safari exactly."""
+  if not bool(getattr(config, "use_memory", False)):
+    return None, None, None
+  from maxdiffusion.models.wan.memory_pose import build_memory_pose_tokens
+
+  n_key = int(getattr(config, "memory_n_key", 4))
+  mem_raw = np.load(config.memory_path, allow_pickle=True).astype(np.float32)  # [>=K,4,782,1024]
+  memory = jnp.asarray(mem_raw[:n_key].reshape(1, -1, 1024), dtype=dtype)
+  max_logging.log(f"Loaded memory: raw {mem_raw.shape} -> {memory.shape} (first {n_key} keyframes)")
+
+  target_np, key_np = build_memory_pose_tokens(
+      extr_key=np.load(config.extrinsic_key_path),
+      intr_key=np.load(config.intrinsic_key_path),
+      extr_query=np.load(config.extrinsic_query_path),
+      intr_query=np.load(config.intrinsic_query_path),
+      n_key=n_key,
+  )
+  target_pose_token = jnp.asarray(target_np, dtype=dtype)  # [1,1,9]
+  key_pose_token = jnp.asarray(key_np, dtype=dtype)        # [1,K,9]
+  max_logging.log(f"Built pose tokens: target {target_pose_token.shape} key {key_pose_token.shape}")
+  return memory, target_pose_token, key_pose_token
+
+
 def run(config):
   if config.model_name != WAN2_2:
     raise ValueError("generate_wan_2_2_fun_camera.py only supports model_name=wan2.2")
@@ -92,6 +121,8 @@ def run(config):
     control_camera_latents_input = jnp.concatenate([control_camera_latents_input] * len(prompt), axis=0)
   max_logging.log(f"Prepared control_camera_latents_input shape: {control_camera_latents_input.shape}")
 
+  memory, target_pose_token, key_pose_token = build_memory_inputs_from_config(config, dtype)
+
   videos, trace = pipeline(
       prompt=prompt,
       negative_prompt=negative_prompt,
@@ -103,6 +134,9 @@ def run(config):
       use_kv_cache=config.use_kv_cache,
       y_latents=y_latents,
       control_camera_latents_input=control_camera_latents_input,
+      memory=memory,
+      memory_pose_token=target_pose_token,
+      memory_key_pose_token=key_pose_token,
   )
   max_logging.log(f"Inference trace: {trace}")
 
