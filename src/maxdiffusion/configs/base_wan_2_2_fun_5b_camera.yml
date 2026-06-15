@@ -513,7 +513,7 @@ output_video_name: "wan22_fun_camera_output.mp4"
 # memory_path: StreamVGGT features .npy (>=memory_n_key keyframes, [K,4,782,1024]).
 # The query/key camera matrices feed the retriever's pose tokens (memory_pose.py).
 memory_path: ""
-memory_n_key: 4
+memory_n_key: 0       # 0 = use ALL keyframes in the memory file (matches CS); >0 = first N
 extrinsic_query_path: ""   # [3,4] target-frame extrinsic (w2c)
 intrinsic_query_path: ""   # [3,3] target-frame intrinsic (pixels)
 extrinsic_key_path: ""     # [>=K,3,4] key-frame extrinsics

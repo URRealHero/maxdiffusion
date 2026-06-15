@@ -65,10 +65,13 @@ def build_memory_inputs_from_config(config, dtype):
     return None, None, None
   from maxdiffusion.models.wan.memory_pose import build_memory_pose_tokens
 
-  n_key = int(getattr(config, "memory_n_key", 4))
-  mem_raw = np.load(config.memory_path, allow_pickle=True).astype(np.float32)  # [>=K,4,782,1024]
+  mem_raw = np.load(config.memory_path, allow_pickle=True).astype(np.float32)  # [K,4,782,1024]
+  # CS uses ALL keyframes the data provides (T = key_pose_token.shape[1]); the retriever's
+  # "previous 4 frames" comments are stale. memory_n_key<=0 -> use all K (default); >0 -> first N.
+  n_key_cfg = int(getattr(config, "memory_n_key", 0))
+  n_key = mem_raw.shape[0] if n_key_cfg <= 0 else min(n_key_cfg, mem_raw.shape[0])
   memory = jnp.asarray(mem_raw[:n_key].reshape(1, -1, 1024), dtype=dtype)
-  max_logging.log(f"Loaded memory: raw {mem_raw.shape} -> {memory.shape} (first {n_key} keyframes)")
+  max_logging.log(f"Loaded memory: raw {mem_raw.shape} -> {memory.shape} ({n_key} keyframes)")
 
   target_np, key_np = build_memory_pose_tokens(
       extr_key=np.load(config.extrinsic_key_path),
