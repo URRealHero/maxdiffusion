@@ -778,11 +778,25 @@ class WanPipeline:
 
     vae_dtype = getattr(self.vae, "dtype", jnp.float32)
     video_condition = video_condition.astype(vae_dtype)
+    # Pad the batch up to the VAE mesh 'redundant' axis (symmetric with the decode path
+    # in _decode_latents_to_video) so a single-sample encode (batch=1) doesn't violate the
+    # redundant-axis sharding constraint (dim 0 must be divisible by 'redundant').
+    orig_batch = int(video_condition.shape[0])
+    try:
+      redundant = max(1, int(getattr(getattr(self, "vae_mesh", None), "shape", {}).get("redundant", 1)))
+    except Exception:
+      redundant = 1
+    pad_vae = redundant > 1 and orig_batch % redundant != 0
+    if pad_vae:
+      pad = redundant - (orig_batch % redundant)
+      video_condition = jnp.concatenate([video_condition, jnp.repeat(video_condition[-1:], pad, axis=0)], axis=0)
     t_vae_encode_start = time.perf_counter()
     with self.vae_mesh, nn_partitioning.axis_rules(self.vae_logical_axis_rules):
       encoded_output = self.vae.encode(video_condition, self.vae_cache)[0].mode()
       if hasattr(encoded_output, "block_until_ready"):
         encoded_output.block_until_ready()
+    if pad_vae:
+      encoded_output = encoded_output[:orig_batch]  # drop the redundant-axis padding
 
     if trace is not None:
       trace["vae_encode"] = time.perf_counter() - t_vae_encode_start
