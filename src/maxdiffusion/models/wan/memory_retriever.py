@@ -238,10 +238,12 @@ class MemoryRetriever(nnx.Module):
     self._freq_end = 2048
 
   def _embed_pose(self, p):
-    return self.embed_2(nnx.gelu(self.embed_0(p)))
+    # CS uses EXACT gelu (nn.GELU(), erf) for embed/memory_embed — NOT the tanh approx
+    # that flax's nnx.gelu defaults to (and that the retriever-block FFN does use).
+    return self.embed_2(nnx.gelu(self.embed_0(p), approximate=False))
 
   def _embed_mem(self, m):
-    return self.memory_embed_2(nnx.gelu(self.memory_embed_0(m)))
+    return self.memory_embed_2(nnx.gelu(self.memory_embed_0(m), approximate=False))
 
   def __call__(self, pose_token, key_pose_token, memory_context):
     B, T = key_pose_token.shape[:2]
