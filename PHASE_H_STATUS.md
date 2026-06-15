@@ -49,3 +49,12 @@ Tooling (all on `wan22-memory`, run on tpu-v6e-8-debug; CS dumps at `gs://data_u
 - CS checkpoint `epoch-4.safetensors` = base PAI + LoRA r32 (alpha=1) + memory. See memory note `cs-checkpoint-structure`.
 - Memory layout: `(K,4,782,1024)` = K keyframes × 4 VGGT layers × 782 tokens × 1024. Retriever T = #keyframes (16 in demo). per_frame=3128=4×782.
 - Run gen: `examples/generate_cs_memory_demo.sh` (RUN_TAG/HEIGHT/WIDTH/NUM_FRAMES/STEPS/PER_DEVICE_BS env). Assets at gs://…/cs_memory/.
+
+## UPDATE — parity harness caveats (important for codex)
+Both quick parities have **confounds** — do not trust their NaNs as real model bugs:
+- `tpu_noise_pred_parity.py`: feeds CS's step-0 latent (from CS's FlowMatch scheduler) → out of our model's expected scale → bf16 overflow → NaN. (Real gen uses our scheduler's latent, no NaN.)
+- `tpu_block_parity.py`: hand-feeds CS's `blkin_t_mod` + a recomputed `rotary` to each block → **block 0 NaNs even WITHOUT memory**, i.e. the BASE path NaNs → the temb/rotary I feed is wrong. So its per-block NaNs are a harness artifact, NOT a memory bug.
+
+**Reliable facts:** real bf16+flash+scan generation = **content + noisy TAIL** (finite, not NaN). Memory/conditioning/camera all match CS numerically; `memory_context` finite.
+
+**Clean next step (TODO):** capture per-block outputs DURING the real full forward (model computes temb/rotary/context itself) by instrumenting `WanModel._run_all_blocks` scan to emit per-layer `ys`; feed CS's latents/y/context; diff each layer's output vs CS `block_NN`. That isolates the first real divergence without the temb/rotary or latent-scale confounds. Then chase the noisy-tail (sampler UniPC-vs-FlowMatch, or VAE temporal-decode tail) on the finite output.
