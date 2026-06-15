@@ -41,26 +41,35 @@ def _save(name, t):
 
 
 # ---- build pipeline exactly like validate ----
-# PAI_DIR: local dir holding the already-downloaded PAI base files -> use ModelConfig(path=...)
-# to AVOID re-downloading. Falls back to ModelScope download if unset/not found.
-import glob
+# PAI_DIR: local dir holding the already-downloaded PAI base files. When set, use Shu's
+# proven no-download recipe: local_model_path + skip_download=True + redirect_common_files
+# =False (keeps T5 model_id) + a local tokenizer_config. Falls back to ModelScope download.
 PAI_DIR = os.environ.get("PAI_DIR", "")
-def _pai_cfg(pattern, **kw):
+# tokenizer lives at <PAI_DIR>/PAI/Wan2.2-Fun-5B-Control-Camera/google/umt5-xxl (override via TOKENIZER_PATH)
+TOKENIZER_PATH = os.environ.get(
+    "TOKENIZER_PATH",
+    os.path.join(PAI_DIR, "PAI", "Wan2.2-Fun-5B-Control-Camera", "google", "umt5-xxl") if PAI_DIR else "",
+)
+def _pai_cfg(pattern):
   if PAI_DIR:
-    m = sorted(glob.glob(os.path.join(PAI_DIR, "**", pattern), recursive=True))
-    if m:
-      print(f"  [PAI local] {pattern} -> {m}")
-      return ModelConfig(path=(m if len(m) > 1 else m[0]), **kw)
-    print(f"  [PAI WARN] no local match for {pattern} under {PAI_DIR}; will download")
-  return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern, **kw)
+    return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern,
+                       offload_device="cpu", skip_download=True, local_model_path=PAI_DIR)
+  return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern, offload_device="cpu")
+
+_pipe_kw = {}
+if PAI_DIR:
+  _pipe_kw["redirect_common_files"] = False
+  _pipe_kw["tokenizer_config"] = ModelConfig(path=TOKENIZER_PATH)
+  print(f"  [PAI local] local_model_path={PAI_DIR}  tokenizer={TOKENIZER_PATH}")
 
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16, device=GPU,
     model_configs=[
-        _pai_cfg("diffusion_pytorch_model*.safetensors", offload_device="cpu"),
-        _pai_cfg("models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu"),
-        _pai_cfg("Wan2.2_VAE.pth", offload_device="cpu"),
+        _pai_cfg("diffusion_pytorch_model*.safetensors"),
+        _pai_cfg("models_t5_umt5-xxl-enc-bf16.pth"),
+        _pai_cfg("Wan2.2_VAE.pth"),
     ],
+    **_pipe_kw,
 )
 pipe.dit.use_memory_retrieval = True
 pipe.dit.use_memory_cross_attn = True
