@@ -112,7 +112,10 @@ def _mha(q, k, v, num_heads):
   which previously built an ~8GB attention matrix per block."""
   b, sq, dim = q.shape
   hd = dim // num_heads
-  rs = lambda t: t.reshape(t.shape[0], t.shape[1], num_heads, hd)  # [B, S, n, hd]
+  # dot_product_attention requires q/k/v same dtype; rope makes q/k fp32 while v is the input
+  # dtype. Promote all three to their common type (matches the old einsum's dtype promotion).
+  dt = jnp.result_type(q, k, v)
+  rs = lambda t: t.astype(dt).reshape(t.shape[0], t.shape[1], num_heads, hd)  # [B, S, n, hd]
   out = jax.nn.dot_product_attention(rs(q), rs(k), rs(v), implementation="xla")  # scale=1/sqrt(hd)
   return out.reshape(b, sq, dim)
 
