@@ -635,17 +635,19 @@ def init_wan_lora_params(eval_shapes: dict, seed: int = 0):
   These must be filled because eval_shape leaves them abstract and the base
   checkpoint does not contain LoRA weights.
   """
-  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
   out = {}
   key = jax.random.key(seed)
-  for path, shaped in shapes.items():
-    if "lora_A" in path and path[-1] == "kernel":
+  # Preserve ORIGINAL key types (non-scan block lists carry int indices); stringify only
+  # for classification so the output keys match the base param dict (mixed str/int -> sort fails).
+  for orig_path, shaped in flatten_dict(eval_shapes).items():
+    sp = tuple(str(p) for p in orig_path)
+    if "lora_A" in sp and sp[-1] == "kernel":
       key, sub = jax.random.split(key)
       fan_in = shaped.shape[-2]  # [.., in, rank] (or [L, in, rank] under scan)
       bound = 1.0 / (fan_in ** 0.5)
-      out[path] = jax.random.uniform(sub, shaped.shape, jnp.float32, -bound, bound)
-    elif "lora_B" in path and path[-1] == "kernel":
-      out[path] = jnp.zeros(shaped.shape, dtype=jnp.float32)
+      out[orig_path] = jax.random.uniform(sub, shaped.shape, jnp.float32, -bound, bound)
+    elif "lora_B" in sp and sp[-1] == "kernel":
+      out[orig_path] = jnp.zeros(shaped.shape, dtype=jnp.float32)
   return out
 
 
@@ -684,8 +686,9 @@ def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, n
           out[nnx_path] = jnp.zeros(target.shape, dtype=jnp.float32)  # [num_layers, in, out]
         out[nnx_path] = out[nnx_path].at[block_index].set(tensor)
       else:
-        # non-scan: per-layer modules live under blocks.<idx>.*
-        path = ("blocks", str(block_index)) + nnx_path[1:]
+        # non-scan: per-layer modules live under blocks.<idx>.* — use the INT index to match
+        # the base param dict (str would create a mixed str/int dict that fails to sort).
+        path = ("blocks", block_index) + nnx_path[1:]
         out[path] = tensor
 
   max_logging.log(f"WAN LoRA: mapped {n_lora} tensors -> {len(out)} stacked params, skipped {skipped} non-LoRA keys")
