@@ -719,7 +719,6 @@ def load_wan_memory(memory_path: str, eval_shapes: dict, scan_layers: bool = Tru
   max_logging.log(f"Loading WAN memory weights from {memory_path}")
   from .memory_retriever import _nnx_path_to_cs_key
 
-  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
   out = {}
   filled = 0
   with safe_open(memory_path, framework="pt") as f:
@@ -735,34 +734,39 @@ def load_wan_memory(memory_path: str, eval_shapes: dict, scan_layers: bool = Tru
         raise ValueError(f"shape mismatch {cs_key}: {tuple(w.shape)} vs want {tuple(want_shape)} ({path})")
       return w
 
-    for path, shaped in shapes.items():
-      is_emb = path[0] in ("memory_emb_0", "memory_emb_2")
-      is_retriever = path[0] == "memory_retriever"
-      is_blk = path[0] == "blocks" and ("memory_cross_attn" in path or "norm_memory" in path)
+    # IMPORTANT: keep the ORIGINAL flat-state key (the retriever's nnx module-lists carry
+    # real INT indices, e.g. retrieval_blocks_list.0). Stringify only for classification +
+    # CS-key building; output under the int-preserving key so it matches the model state's
+    # sharding map (stringifying would yield '0' != 0 and miss the sharding lookup).
+    for orig_path, shaped in flatten_dict(eval_shapes).items():
+      sp = tuple(str(p) for p in orig_path)
+      is_emb = sp[0] in ("memory_emb_0", "memory_emb_2")
+      is_retriever = sp[0] == "memory_retriever"
+      is_blk = sp[0] == "blocks" and ("memory_cross_attn" in sp or "norm_memory" in sp)
       if not (is_emb or is_retriever or is_blk):
         continue
-      cs_leaf, transpose = _cs_mem_leaf(path[-1])
+      cs_leaf, transpose = _cs_mem_leaf(sp[-1])
 
       if is_emb:
-        idx = "0" if path[0] == "memory_emb_0" else "2"
-        out[path] = fetch(f"memory_emb.{idx}.{cs_leaf}", transpose, shaped.shape, path)
+        idx = "0" if sp[0] == "memory_emb_0" else "2"
+        out[orig_path] = fetch(f"memory_emb.{idx}.{cs_leaf}", transpose, shaped.shape, sp)
         filled += 1
       elif is_retriever:
         # retriever mapper re-adds the 'memory_retriever.' prefix; pass the model-relative tail.
-        cs_key, tr = _nnx_path_to_cs_key(path[1:])
-        out[path] = fetch(cs_key, tr, shaped.shape, path)
+        cs_key, tr = _nnx_path_to_cs_key(sp[1:])
+        out[orig_path] = fetch(cs_key, tr, shaped.shape, sp)
         filled += 1
       elif scan_layers:
-        suffix = ".".join(path[1:-1]) + "." + cs_leaf  # body between 'blocks' and leaf
+        suffix = ".".join(sp[1:-1]) + "." + cs_leaf  # body between 'blocks' and leaf
         stacked = jnp.zeros(shaped.shape, dtype=dtype)  # [L, ...]
         for n in range(num_layers):
-          per = fetch(f"blocks.{n}.{suffix}", transpose, shaped.shape[1:], path)
+          per = fetch(f"blocks.{n}.{suffix}", transpose, shaped.shape[1:], sp)
           stacked = stacked.at[n].set(per)
-        out[path] = stacked
+        out[orig_path] = stacked
         filled += 1
       else:  # non-scan: blocks.<idx>.memory_*...
-        cs_key = f"blocks.{path[1]}." + ".".join(path[2:-1]) + "." + cs_leaf
-        out[path] = fetch(cs_key, transpose, shaped.shape, path)
+        cs_key = f"blocks.{sp[1]}." + ".".join(sp[2:-1]) + "." + cs_leaf
+        out[orig_path] = fetch(cs_key, transpose, shaped.shape, sp)
         filled += 1
 
   max_logging.log(f"WAN memory: filled {filled} params from {memory_path}")
