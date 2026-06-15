@@ -425,6 +425,15 @@ lora_trainable_param_substrings: ""
 # trainable adapter tensors (a few MB) instead of the full ~5B-param state; restore
 # loads the PAI base and overlays them. Default False = full-state save (unchanged).
 save_lora_only: False
+# Captain-Safari 3D memory (pose-aligned memory retriever + per-block memory cross-attn).
+# use_memory=False -> no memory modules built (identical to plain camera-control model).
+# When True, the retriever + per-block memory_cross_attn/norm_memory + memory_emb are built
+# and loaded from wan_memory_path (or wan_lora_path if empty -- CS ships both in one file).
+use_memory: False
+memory_dim: 1024     # StreamVGGT feature dim (retriever input)
+memory_heads: 8      # retriever attention heads
+memory_blocks: 1     # retriever RetrievalBlocks (CS checkpoint = 1)
+wan_memory_path: ""  # CS epoch-*.safetensors with memory_* keys; empty -> reuse wan_lora_path
 # Training-loop debug: log around first batch, JIT dispatch, execution barriers, metrics, and async input waits.
 debug_training_loop: False
 debug_training_loop_wait_seconds: 60
