@@ -74,19 +74,21 @@ def run(config):
     o = block(h, ctx, tb, rot, memory_context=mc)
     return o[0] if isinstance(o, tuple) else o
 
+  # ISOLATE on block 0 only: with-memory vs no-memory, on CS's clean input.
+  #   no-mem FINITE + with-mem NaN  -> the bug is the MEMORY INJECTION (norm_memory/memory_cross_attn)
+  #   no-mem ALSO NaN               -> harness feeds the base path wrong (temb/rotary)
   cur = jnp.asarray(x0, dtype=dtype)
   with pipeline.mesh:
-    for i, blk in enumerate(blocks):
-      out = _fwd(blk, cur, context, temb, rotary, memory_context)
-      cs_i = _load(f"block_{i:02d}.npy")
-      if cs_i is None:
-        max_logging.log(f"  block {i:02d}: (no CS dump)")
-      else:
-        nan, cos = _cmp(f"block_{i:02d}", out, cs_i)
-        if nan or cos < 0.9:
-          max_logging.log(f"  >>> FIRST DIVERGENCE at block {i:02d} (nan={nan} cos={cos:.4f}) <<<")
-      # isolated: next block gets CS's block_i output (so errors don't accumulate)
-      cur = jnp.asarray(cs_i, dtype=dtype) if cs_i is not None else out
+    blk = blocks[0]
+    out_mem = np.asarray(_fwd(blk, cur, context, temb, rotary, memory_context), dtype=np.float64)
+    out_nm = np.asarray(_fwd(blk, cur, context, temb, rotary, None), dtype=np.float64)
+    max_logging.log("================ BLOCK 0 ISOLATION ================")
+    max_logging.log(f"  block0 WITH memory: nan={bool(np.isnan(out_mem).any())} std={np.nan_to_num(out_mem).std():.4f} max={np.nan_to_num(out_mem).max():.4e}")
+    max_logging.log(f"  block0 NO   memory: nan={bool(np.isnan(out_nm).any())} std={out_nm.std():.4f} max={np.abs(out_nm).max():.4e}")
+    cs0 = _load("block_00.npy")
+    if cs0 is not None:
+      _cmp("block0(mem) vs CS", out_mem, cs0)
+      _cmp("block0(nomem) vs CS", out_nm, cs0)
 
 
 def main(argv):
