@@ -44,23 +44,29 @@ def _save(name, t):
 # PAI_DIR: local dir holding the already-downloaded PAI base files. When set, use Shu's
 # proven no-download recipe: local_model_path + skip_download=True + redirect_common_files
 # =False (keeps T5 model_id) + a local tokenizer_config. Falls back to ModelScope download.
+MODEL_ID = "PAI/Wan2.2-Fun-5B-Control-Camera"
 PAI_DIR = os.environ.get("PAI_DIR", "")
-# tokenizer lives at <PAI_DIR>/PAI/Wan2.2-Fun-5B-Control-Camera/google/umt5-xxl (override via TOKENIZER_PATH)
+# local_model_path must be the PARENT that contains <MODEL_ID>/...  If PAI_DIR points at the
+# model dir itself (ends with the model_id), strip back to the parent so both forms work.
+local_root = PAI_DIR.rstrip("/")
+if local_root.endswith(MODEL_ID):
+  local_root = local_root[: -len(MODEL_ID)].rstrip("/")
+# tokenizer lives at <local_root>/<MODEL_ID>/google/umt5-xxl (override via TOKENIZER_PATH)
 TOKENIZER_PATH = os.environ.get(
     "TOKENIZER_PATH",
-    os.path.join(PAI_DIR, "PAI", "Wan2.2-Fun-5B-Control-Camera", "google", "umt5-xxl") if PAI_DIR else "",
+    os.path.join(local_root, MODEL_ID, "google", "umt5-xxl") if local_root else "",
 )
 def _pai_cfg(pattern):
   if PAI_DIR:
-    return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern,
-                       offload_device="cpu", skip_download=True, local_model_path=PAI_DIR)
-  return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern, offload_device="cpu")
+    return ModelConfig(model_id=MODEL_ID, origin_file_pattern=pattern,
+                       offload_device="cpu", skip_download=True, local_model_path=local_root)
+  return ModelConfig(model_id=MODEL_ID, origin_file_pattern=pattern, offload_device="cpu")
 
 _pipe_kw = {}
 if PAI_DIR:
   _pipe_kw["redirect_common_files"] = False
   _pipe_kw["tokenizer_config"] = ModelConfig(path=TOKENIZER_PATH)
-  print(f"  [PAI local] local_model_path={PAI_DIR}  tokenizer={TOKENIZER_PATH}")
+  print(f"  [PAI local] local_model_path={local_root}  tokenizer={TOKENIZER_PATH}")
 
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16, device=GPU,
