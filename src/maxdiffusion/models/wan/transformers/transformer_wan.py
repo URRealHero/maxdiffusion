@@ -970,6 +970,15 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     return kv_cache, encoder_attention_mask
 
   @jax.named_scope("WanModel")
+  def compute_memory_context(self, memory, memory_pose_token, memory_key_pose_token):
+    """Retrieve pose-aligned memory and lift it to the DiT dim.
+
+    Independent of the noisy latents and timestep, so the generation loop computes this
+    ONCE and feeds it back in as `memory_context` (skipping the per-step retriever).
+    Returns [B, 4*782, inner_dim]. Requires use_memory=True."""
+    mem_pred = self.memory_retriever(memory_pose_token, memory_key_pose_token, memory)
+    return self.memory_emb_2(nnx.silu(self.memory_emb_0(mem_pred)))
+
   def __call__(
       self,
       hidden_states: jax.Array,

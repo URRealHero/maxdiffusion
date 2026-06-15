@@ -120,6 +120,9 @@ class WanPipeline2_2_FunCamera(WanPipeline2_2_Dense):
       control_camera_latents_input: Optional[jax.Array] = None,
       vae_only: bool = False,
       use_kv_cache: bool = False,
+      memory: Optional[jax.Array] = None,
+      memory_pose_token: Optional[jax.Array] = None,
+      memory_key_pose_token: Optional[jax.Array] = None,
   ):
     if y_latents is None:
       raise ValueError("Wan2.2-Fun camera inference requires y_latents from the first input image.")
@@ -168,6 +171,9 @@ class WanPipeline2_2_FunCamera(WanPipeline2_2_Dense):
           negative_prompt_embeds=negative_prompt_embeds,
           y_latents=y_latents,
           control_camera_latents_input=control_camera_latents_input,
+          memory=memory,
+          memory_pose_token=memory_pose_token,
+          memory_key_pose_token=memory_key_pose_token,
       )
       latents = self._denormalize_latents(latents)
       latents.block_until_ready()
@@ -196,6 +202,9 @@ def run_inference_2_2_fun_camera(
     scheduler_state,
     config=None,
     use_kv_cache: bool = False,
+    memory: Optional[jnp.array] = None,
+    memory_pose_token: Optional[jnp.array] = None,
+    memory_key_pose_token: Optional[jnp.array] = None,
 ):
   do_cfg = guidance_scale > 1.0
   bsz = latents.shape[0]
@@ -203,6 +212,21 @@ def run_inference_2_2_fun_camera(
   prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0) if do_cfg else None
 
   transformer_obj = nnx.merge(graphdef, sharded_state, rest_of_state)
+
+  # Captain-Safari 3D memory: retrieve + lift ONCE (independent of the noisy latents and
+  # timestep), then reuse every denoise step. memory_context is text-independent, so under
+  # CFG both the cond and uncond halves get the SAME memory -> just double it.
+  memory_context = None
+  if memory is not None:
+    memory_context = transformer_obj.compute_memory_context(
+        memory, memory_pose_token, memory_key_pose_token
+    ).astype(latents.dtype)
+
+  def _double_mem(mc, x):
+    if mc is None:
+      return None
+    batch_mult = x.shape[0] // mc.shape[0]
+    return mc if batch_mult == 1 else jnp.concatenate([mc] * batch_mult, axis=0)
   rope_channels = latents.shape[1] + y_latents.shape[1]
   dummy_hidden_states = jnp.zeros((latents.shape[0], latents.shape[2], latents.shape[3], latents.shape[4], rope_channels))
   rotary_emb = transformer_obj.rope(dummy_hidden_states)
@@ -243,6 +267,7 @@ def run_inference_2_2_fun_camera(
           rotary_emb=rotary_emb,
           encoder_attention_mask=encoder_attention_mask,
           control_camera_latents_input=_camera_for_batch(transformer_input),
+          memory_context=_double_mem(memory_context, transformer_input),
       )
     else:
       transformer_input = _append_y(latents)
@@ -260,6 +285,7 @@ def run_inference_2_2_fun_camera(
           rotary_emb=rotary_emb,
           encoder_attention_mask=encoder_attention_mask,
           control_camera_latents_input=_camera_for_batch(transformer_input),
+          memory_context=_double_mem(memory_context, transformer_input),
       )
 
     latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()

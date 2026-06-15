@@ -1107,6 +1107,7 @@ def transformer_forward_pass(
     rotary_emb=None,
     encoder_attention_mask=None,
     control_camera_latents_input=None,
+    memory_context=None,
 ):
   wan_transformer = nnx.merge(graphdef, sharded_state, rest_of_state)
   outputs = wan_transformer(
@@ -1121,6 +1122,7 @@ def transformer_forward_pass(
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
       control_camera_latents_input=control_camera_latents_input,
+      memory_context=memory_context,
   )
 
   if return_residual:
@@ -1155,6 +1157,7 @@ def transformer_forward_pass_full_cfg(
     rotary_emb=None,
     encoder_attention_mask=None,
     control_camera_latents_input=None,
+    memory_context=None,
 ):
   """Full CFG forward pass.
 
@@ -1177,6 +1180,7 @@ def transformer_forward_pass_full_cfg(
       rotary_emb=rotary_emb,
       encoder_attention_mask=encoder_attention_mask,
       control_camera_latents_input=control_camera_latents_input,
+      memory_context=memory_context,
   )
   noise_cond = noise_pred[:bsz]
   noise_uncond = noise_pred[bsz:]
