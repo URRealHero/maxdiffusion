@@ -41,12 +41,25 @@ def _save(name, t):
 
 
 # ---- build pipeline exactly like validate ----
+# PAI_DIR: local dir holding the already-downloaded PAI base files -> use ModelConfig(path=...)
+# to AVOID re-downloading. Falls back to ModelScope download if unset/not found.
+import glob
+PAI_DIR = os.environ.get("PAI_DIR", "")
+def _pai_cfg(pattern, **kw):
+  if PAI_DIR:
+    m = sorted(glob.glob(os.path.join(PAI_DIR, "**", pattern), recursive=True))
+    if m:
+      print(f"  [PAI local] {pattern} -> {m}")
+      return ModelConfig(path=(m if len(m) > 1 else m[0]), **kw)
+    print(f"  [PAI WARN] no local match for {pattern} under {PAI_DIR}; will download")
+  return ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern=pattern, **kw)
+
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16, device=GPU,
     model_configs=[
-        ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern="diffusion_pytorch_model*.safetensors", offload_device="cpu"),
-        ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu"),
-        ModelConfig(model_id="PAI/Wan2.2-Fun-5B-Control-Camera", origin_file_pattern="Wan2.2_VAE.pth", offload_device="cpu"),
+        _pai_cfg("diffusion_pytorch_model*.safetensors", offload_device="cpu"),
+        _pai_cfg("models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu"),
+        _pai_cfg("Wan2.2_VAE.pth", offload_device="cpu"),
     ],
 )
 pipe.dit.use_memory_retrieval = True
