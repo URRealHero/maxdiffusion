@@ -807,6 +807,18 @@ class WanPipeline:
   def _decode_latents_to_video(self, latents: jax.Array, trace: Optional[dict] = None) -> np.ndarray:
     """Decodes latents to video frames and postprocesses."""
     t_vae_tpu_start = time.perf_counter()
+    # Pad the batch up to the VAE mesh 'redundant' axis (symmetric with the encode
+    # path's _pad_videos_for_vae_mesh) so batch sizes not divisible by it — e.g. a
+    # single-sample eval/viz generation — don't trip the decode sharding constraint.
+    orig_batch = int(latents.shape[0])
+    redundant = 1
+    try:
+      redundant = max(1, int(getattr(getattr(self, "vae_mesh", None), "shape", {}).get("redundant", 1)))
+    except (AttributeError, TypeError):
+      redundant = 1
+    if redundant > 1 and orig_batch % redundant != 0:
+      pad = redundant - (orig_batch % redundant)
+      latents = jnp.concatenate([latents, jnp.repeat(latents[-1:], pad, axis=0)], axis=0)
     with self.vae_mesh, nn_partitioning.axis_rules(self.vae_logical_axis_rules):
       video = self.vae.decode(latents, self.vae_cache)[0]
       video = (video / 2.0) + 0.5
@@ -817,7 +829,7 @@ class WanPipeline:
       trace["vae_decode_tpu"] = time.perf_counter() - t_vae_tpu_start
 
     video = jax.experimental.multihost_utils.process_allgather(video, tiled=True)
-    video = np.array(video)
+    video = np.array(video)[:orig_batch]  # drop padding added for the redundant axis
     return video
 
   @classmethod

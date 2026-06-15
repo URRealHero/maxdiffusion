@@ -448,9 +448,19 @@ enable_generate_video_for_eval: False # This will increase the used TPU memory.
 # sample the current (shuffled) training batch and render videos with the SAME
 # conditioning training uses (y=[mask|latent_condition], Plucker camera, precomputed
 # text embeds), saving video + camera metadata under {output_dir}/{run_name}/eval/.
-eval_num_generate_samples: 2       # how many of the batch's records to save per eval
+eval_num_generate_samples: 2       # how many records to gen per eval (0 = all, for the viz tool)
 eval_num_inference_steps: 0        # 0 => use num_inference_steps (fewer = faster eval)
 eval_guidance_scale: 1.0           # 1.0 => no CFG (no text encoder needed at eval)
+eval_checkpoint_step: -1           # viz tool: which checkpoint step to load (-1 = latest)
+eval_save_gt_video: False          # viz tool: also decode the record's GT latents for side-by-side
+# viz tool text conditioning: "embedding" = use the record's precomputed encoder_hidden_states
+# (exact training cond); "caption" = re-encode the record's caption (or eval_caption_manifest
+# join) via umT5; "prompt" = encode the single custom eval_prompt via umT5 (test text-following).
+eval_text_mode: "embedding"
+eval_prompt: ""                    # custom prompt for text_mode=prompt
+eval_negative_prompt: ""           # viz CFG negative; "" = classic empty-string unconditional (not WAN's default)
+eval_caption_manifest: ""          # gs:// jsonl (sample_id+caption) for caption text/display when not embedded
+eval_output_dir: ""                # viz: where to write videos (decoupled from output_dir, which is forced to the ckpt run)
 # Log generated eval samples into TensorBoard media summaries. MP4s are still uploaded separately.
 tensorboard_eval_video_max_outputs: 1
 tensorboard_eval_video_max_frames: 32
