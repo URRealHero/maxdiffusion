@@ -216,6 +216,13 @@ def create_sharded_logical_transformer(
     else:
       _lora_targets = tuple(_lora_targets)
     wan_config["lora_target_modules"] = _lora_targets
+  # Captain-Safari 3D memory (retriever + per-block memory cross-attn). Off by default;
+  # when on, eval_shape builds the memory params so the loader has targets to fill.
+  wan_config["use_memory"] = bool(getattr(config, "use_memory", wan_config.get("use_memory", False)))
+  if wan_config["use_memory"]:
+    wan_config["memory_dim"] = int(getattr(config, "memory_dim", wan_config.get("memory_dim", 1024)))
+    wan_config["memory_heads"] = int(getattr(config, "memory_heads", wan_config.get("memory_heads", 8)))
+    wan_config["memory_blocks"] = int(getattr(config, "memory_blocks", wan_config.get("memory_blocks", 1)))
   # Camera-control adapter + Fun checkpoint channel overrides.
   wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
   wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
@@ -278,6 +285,18 @@ def create_sharded_logical_transformer(
             load_wan_lora(lora_path, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"])
         )
       params = flax.traverse_util.unflatten_dict(flat_params)
+
+    # Captain-Safari memory weights (memory_emb + per-block memory_cross_attn/norm_memory
+    # + memory_retriever) live in the same epoch-*.safetensors as the LoRA adapters.
+    if bool(wan_config.get("use_memory", False)):
+      from ...models.wan.wan_utils import load_wan_memory
+      mem_path = getattr(config, "wan_memory_path", "") or getattr(config, "wan_lora_path", "") or ""
+      if mem_path:
+        flat_params = flax.traverse_util.flatten_dict(params)
+        flat_params.update(
+            load_wan_memory(mem_path, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"])
+        )
+        params = flax.traverse_util.unflatten_dict(flat_params)
 
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),

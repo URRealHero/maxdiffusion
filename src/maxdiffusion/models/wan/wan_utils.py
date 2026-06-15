@@ -692,6 +692,83 @@ def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, n
   return out
 
 
+def _cs_mem_leaf(leaf: str):
+  """nnx param leaf -> (cs_torch_leaf, transpose_kernel)."""
+  if leaf == "kernel":   # nnx Linear [in,out] -> CS [out,in]
+    return "weight", True
+  if leaf == "scale":    # nnx LayerNorm gamma -> CS weight
+    return "weight", False
+  return leaf, False     # bias, or RMSNorm 'weight'
+
+
+def load_wan_memory(memory_path: str, eval_shapes: dict, scan_layers: bool = True,
+                    num_layers: int = 30, dtype=jnp.float32):
+  """Load Captain-Safari memory weights into a flat nnx param dict.
+
+  Covers all 3 memory groups in epoch-*.safetensors:
+    * memory_emb.{0,2}            -> memory_emb_0 / memory_emb_2 (WanModel top-level Linear)
+    * blocks.N.memory_cross_attn  -> blocks.memory_cross_attn (scan-stacked to [L,...])
+      + blocks.N.norm_memory      -> blocks.norm_memory
+    * memory_retriever.*          -> memory_retriever (reuses the validated retriever mapper)
+
+  Mirrors load_wan_lora: returns {nnx_path_tuple(str): jnp.array}, scan-stacking the
+  per-block memory modules. Every memory param present in eval_shapes is filled or this
+  raises (no silent gaps). PyTorch [out,in] kernels are transposed to nnx [in,out]."""
+  if not os.path.isfile(memory_path):
+    raise FileNotFoundError(f"Memory file not found: {memory_path} (expected a local .safetensors path)")
+  max_logging.log(f"Loading WAN memory weights from {memory_path}")
+  from .memory_retriever import _nnx_path_to_cs_key
+
+  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
+  out = {}
+  filled = 0
+  with safe_open(memory_path, framework="pt") as f:
+    keys = set(f.keys())
+
+    def fetch(cs_key, transpose, want_shape, path):
+      if cs_key not in keys:
+        raise KeyError(f"memory CS key not found: {cs_key} (for {path})")
+      w = torch2jax(f.get_tensor(cs_key)).astype(dtype)
+      if transpose:
+        w = jnp.swapaxes(w, -1, -2)
+      if tuple(w.shape) != tuple(want_shape):
+        raise ValueError(f"shape mismatch {cs_key}: {tuple(w.shape)} vs want {tuple(want_shape)} ({path})")
+      return w
+
+    for path, shaped in shapes.items():
+      is_emb = path[0] in ("memory_emb_0", "memory_emb_2")
+      is_retriever = path[0] == "memory_retriever"
+      is_blk = path[0] == "blocks" and ("memory_cross_attn" in path or "norm_memory" in path)
+      if not (is_emb or is_retriever or is_blk):
+        continue
+      cs_leaf, transpose = _cs_mem_leaf(path[-1])
+
+      if is_emb:
+        idx = "0" if path[0] == "memory_emb_0" else "2"
+        out[path] = fetch(f"memory_emb.{idx}.{cs_leaf}", transpose, shaped.shape, path)
+        filled += 1
+      elif is_retriever:
+        # retriever mapper re-adds the 'memory_retriever.' prefix; pass the model-relative tail.
+        cs_key, tr = _nnx_path_to_cs_key(path[1:])
+        out[path] = fetch(cs_key, tr, shaped.shape, path)
+        filled += 1
+      elif scan_layers:
+        suffix = ".".join(path[1:-1]) + "." + cs_leaf  # body between 'blocks' and leaf
+        stacked = jnp.zeros(shaped.shape, dtype=dtype)  # [L, ...]
+        for n in range(num_layers):
+          per = fetch(f"blocks.{n}.{suffix}", transpose, shaped.shape[1:], path)
+          stacked = stacked.at[n].set(per)
+        out[path] = stacked
+        filled += 1
+      else:  # non-scan: blocks.<idx>.memory_*...
+        cs_key = f"blocks.{path[1]}." + ".".join(path[2:-1]) + "." + cs_leaf
+        out[path] = fetch(cs_key, transpose, shaped.shape, path)
+        filled += 1
+
+  max_logging.log(f"WAN memory: filled {filled} params from {memory_path}")
+  return out
+
+
 def load_wan_vae(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,
