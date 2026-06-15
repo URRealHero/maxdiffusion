@@ -103,15 +103,18 @@ class RMSNorm(nnx.Module):
 
 
 def _mha(q, k, v, num_heads):
-  """Plain multi-head scaled-dot-product attention. q/k/v: [B, S, dim]."""
+  """Multi-head scaled-dot-product attention via JAX's memory-efficient (flash) kernel.
+
+  q/k/v: [B, S, dim]. Mathematically identical to the previous naive implementation
+  (scale = 1/sqrt(head_dim), numerically-stable softmax) but does NOT materialize the full
+  [S_q, S_kv] score matrix -> much faster + far less HBM. This matters most for the per-block
+  memory cross-attn (queries=video tokens ~27280, keys=memory ~3128, x24 heads x30 blocks),
+  which previously built an ~8GB attention matrix per block."""
   b, sq, dim = q.shape
   hd = dim // num_heads
-  sh = lambda t: t.reshape(t.shape[0], t.shape[1], num_heads, hd).transpose(0, 2, 1, 3)
-  qh, kh, vh = sh(q), sh(k), sh(v)                        # [B, n, S, hd]
-  attn = jnp.einsum("bnqd,bnkd->bnqk", qh, kh) / jnp.sqrt(hd).astype(q.dtype)
-  attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(q.dtype)
-  out = jnp.einsum("bnqk,bnkd->bnqd", attn, vh)
-  return out.transpose(0, 2, 1, 3).reshape(b, sq, dim)
+  rs = lambda t: t.reshape(t.shape[0], t.shape[1], num_heads, hd)  # [B, S, n, hd]
+  out = jax.nn.dot_product_attention(rs(q), rs(k), rs(v), implementation="xla")  # scale=1/sqrt(hd)
+  return out.reshape(b, sq, dim)
 
 
 class JointSelfAttention(nnx.Module):
