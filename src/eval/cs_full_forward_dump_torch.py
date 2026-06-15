@@ -101,8 +101,10 @@ extr_c = torch.tensor(ld("extrinsic_clip"), dtype=torch.bfloat16).unsqueeze(0)
 input_image = VideoData(os.path.join(DATA, str(row["video"])), height=704, width=1280)[0]
 
 # ---- capture the FIRST model_fn call ----
+# IMPORTANT: the pipeline binds self.model_fn = model_fn_wan_video at __init__, so we must
+# patch the INSTANCE attribute (pipe.model_fn), not the module-level function.
 captured = {}
-orig = wv.model_fn_wan_video
+orig = pipe.model_fn
 def patched(*args, **kw):
   out = orig(*args, **kw)
   if not captured:
@@ -114,7 +116,7 @@ def patched(*args, **kw):
     for k, v in captured.items():
       if torch.is_tensor(v): _save(k, v)
   return out
-wv.model_fn_wan_video = patched
+pipe.model_fn = patched
 
 NEG = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 print("[dump] running 1-step generation to trigger model_fn capture...")
