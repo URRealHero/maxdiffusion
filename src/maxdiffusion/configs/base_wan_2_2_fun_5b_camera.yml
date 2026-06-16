@@ -509,6 +509,10 @@ intrinsic_clip_path: ""
 camera_clip_fps_in: 4.0
 camera_clip_fps_out: 24.0
 output_video_name: "wan22_fun_camera_output.mp4"
+# DEBUG: when True, inference holds latent frame 0 = clean conditioning + per-token timestep
+# (frame-0 tokens t=0), matching the camera LoRA training convention. Default False = scalar
+# (correct for CS Fun-5B base, which is seperated_timestep=False). Tests the first-frame split.
+ti2v_first_frame_clean: False
 # Captain-Safari 3D memory inputs for generation (used when use_memory=True).
 # memory_path: StreamVGGT features .npy (>=memory_n_key keyframes, [K,4,782,1024]).
 # The query/key camera matrices feed the retriever's pose tokens (memory_pose.py).

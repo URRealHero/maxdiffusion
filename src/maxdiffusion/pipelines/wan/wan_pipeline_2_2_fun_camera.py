@@ -249,12 +249,29 @@ def run_inference_2_2_fun_camera(
       return control_camera_latents_input
     return jnp.concatenate([control_camera_latents_input] * batch_mult, axis=0)
 
+  # TI2V convention match (debug flag, default OFF -> unchanged scalar-timestep behavior, so the
+  # Phase H memory path is untouched). When ON: hold latent frame 0 = the clean conditioning and
+  # use per-token timesteps with frame-0 tokens at t=0 — exactly what training does
+  # (step_optimizer: noisy_latents[:,:,0:1]=clean + _per_token_timesteps). Tests whether the
+  # first-frame "split" is a train/inference convention mismatch.
+  ti2v_clean = bool(getattr(config, "ti2v_first_frame_clean", False)) if config is not None else False
+  if ti2v_clean:
+    mask_ch = y_latents.shape[1] - latents.shape[1]          # 52-48 = 4 mask channels
+    cond_f0 = y_latents[:, mask_ch:, 0:1]                    # [B,48,1,h,w] clean first-frame latent
+    f_lat, h_lat, w_lat = latents.shape[2], latents.shape[3], latents.shape[4]
+    tpf = (h_lat // 2) * (w_lat // 2)                        # patch (1,2,2) -> tokens per latent frame
+    def _ttok(tscalar, n):
+      tt = jnp.broadcast_to(jnp.asarray(tscalar, jnp.float32), (n, f_lat * tpf))
+      return tt.at[:, :tpf].set(0.0)                         # frame-0 tokens clean (t=0)
+
   for step in range(num_inference_steps):
     t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
+    if ti2v_clean:
+      latents = latents.at[:, :, 0:1].set(cond_f0.astype(latents.dtype))   # clean frame 0 before forward
     if do_cfg:
       latents_doubled = jnp.concatenate([latents] * 2)
       transformer_input = _append_y(latents_doubled)
-      timestep = jnp.broadcast_to(t, (bsz * 2,))
+      timestep = _ttok(t, bsz * 2) if ti2v_clean else jnp.broadcast_to(t, (bsz * 2,))
       noise_pred, _, _ = transformer_forward_pass_full_cfg(
           graphdef,
           sharded_state,
@@ -271,7 +288,7 @@ def run_inference_2_2_fun_camera(
       )
     else:
       transformer_input = _append_y(latents)
-      timestep = jnp.broadcast_to(t, (bsz,))
+      timestep = _ttok(t, bsz) if ti2v_clean else jnp.broadcast_to(t, (bsz,))
       noise_pred, _ = transformer_forward_pass(
           graphdef,
           sharded_state,
@@ -289,5 +306,7 @@ def run_inference_2_2_fun_camera(
       )
 
     latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
+    if ti2v_clean:
+      latents = latents.at[:, :, 0:1].set(cond_f0.astype(latents.dtype))   # keep frame 0 clean
 
   return latents
