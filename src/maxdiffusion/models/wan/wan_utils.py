@@ -587,8 +587,7 @@ def _remap_wan_2p2_pth_vae_key(key: str) -> str:
 #   blocks.N.ffn.2.lora_{A,B}.default.weight                 -> ffn.lora_ffn2
 # Every CS weight is PyTorch [out, in]; our nnx Linear kernel is [in, out] -> transpose.
 # Non-LoRA CS keys (memory_*, norm_memory, memory_cross_attn, memory_retriever,
-# memory_emb) belong to the Captain-Safari memory augmentation we do NOT model;
-# they are skipped.
+# memory_emb) are handled by load_wan_memory below, not by the LoRA loader here.
 # ---------------------------------------------------------------------------
 _CS_ATTN_TO_NNX = {"self_attn": "attn1", "cross_attn": "attn2"}
 _CS_PROJ_TO_NNX = {"q": "lora_q", "k": "lora_k", "v": "lora_v", "o": "lora_o"}
