@@ -315,21 +315,23 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
-    # First latent frame is the CLEAN conditioning frame (TI2V): never noised.
-    noisy_latents = noisy_latents.at[:, :, 0:1].set(latents[:, :, 0:1])
+    # Match diffsynth/CS Fun-5B training (seperated_timestep=False): ALL latent frames are
+    # noised (no clean frame-0 hold), a SCALAR timestep is used (not per-token), and the loss
+    # is over ALL frames. First-frame conditioning comes solely from the y-concat
+    # (mask + latent_condition). The previous per-token-timestep + clean-frame-0 + frame-0-
+    # excluded-loss convention is NOT how this base model was trained; the LoRA overfit to it
+    # and caused the first-frame "split" vs the (scalar) inference. (diffsynth wan_video_new.py
+    # training_loss: add_noise over the whole tensor + scalar timestep + mse over all frames.)
 
     # y-conditioning: [mask(4) | latent_condition(48)], concat after the noisy
     # latents -> the 100-channel Fun camera-control input.
     mask = _build_first_frame_mask(latents)
     hidden_states = jnp.concatenate([noisy_latents, mask, latent_condition], axis=1)
 
-    tokens_per_frame = (h_lat // patch_hw[0]) * (w_lat // patch_hw[1])
-    t_tok = _per_token_timesteps(timesteps, f_lat, tokens_per_frame)
-
     with jax.named_scope("forward_pass"):
       model_pred = model(
           hidden_states=hidden_states,
-          timestep=t_tok,
+          timestep=timesteps,  # scalar [B] timestep (matches diffsynth + our scalar inference)
           encoder_hidden_states=encoder_hidden_states,
           deterministic=False,
           rngs=nnx.Rngs(dropout=dropout_rng),
@@ -337,8 +339,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
       )
 
     with jax.named_scope("loss"):
-      # Frame 0 is conditioning, not a prediction target (DiffSynth convention).
-      loss = (training_target[:, :, 1:] - model_pred[:, :, 1:]) ** 2
+      loss = (training_target - model_pred) ** 2  # all frames (diffsynth convention)
       if not config.disable_training_weights:
         training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
         loss = loss * training_weight
