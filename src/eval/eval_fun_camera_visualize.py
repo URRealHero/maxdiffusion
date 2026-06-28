@@ -142,6 +142,32 @@ def run(config):
 
   records = read_eval_records(config.eval_data_dir, limit=limit)
 
+  # Multi-host sharding: each worker takes a strided slice so a pod can fan a large
+  # eval set (e.g. 1000 clips) across all workers. The launcher passes eval_host_index
+  # (from GCE metadata agent-worker-number) and eval_host_count (#workers). Strided
+  # (records[i::N]) rather than contiguous so any prefix limit stays balanced across hosts.
+  # Default 1/0 -> no-op (single host). Apply AFTER the optional `limit` read so the cap
+  # is global, then this host generates only its share.
+  host_count = max(1, int(getattr(config, "eval_host_count", 1)))
+  host_index = int(getattr(config, "eval_host_index", 0)) % host_count
+  if host_count > 1:
+    n_total = len(records)
+    records = records[host_index::host_count]
+    max_logging.log(f"[viz] shard {host_index}/{host_count}: {len(records)} of {n_total} records")
+
+  # Resume: skip sids already generated in out_root (idempotent re-runs to fill in clips
+  # from workers that died in a prior flaky pass — generation is the slow part). gfile lists GCS.
+  if out_root:
+    try:
+      done = {os.path.basename(p)[: -len("_gen.mp4")]
+              for p in tf.io.gfile.glob(os.path.join(out_root, "*_gen.mp4"))}
+      if done:
+        before = len(records)
+        records = [r for r in records if r["sample_id"] not in done]
+        max_logging.log(f"[viz] resume: skipping {before - len(records)} done, {len(records)} left this shard")
+    except Exception as e:  # never let a resume-list failure block generation
+      max_logging.log(f"[viz] resume check skipped: {e}")
+
   # Text conditioning mode:
   #   embedding (default) -> use the record's precomputed encoder_hidden_states (exact training cond)
   #   caption             -> re-encode the record's caption (or a manifest join) via umT5

@@ -470,6 +470,12 @@ eval_prompt: ""                    # custom prompt for text_mode=prompt
 eval_negative_prompt: ""           # viz CFG negative; "" = classic empty-string unconditional (not WAN's default)
 eval_caption_manifest: ""          # gs:// jsonl (sample_id+caption) for caption text/display when not embedded
 eval_output_dir: ""                # viz: where to write videos (decoupled from output_dir, which is forced to the ckpt run)
+# Multi-host eval-generation sharding: each pod worker generates a strided slice
+# records[eval_host_index::eval_host_count], so a large eval set (e.g. 1000 clips)
+# fans across all workers. Default 1/0 = single-host (unchanged). The launcher sets
+# eval_host_index from GCE metadata agent-worker-number and eval_host_count=#workers.
+eval_host_count: 1
+eval_host_index: 0
 # Log generated eval samples into TensorBoard media summaries. MP4s are still uploaded separately.
 tensorboard_eval_video_max_outputs: 1
 tensorboard_eval_video_max_frames: 32
