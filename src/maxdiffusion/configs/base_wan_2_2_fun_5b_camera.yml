@@ -425,6 +425,10 @@ lora_trainable_param_substrings: ""
 # trainable adapter tensors (a few MB) instead of the full ~5B-param state; restore
 # loads the PAI base and overlays them. Default False = full-state save (unchanged).
 save_lora_only: False
+# Held-out training: path to a text file (one sample_id per line, local or gs://) whose
+# records are EXCLUDED from the TRAINING data stream (e.g. the eval/test set), so a model
+# can be trained for a true held-out generalization eval. Empty = no exclusion (unchanged).
+exclude_sample_ids_path: ""
 # Captain-Safari 3D memory (pose-aligned memory retriever + per-block memory cross-attn).
 # use_memory=False -> no memory modules built (identical to plain camera-control model).
 # When True, the retriever + per-block memory_cross_attn/norm_memory + memory_emb are built

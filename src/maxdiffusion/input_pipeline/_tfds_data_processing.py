@@ -170,9 +170,24 @@ def _make_tfrecord_iterator(
           num_parallel_calls=4,
           deterministic=False,
       ).shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+    ds = ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
+    # Held-out training: drop records whose sample_id is in the exclude list (e.g. the test
+    # set) so the model never trains on them. Opt-in via config.exclude_sample_ids_path; the
+    # trainer adds 'sample_id' to the feature_description when this is set.
+    _exclude_path = config.exclude_sample_ids_path if "exclude_sample_ids_path" in config.get_keys() else ""
+    if _exclude_path:
+      with tf.io.gfile.GFile(_exclude_path, "r") as _f:
+        _bad = [ln.strip() for ln in _f if ln.strip()]
+      _excl = tf.lookup.StaticHashTable(
+          tf.lookup.KeyValueTensorInitializer(
+              tf.constant(_bad, dtype=tf.string), tf.ones([len(_bad)], dtype=tf.int64)
+          ),
+          default_value=tf.constant(0, dtype=tf.int64),
+      )
+      max_logging.log(f"Held-out training: excluding {len(_bad)} sample_ids from training ({_exclude_path})")
+      ds = ds.filter(lambda x: tf.equal(_excl.lookup(x["sample_id"]), 0))
     ds = (
-        ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
-        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+        ds.map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
         .shuffle(global_batch_size * 10)
         .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
         .repeat(-1)

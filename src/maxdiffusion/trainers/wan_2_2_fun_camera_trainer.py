@@ -90,6 +90,10 @@ class Wan2_2FunCameraTrainer(WanTrainer):
     }
     if not is_training:
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
+    # Held-out training: parse sample_id so the pipeline can drop excluded (test) records.
+    # Only when excluding + training, to avoid touching the normal (no-exclusion) path.
+    if is_training and getattr(config, "exclude_sample_ids_path", ""):
+      feature_description["sample_id"] = tf.io.FixedLenFeature([], tf.string, default_value="")
 
     def prepare_sample(features):
       out = {
