@@ -25,7 +25,8 @@ WIDTH="${WIDTH:-1280}"
 NUM_FRAMES="${NUM_FRAMES:-121}"
 STEPS="${STEPS:-50}"
 GUIDANCE="${GUIDANCE:-5.0}"
-PER_DEVICE_BS="${PER_DEVICE_BS:-0.25}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-0.125}"   # 8 chips * 0.125 = global batch 1
+CHIP_BOUNDS="${CHIP_BOUNDS:-2,4,1}"       # all 8 chips of v6e-8 -> 2x HBM headroom (704x1280x121 is borderline on 4)
 VAE_SPATIAL="${VAE_SPATIAL:-4}"   # must divide the latent spatial dim (matches working viz; 8 fails at 480x832)
 # CS certified negative (the long Chinese WAN negative). Override with NEG_PROMPT.
 NEG_PROMPT="${NEG_PROMPT:-色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走}"
@@ -48,9 +49,9 @@ cd ~/maxdiffusion
 git fetch -q origin && (git stash -u 2>/dev/null || true) && git checkout -B wan22-memory origin/wan22-memory && git reset --hard origin/wan22-memory
 pip install -e ~/maxdiffusion --no-deps -q
 
-# Single-host topology: claim only this worker's 2x2 chips.
+# Single-host topology: claim all 8 chips of this v6e-8 worker (2x HBM headroom).
 export TPU_PROCESS_BOUNDS=1,1,1
-export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
+export TPU_CHIPS_PER_PROCESS_BOUNDS=${CHIP_BOUNDS}
 
 # Pull assets to local disk (np.load + safe_open need local paths).
 A=/tmp/cs_mem_assets
