@@ -1725,15 +1725,131 @@ class FlaxWanAttention(nnx.Module):
 
     return q, k, v, k_comp, v_comp, similarity, freqs_comp
 
+  def _dynamic_retrieval_attention(self, q, k, v, k_comp, v_comp, similarity, grid_thw):
+    """V2V-2b: faithful JAX/flax.nnx port of HyDRA's ``DynamicRetrievalAttention``
+    (sparse per-frame retrieval), the mixed-resolution ``forward`` path with
+    k_comp/v_comp provided (HyDRA/diffsynth/models/wan_video_dit.py:259-303 +
+    ``_process_mixed_frame_chunk`` 334-370).
+
+    Each query frame attends to a STATIC set of keys/values:
+      * the local temporal window (window_size=5 full-resolution frames), and
+      * the top_k=10 most-similar COMPRESSED frames (selected via ``similarity``,
+        with compressed frames overlapping the local window masked out so they are
+        never re-selected).
+    total_selected = 5 + 10 = 15 frames -> exactly 5*HW + 10*HW_comp keys per query
+    frame (compile-time constant), so the whole thing runs with static shapes and
+    NO python loop over F -- the per-frame attention is ``jax.vmap``-ed over F.
+
+    Inputs (per-head, rope'd, straight from ``_hydra_memory_encode``):
+      q, k, v        : [B, heads, F*HW, head_dim]
+      k_comp, v_comp : [B, heads, F_comp*HW_comp, head_dim]
+      similarity     : [B, F, F_comp]
+    Returns:
+      [B, F*HW, inner_dim]  (flattened-head layout, ready for proj_attn)
+    """
+    top_k = 10
+    window_size = 5
+    f, h, w = grid_thw
+    F = int(f)
+    HW = int(h) * int(w)
+    B = q.shape[0]
+    inner = self.inner_dim
+    F_comp = int(similarity.shape[-1])
+    HW_comp = int(k_comp.shape[2]) // F_comp
+
+    # --- flatten heads back to [B, seq, inner_dim]; HyDRA's retrieval works on the
+    # full inner_dim per token and its flash_attention re-splits it into num_heads. ---
+    q_flat = _reshape_heads_to_head_dim(q)  # [B, F*HW, inner]
+    k_flat = _reshape_heads_to_head_dim(k)
+    v_flat = _reshape_heads_to_head_dim(v)
+    kc_flat = _reshape_heads_to_head_dim(k_comp)  # [B, F_comp*HW_comp, inner]
+    vc_flat = _reshape_heads_to_head_dim(v_comp)
+
+    # --- reshape flat token sequences into frames ---
+    q_f = q_flat.reshape(B, F, HW, inner)
+    k_f = k_flat.reshape(B, F, HW, inner)
+    v_f = v_flat.reshape(B, F, HW, inner)
+    kc_f = kc_flat.reshape(B, F_comp, HW_comp, inner)
+    vc_f = vc_flat.reshape(B, F_comp, HW_comp, inner)
+
+    # --- local temporal window indices: data-independent -> a compile-time constant.
+    # radius = window_size//2 = 2; per query frame i, start = clamp(i-2, 0, F-5),
+    # local_indices[i] = start + arange(5). ---
+    radius = window_size // 2
+    idx = jnp.arange(F)
+    start_indices = jnp.clip(idx - radius, 0, F - window_size)  # [F]
+    window_range = jnp.arange(window_size)
+    local_indices = start_indices[:, None] + window_range[None, :]  # [F, 5]
+
+    # --- mask compressed frames that overlap the local window so top-k can't reselect
+    # them. token_start = arange(F_comp)*stride_f, stride_f = max(1, round((F-2)/(F_comp-1)));
+    # a compressed frame is "inside" iff its [token_start, token_end] span lies within
+    # the local window's [win_start, win_end]. (Mirrors HyDRA lines 271-287.) ---
+    token_indices = jnp.arange(F_comp)
+    if F_comp > 1:
+      stride_f = max(1, int(round((F - 2) / (F_comp - 1))))
+    else:
+      stride_f = 1
+    token_start = token_indices * stride_f  # [F_comp]
+    token_end = token_start + 1
+    win_start = start_indices[:, None]  # [F, 1]
+    win_end = win_start + window_size - 1  # [F, 1]
+    is_inside = (token_start[None, :] >= win_start) & (token_end[None, :] <= win_end)  # [F, F_comp]
+
+    mask_val = jnp.array(-1e9, dtype=similarity.dtype)
+    similarity_masked = jnp.where(is_inside[None, :, :], mask_val, similarity)  # [B, F, F_comp]
+
+    # --- top-k over compressed frames (dim=-1) -> dynamic per-(B,F) indices ---
+    _topk_values, topk_indices = jax.lax.top_k(similarity_masked, top_k)  # [B, F, top_k]
+
+    # --- gather the local full-res frames. local_indices is a constant, so this is a
+    # plain take along the frame axis (broadcast over B): [B, F, 5, HW, inner]. ---
+    k_local = jnp.take(k_f, local_indices, axis=1)  # [B, F, window, HW, inner]
+    v_local = jnp.take(v_f, local_indices, axis=1)
+    k_local = k_local.reshape(B, F, window_size * HW, inner)
+    v_local = v_local.reshape(B, F, window_size * HW, inner)
+
+    # --- gather the top-k compressed frames. topk_indices is DYNAMIC and per-batch, so
+    # take_along_axis over the compressed-frame axis (idx broadcast over HW_comp/inner). ---
+    gather_idx = topk_indices.reshape(B, F * top_k)[:, :, None, None]  # [B, F*top_k, 1, 1]
+    k_comp_sel = jnp.take_along_axis(kc_f, gather_idx, axis=1)  # [B, F*top_k, HW_comp, inner]
+    v_comp_sel = jnp.take_along_axis(vc_f, gather_idx, axis=1)
+    k_comp_sel = k_comp_sel.reshape(B, F, top_k * HW_comp, inner)
+    v_comp_sel = v_comp_sel.reshape(B, F, top_k * HW_comp, inner)
+
+    # --- k_all/v_all: concat local (full-res) + selected compressed keys/values.
+    # [B, F, 5*HW + 10*HW_comp, inner] (static seq length). ---
+    k_all = jnp.concatenate([k_local, k_comp_sel], axis=2)
+    v_all = jnp.concatenate([v_local, v_comp_sel], axis=2)
+
+    # --- per-query-frame attention, vmapped over the F axis (no python loop). Reuses
+    # the SAME dot-product math FlaxWanAttention uses (dot_product kernel via
+    # _apply_attention_dot). split_head_dim=True keeps it pure einsum -> vmap-safe
+    # (no with_sharding_constraint inside). q [B,HW,inner] attends k_all/v_all
+    # [B,S,inner]; num_heads handled by the head_dim split, exactly like HyDRA's
+    # flash_attention(num_heads=H). ---
+    attn_fn = functools.partial(
+        _apply_attention_dot,
+        dtype=q_f.dtype,
+        heads=self.heads,
+        dim_head=self.dim_head,
+        scale=self.attention_op.scale,
+        split_head_dim=True,
+        float32_qk_product=self.attention_op.float32_qk_product,
+        use_memory_efficient_attention=False,
+    )
+    out = jax.vmap(attn_fn, in_axes=(1, 1, 1), out_axes=1)(q_f, k_all, v_all)  # [B, F, HW, inner]
+    out = out.reshape(B, F * HW, inner)
+    return out
+
   def _hydra_forward(self, hidden_states, rotary_emb, grid_thw, dtype, deterministic, rngs):
-    """V2V-2a self-attention forward. Runs the HyDRA memory-encoding, then STOPS:
-    DynamicRetrievalAttention (V2V-2b) is not yet ported, so we fall back to standard
-    dense attention over the rope'd main q/k/v (k_comp/v_comp/similarity are computed
-    for shape correctness but not consumed here). Output matches the standard
-    self-attention path's shape and post-processing (proj_attn + optional o-LoRA)."""
-    q, k, v, _k_comp, _v_comp, _similarity, _freqs_comp = self._hydra_memory_encode(hidden_states, rotary_emb, grid_thw)
-    with jax.named_scope("apply_attention"):
-      attn_output = self.attention_op.apply_attention(q, k, v, attention_mask=None)
+    """V2V-2b self-attention forward. Runs the HyDRA memory-encoding (V2V-2a) then the
+    ported DynamicRetrievalAttention (sparse per-frame retrieval over the local window +
+    top-k compressed frames). Output matches the standard self-attention path's shape and
+    post-processing (proj_attn + optional o-LoRA)."""
+    q, k, v, k_comp, v_comp, similarity, _freqs_comp = self._hydra_memory_encode(hidden_states, rotary_emb, grid_thw)
+    with jax.named_scope("dynamic_retrieval_attention"):
+      attn_output = self._dynamic_retrieval_attention(q, k, v, k_comp, v_comp, similarity, grid_thw)
     attn_output = attn_output.astype(dtype=dtype)
     attn_output = checkpoint_name(attn_output, "attn_output")
     with jax.named_scope("proj_attn"):
