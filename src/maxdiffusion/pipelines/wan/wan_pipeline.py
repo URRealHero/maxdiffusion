@@ -216,6 +216,9 @@ def create_sharded_logical_transformer(
     else:
       _lora_targets = tuple(_lora_targets)
     wan_config["lora_target_modules"] = _lora_targets
+  # V2V-1a per-block camera injection (HyDRA baseline). Threaded here so
+  # config.v2v_concat reaches WanModel; defaults False (existing configs unaffected).
+  wan_config["v2v_concat"] = bool(getattr(config, "v2v_concat", wan_config.get("v2v_concat", False)))
   # Camera-control adapter + Fun checkpoint channel overrides.
   wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
   wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
