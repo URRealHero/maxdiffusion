@@ -689,15 +689,26 @@ class WanTransformerBlock(nnx.Module):
           # V2V-1a per-block camera injection (HyDRA wan_video_dit.py:566-572):
           # add cam_encoder_con to the cond/first half and cam_encoder_tgt to the
           # tgt/second half, broadcasting over the (h, w) spatial axes.
+          #
+          # CONTEXT-PARALLEL SAFE: norm_hidden_states is [B, f*h*w, dim] with the
+          # length axis sharded on the 'context' mesh axis. A reshape to
+          # [B, f, h, w, dim] would misinterpret a per-device sequence *shard* as
+          # the full (f,h,w) grid and corrupt the frame-half slicing -> NaN under
+          # ici_context>1. Instead build a per-token camera bias by repeating the
+          # per-frame camera h*w times (frame-major, matching jax.lax.collapse over
+          # f,h,w) and add it elementwise -- no reshape, sharding-preserving.
           f, h, w = grid_thw
-          b = norm_hidden_states.shape[0]
-          nhs = norm_hidden_states.reshape(b, f, h, w, -1)
           c_con = self.cam_encoder_con(cam_emb_con).astype(norm_hidden_states.dtype)  # [B, f//2, dim]
           c_tgt = self.cam_encoder_tgt(cam_emb_tgt).astype(norm_hidden_states.dtype)  # [B, f//2, dim]
-          first_half = nhs[:, : f // 2, :, :, :] + c_con[:, :, None, None, :]
-          second_half = nhs[:, f // 2 :, :, :, :] + c_tgt[:, :, None, None, :]
-          nhs = jnp.concatenate([first_half, second_half], axis=1)
-          norm_hidden_states = nhs.reshape(b, f * h * w, -1)
+          cam_per_frame = jnp.concatenate([c_con, c_tgt], axis=1)  # [B, f, dim]
+          cam_bias = jnp.repeat(cam_per_frame, h * w, axis=1)  # [B, f*h*w, dim], frame-major
+          # Constrain cam_bias to the SAME (batch, length->context, heads) sharding
+          # as the block's hidden_states so XLA shards the repeat directly, instead
+          # of materializing the full unsharded [B, f*h*w, dim] and resharding onto
+          # the context axis (that reshard deadlocks under ici_context>1).
+          cam_bias = jax.lax.with_sharding_constraint(
+              cam_bias, nn.logical_to_mesh_axes(("activation_batch", "activation_length", "activation_heads")))
+          norm_hidden_states = norm_hidden_states + cam_bias
         with self.conditional_named_scope("self_attn_attn"):
           attn_output = self.attn1(
               hidden_states=norm_hidden_states,
