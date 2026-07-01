@@ -62,6 +62,53 @@ def get_frequencies(max_seq_len: int, theta: int, attention_head_dim: int):
   return freqs_split
 
 
+def get_compressed_frequencies(attention_head_dim: int, f: int, h: int, w: int, theta: float = 10000.0):
+  """3D RoPE for HyDRA's compressed memory grid (V2V-2a).
+
+  JAX/flax port of HyDRA's ``get_compressed_freqs_cis_3d``
+  (HyDRA/diffsynth/models/wan_video_dit.py:108-135). After the MemoryTokenizer
+  downsamples the (F, H, W) grid by 2x on every axis, each compressed token spans
+  two original tokens, so its RoPE position is expressed in the ORIGINAL
+  full-resolution coordinate frame: t = 2*i + 0.5 (center of the 2-frame span),
+  h = 2*i, w = 2*i. This keeps the compressed keys in the same rotary space as the
+  full-resolution query (which is rope'd with the normal integer positions), so
+  the two can be compared consistently in the (future V2V-2b) retrieval attention.
+
+  Convention alignment with maxdiffusion's WanRotaryPosEmbed / get_frequencies:
+    * Per-axis channel split uses maxdiffusion's convention
+      (h_dim = w_dim = 2*(head_dim//6), t_dim = remainder) rather than HyDRA's
+      literal ``f_dim = dim - 2*(dim//3); h_dim = w_dim = dim//3``. The two are
+      NUMERICALLY IDENTICAL for the WAN head_dim=128 (44/42/42) and the smoke's
+      head_dim=32 (12/10/10); using maxdiffusion's split guarantees the compressed
+      keys share the exact [t | h | w] channel boundaries as the query's normal rope.
+    * inv_freq (1/theta**(2i/d)), the interleaved-pair layout, and the [f, h, w]
+      concat/flatten order all match get_frequencies exactly (get_1d_rotary_pos_embed
+      is the shared building block), so the returned array is fed to the same
+      FlaxWanAttention._apply_rope as the normal rotary embedding.
+
+  Returns a complex array shaped [1, 1, f*h*w, head_dim//2] (same layout as
+  WanRotaryPosEmbed.__call__).
+  """
+  t_pos = jnp.arange(f, dtype=jnp.float32) * 2 + 0.5
+  h_pos = jnp.arange(h, dtype=jnp.float32) * 2
+  w_pos = jnp.arange(w, dtype=jnp.float32) * 2
+
+  h_dim = w_dim = 2 * (attention_head_dim // 6)
+  t_dim = attention_head_dim - h_dim - w_dim
+
+  f_freq = get_1d_rotary_pos_embed(t_dim, t_pos, theta, freqs_dtype=jnp.float32, use_real=False)  # [f, t_dim//2]
+  h_freq = get_1d_rotary_pos_embed(h_dim, h_pos, theta, freqs_dtype=jnp.float32, use_real=False)  # [h, h_dim//2]
+  w_freq = get_1d_rotary_pos_embed(w_dim, w_pos, theta, freqs_dtype=jnp.float32, use_real=False)  # [w, w_dim//2]
+
+  freqs_f = jnp.broadcast_to(f_freq[:, None, None, :], (f, h, w, f_freq.shape[-1]))
+  freqs_h = jnp.broadcast_to(h_freq[None, :, None, :], (f, h, w, h_freq.shape[-1]))
+  freqs_w = jnp.broadcast_to(w_freq[None, None, :, :], (f, h, w, w_freq.shape[-1]))
+
+  freqs_concat = jnp.concatenate([freqs_f, freqs_h, freqs_w], axis=-1)
+  freqs_final = jnp.reshape(freqs_concat, (1, 1, f * h * w, -1))
+  return freqs_final
+
+
 class WanRotaryPosEmbed(nnx.Module):
 
   def __init__(
@@ -501,8 +548,13 @@ class WanTransformerBlock(nnx.Module):
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
       v2v_concat: bool = False,
+      hydra: bool = False,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    # V2V-2a: gate HyDRA memory-encoding self-attention. Only the SELF-attention
+    # (attn1, HyDRA's self_attn) participates; the cross-attention (attn2) is
+    # unchanged. Default False => strict no-op.
+    self.hydra = hydra
 
     # 1. Self-attention
     self.norm1 = FP32LayerNorm(rngs=rngs, dim=dim, eps=eps, elementwise_affine=False)
@@ -530,6 +582,7 @@ class WanTransformerBlock(nnx.Module):
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_target_modules=lora_target_modules,
+        hydra=hydra,
     )
 
     # 1. Cross-attention
@@ -717,6 +770,10 @@ class WanTransformerBlock(nnx.Module):
               rotary_emb=rotary_emb,
               deterministic=deterministic,
               rngs=rngs,
+              # V2V-2a: HyDRA memory-encoding needs the (F, H, W) grid to reshape
+              # the flat token sequence into a 3D volume for the MemoryTokenizer.
+              # None (the default) unless hydra=True => strict no-op otherwise.
+              grid_thw=grid_thw if self.hydra else None,
           )
         if self.v2v_concat:
           # V2V-1a projector wraps the self-attention output (HyDRA:575).
@@ -807,6 +864,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       in_dim_control_adapter: int = 24,
       downscale_factor_control_adapter: int = 8,
       v2v_concat: bool = False,
+      hydra: bool = False,
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
@@ -817,6 +875,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     self.scan_layers = scan_layers
     self.enable_jax_named_scopes = enable_jax_named_scopes
     self.v2v_concat = v2v_concat
+    self.hydra = hydra
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -898,6 +957,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           lora_alpha=lora_alpha,
           lora_target_modules=lora_target_modules,
           v2v_concat=v2v_concat,
+          hydra=hydra,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -930,6 +990,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
             v2v_concat=v2v_concat,
+            hydra=hydra,
         )
         blocks.append(block)
       self.blocks = nnx.data(blocks)

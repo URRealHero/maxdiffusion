@@ -677,6 +677,35 @@ def init_wan_v2v_params(eval_shapes: dict):
   return out
 
 
+def init_wan_hydra_params(eval_shapes: dict, seed: int = 0):
+  """Fresh init for V2V-2a HyDRA MemoryTokenizer conv params, which are NOT in the
+  base checkpoint (so eval_shape leaves them abstract). Mirrors flax nnx.Conv defaults:
+  kernel lecun-normal (fan_in = prod(kernel_spatial) * in_features on the last-but-one
+  axis), bias zeros. Handles scan-stacked ([num_layers, ...]) and per-layer shapes.
+  Returns {flat_path_tuple: jnp.array} matching the model param dict.
+  """
+  out = {}
+  key = jax.random.key(seed)
+  for orig_path, shaped in flatten_dict(eval_shapes).items():
+    sp = tuple(str(p) for p in orig_path)
+    if "tokenizer" not in sp:
+      continue
+    shape = shaped.shape
+    if sp[-1] == "kernel":
+      # nnx.Conv 3D kernel: [(L,) kf, kh, kw, in, out]. lecun_normal => N(0, 1/fan_in)
+      # with fan_in = kf*kh*kw*in (the 4 dims before the trailing out-channels; a
+      # leading scan/layers axis, if present, is excluded by the -5:-1 slice).
+      key, sub = jax.random.split(key)
+      fan_in = 1
+      for d in shape[-5:-1]:
+        fan_in *= d
+      std = (1.0 / fan_in) ** 0.5
+      out[orig_path] = jax.random.normal(sub, shape, dtype=jnp.float32) * std
+    else:  # bias -> zeros
+      out[orig_path] = jnp.zeros(shape, dtype=jnp.float32)
+  return out
+
+
 def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, num_layers: int = 30):
   """Load a DiffSynth/CS LoRA safetensors into a flax LoRA param dict.
 

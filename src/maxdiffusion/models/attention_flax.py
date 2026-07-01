@@ -1335,6 +1335,44 @@ class AttentionOp(nn.Module):
     )
 
 
+class MemoryTokenizer(nnx.Module):
+  """HyDRA MemoryTokenizer (V2V-2a): a strided 3D conv that compresses the
+  (F, H, W) token grid by 2x on each axis before it is used as memory keys/values.
+
+  Faithful JAX/flax.nnx port of HyDRA's ``MemoryTokenizer``
+  (HyDRA/diffsynth/models/wan_video_dit.py:213-219):
+      self.conv = nn.Conv3d(dim, dim, kernel_size=(2,2,2), stride=(2,2,2))
+  We use the repo's (2, 2, 2) kernel/stride (the paper describes 2x4x4; we follow
+  the repo). Layout differs from torch: torch Conv3d is NCHW-style [B, C, F, H, W],
+  whereas flax nnx.Conv is channel-last [B, F, H, W, C]. padding='VALID' reproduces
+  torch's default zero-padding=0 (each even axis -> exactly axis//2).
+  """
+
+  def __init__(
+      self,
+      dim: int,
+      rngs: nnx.Rngs,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.conv = nnx.Conv(
+        in_features=dim,
+        out_features=dim,
+        kernel_size=(2, 2, 2),
+        strides=(2, 2, 2),
+        padding="VALID",
+        rngs=rngs,
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+    )
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    # x: [B, F, H, W, dim] -> [B, F//2, H//2, W//2, dim]
+    return self.conv(x)
+
+
 class FlaxWanAttention(nnx.Module):
 
   def __init__(
@@ -1373,6 +1411,7 @@ class FlaxWanAttention(nnx.Module):
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
+      hydra: bool = False,
   ):
     if attention_kernel in {"flash", "cudnn_flash_te"} and mesh is None:
       raise ValueError(f"The flash attention kernel requires a value for mesh, but mesh is {self.mesh}")
@@ -1381,6 +1420,8 @@ class FlaxWanAttention(nnx.Module):
     self.inner_dim = dim_head * heads
     scale = dim_head**-0.5
     self.qk_norm = qk_norm
+    # V2V-2a HyDRA memory-encoding gate. Only meaningful for self-attention.
+    self.hydra = bool(hydra) and is_self_attention
     self.query_axis_names = query_axis_names
     self.key_axis_names = key_axis_names
     self.value_axis_names = value_axis_names
@@ -1572,6 +1613,19 @@ class FlaxWanAttention(nnx.Module):
           ),
       )
 
+    # V2V-2a: HyDRA MemoryTokenizer (fresh-init; NOT in the base checkpoint). Built
+    # only for self-attention when hydra=True; otherwise nnx.data(None) so no memory
+    # params exist and the forward is byte-for-byte the baseline.
+    self.tokenizer = nnx.data(None)
+    if self.hydra:
+      self.tokenizer = MemoryTokenizer(
+          dim=self.inner_dim,
+          rngs=rngs,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+
   def _apply_rope(self, xq: jax.Array, xk: jax.Array, freqs_cis: jax.Array) -> Tuple[jax.Array, jax.Array]:
     # 1. Extract cos and sin, keeping them in native bfloat16
     cos = jnp.real(freqs_cis).astype(xq.dtype)
@@ -1602,6 +1656,94 @@ class FlaxWanAttention(nnx.Module):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
 
+  def _hydra_memory_encode(self, hidden_states, rotary_emb, grid_thw):
+    """V2V-2a memory-encoding: JAX/flax port of HyDRA SelfAttention.forward's hydra
+    (sparse_frame) branch (HyDRA/diffsynth/models/wan_video_dit.py:448-487).
+
+    Returns the per-head, rope'd tensors + frame similarity consumed (in V2V-2b) by
+    DynamicRetrievalAttention:
+      q, k, v        : [B, heads, F*H*W, head_dim]        (q/k rope'd with normal freqs)
+      k_comp, v_comp : [B, heads, F'*H'*W', head_dim]     (k_comp rope'd with compressed freqs)
+      similarity     : [B, F, F']                          (mean-pooled per-frame q . k_comp)
+      freqs_comp     : [1, 1, F'*H'*W', head_dim//2]       (compressed 3D RoPE)
+    """
+    from maxdiffusion.models.wan.transformers.transformer_wan import get_compressed_frequencies
+
+    f, h, w = grid_thw
+    B, _, C = hidden_states.shape
+
+    # --- main q/k/v on the full sequence (HyDRA: q=norm_q(q(x)), k=norm_k(k(x)), v=v(x)) ---
+    q = self.query(hidden_states)
+    if self.lora_q is not None:
+      q = q + self.lora_q(hidden_states)
+    k = self.key(hidden_states)
+    if self.lora_k is not None:
+      k = k + self.lora_k(hidden_states)
+    v = self.value(hidden_states)
+    if self.lora_v is not None:
+      v = v + self.lora_v(hidden_states)
+    if self.qk_norm:
+      q = self.norm_q(q)
+      k = self.norm_k(k)
+
+    # --- compressed memory tokens via MemoryTokenizer (2x2x2 strided 3D conv) ---
+    # HyDRA: x_3d = rearrange(x, 'b (f h w) c -> b c f h w'); here flax is channel-last.
+    x_3d = hidden_states.reshape(B, f, h, w, C)  # [B, F, H, W, C]
+    x_token = self.tokenizer(x_3d)  # [B, F', H', W', C]
+    f2, h2, w2 = x_token.shape[1], x_token.shape[2], x_token.shape[3]
+    x_token_flat = x_token.reshape(B, f2 * h2 * w2, C)
+
+    # REUSE self.key/self.value/self.norm_k for the compressed tokens exactly as
+    # HyDRA reuses self.k/self.v/self.norm_k for both the main and memory branches.
+    k_comp = self.key(x_token_flat)
+    if self.lora_k is not None:
+      k_comp = k_comp + self.lora_k(x_token_flat)
+    v_comp = self.value(x_token_flat)
+    if self.lora_v is not None:
+      v_comp = v_comp + self.lora_v(x_token_flat)
+    if self.qk_norm:
+      k_comp = self.norm_k(k_comp)
+
+    # --- compressed 3D RoPE for the downsampled grid ---
+    freqs_comp = get_compressed_frequencies(self.dim_head, f2, h2, w2)
+
+    # --- frame-level similarity: mean-pool over (H, W) then q_frame . k_comp_frame^T ---
+    # HyDRA operates on the FULL inner_dim here (frame-level, not per-head).
+    q_frame_repr = q.reshape(B, f, h, w, C).mean(axis=3).mean(axis=2)  # [B, F, C]
+    k_comp_frame_repr = k_comp.reshape(B, f2, h2, w2, C).mean(axis=3).mean(axis=2)  # [B, F', C]
+    similarity = jnp.matmul(q_frame_repr, jnp.swapaxes(k_comp_frame_repr, -2, -1))  # [B, F, F']
+
+    # --- apply rope: q,k get the normal freqs; k_comp gets the compressed freqs ---
+    q = _unflatten_heads(q, self.heads)  # [B, heads, F*H*W, head_dim]
+    k = _unflatten_heads(k, self.heads)
+    v = _unflatten_heads(v, self.heads)
+    q, k = self._apply_rope(q, k, rotary_emb)
+    k_comp = _unflatten_heads(k_comp, self.heads)  # [B, heads, F'*H'*W', head_dim]
+    v_comp = _unflatten_heads(v_comp, self.heads)
+    # _apply_rope rotates both of its args with the same freqs; feed k_comp twice and keep one.
+    _, k_comp = self._apply_rope(k_comp, k_comp, freqs_comp)
+
+    return q, k, v, k_comp, v_comp, similarity, freqs_comp
+
+  def _hydra_forward(self, hidden_states, rotary_emb, grid_thw, dtype, deterministic, rngs):
+    """V2V-2a self-attention forward. Runs the HyDRA memory-encoding, then STOPS:
+    DynamicRetrievalAttention (V2V-2b) is not yet ported, so we fall back to standard
+    dense attention over the rope'd main q/k/v (k_comp/v_comp/similarity are computed
+    for shape correctness but not consumed here). Output matches the standard
+    self-attention path's shape and post-processing (proj_attn + optional o-LoRA)."""
+    q, k, v, _k_comp, _v_comp, _similarity, _freqs_comp = self._hydra_memory_encode(hidden_states, rotary_emb, grid_thw)
+    with jax.named_scope("apply_attention"):
+      attn_output = self.attention_op.apply_attention(q, k, v, attention_mask=None)
+    attn_output = attn_output.astype(dtype=dtype)
+    attn_output = checkpoint_name(attn_output, "attn_output")
+    with jax.named_scope("proj_attn"):
+      hidden_states = self.proj_attn(attn_output)
+      if self.lora_o is not None:
+        hidden_states = hidden_states + self.lora_o(attn_output)
+      if self.drop_out.rate > 0:
+        hidden_states = self.drop_out(hidden_states, deterministic=deterministic, rngs=rngs)
+    return hidden_states
+
   def __call__(
       self,
       hidden_states: jax.Array,
@@ -1611,6 +1753,7 @@ class FlaxWanAttention(nnx.Module):
       deterministic: bool = True,
       rngs: nnx.Rngs = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      grid_thw: Optional[Tuple[int, int, int]] = None,
   ) -> jax.Array:
     axis_names = nn.logical_to_mesh_axes((BATCH, LENGTH, HEAD))
     hidden_states = jax.lax.with_sharding_constraint(hidden_states, axis_names)
@@ -1619,6 +1762,12 @@ class FlaxWanAttention(nnx.Module):
     is_self_attention = encoder_hidden_states is None
     if encoder_hidden_states is None:
       encoder_hidden_states = hidden_states
+
+    # V2V-2a: HyDRA memory-encoding self-attention path. Gated by self.hydra
+    # (self-attention only) + the presence of grid_thw/rotary_emb. When hydra=False
+    # this branch is never entered, so the baseline is byte-for-byte unchanged.
+    if self.hydra and is_self_attention and grid_thw is not None and rotary_emb is not None:
+      return self._hydra_forward(hidden_states, rotary_emb, grid_thw, dtype, deterministic, rngs)
 
     is_i2v_cross_attention = self.added_kv_proj_dim is not None and not is_self_attention
 

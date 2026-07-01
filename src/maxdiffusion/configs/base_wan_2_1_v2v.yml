@@ -36,6 +36,13 @@ model_type: 'T2V'
 # frame-concat of a conditioning clip and a target clip along the latent-frame axis.
 v2v_concat: True
 
+# V2V-2a HyDRA memory: when True, each self-attention adds a MemoryTokenizer
+# (Conv3d 2x2x2) + compressed k/v + frame similarity (retrieval attention = V2V-2b).
+# Default False -> pure baseline. NOTE: context parallelism (ici_context>1) hangs with
+# attention='flash' but works with attention='ulysses' (heads % ici_context == 0);
+# see CONTEXT_PARALLEL_DEADLOCK.md.
+hydra: False
+
 # V2V-1c partial fine-tune: only params whose path contains one of these
 # comma-separated substrings are trained; everything else is frozen via
 # optax.set_to_zero (HyDRA _freeze_and_mark_trainables). maxdiffusion names the

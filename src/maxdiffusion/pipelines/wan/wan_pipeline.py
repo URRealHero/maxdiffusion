@@ -219,6 +219,8 @@ def create_sharded_logical_transformer(
   # V2V-1a per-block camera injection (HyDRA baseline). Threaded here so
   # config.v2v_concat reaches WanModel; defaults False (existing configs unaffected).
   wan_config["v2v_concat"] = bool(getattr(config, "v2v_concat", wan_config.get("v2v_concat", False)))
+  # V2V-2a HyDRA memory-encoding self-attention. Defaults False (existing configs unaffected).
+  wan_config["hydra"] = bool(getattr(config, "hydra", wan_config.get("hydra", False)))
   # Camera-control adapter + Fun checkpoint channel overrides.
   wan_config["add_control_adapter"] = bool(getattr(config, "add_control_adapter", wan_config.get("add_control_adapter", False)))
   wan_config["in_dim_control_adapter"] = int(getattr(config, "in_dim_control_adapter", wan_config.get("in_dim_control_adapter", 24)))
@@ -289,6 +291,14 @@ def create_sharded_logical_transformer(
       from ...models.wan.wan_utils import init_wan_v2v_params
       flat_params = flax.traverse_util.flatten_dict(params)
       flat_params.update(init_wan_v2v_params(eval_lora_shapes))
+      params = flax.traverse_util.unflatten_dict(flat_params)
+
+    # V2V-2a HyDRA MemoryTokenizer conv params are NOT in the base checkpoint either;
+    # fresh-init them here (kernel lecun-normal, bias zeros) when hydra=True.
+    if bool(wan_config.get("hydra", False)):
+      from ...models.wan.wan_utils import init_wan_hydra_params
+      flat_params = flax.traverse_util.flatten_dict(params)
+      flat_params.update(init_wan_hydra_params(eval_lora_shapes, seed=int(getattr(config, "seed", 0))))
       params = flax.traverse_util.unflatten_dict(flat_params)
 
   params = jax.tree_util.tree_map_with_path(
