@@ -41,6 +41,20 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--condition-video-field", default="cond_video")
   parser.add_argument("--target-video-field", default="tgt_video")
   parser.add_argument("--condition-output-field", default="cond_latents")
+  parser.add_argument(
+      "--with-camera",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Also emit HyDRA-convention cam_emb_con/cam_emb_tgt [N_lat,12] from each sample's "
+      "camera.json (relative to the TARGET frame-0 pose). Missing/bad camera.json is logged + "
+      "skipped per-sample (the record is still encoded). Disable with --no-with-camera.",
+  )
+  parser.add_argument(
+      "--camera-field",
+      default="camera",
+      help="Manifest field holding the camera.json path. If absent from a record, the path is "
+      "derived as <target_video_dir>/camera.json.",
+  )
   parser.add_argument("--height", type=int, default=None)
   parser.add_argument("--width", type=int, default=None)
   parser.add_argument("--num-frames", type=int, default=None)
@@ -373,7 +387,100 @@ def serialize_tensor(array: np.ndarray) -> bytes:
   return tf.io.serialize_tensor(tf.convert_to_tensor(array, dtype=tf.float32)).numpy()
 
 
-def make_example(latent: np.ndarray, cond_latent: np.ndarray, hidden_state: np.ndarray, condition_output_field: str) -> bytes:
+def _apply_coordinate_transform(c2w: np.ndarray) -> np.ndarray:
+  """HyDRA _apply_coordinate_transform (infer_hydra.py): Unreal-world c2w (cm) ->
+  HyDRA camera-convention c2w (m). Permute columns [1,2,0,3], flip Y, cm->m."""
+  np = load_numpy()
+  t = np.array(c2w, dtype=np.float64)
+  t = t[:, [1, 2, 0, 3]]
+  t[:3, 1] *= -1.0
+  t[:3, 3] /= 100.0
+  return t
+
+
+def _cam_dict_to_pose_list(cam_dict: dict, name: str, num_frames: int) -> list:
+  """Read {"0":4x4, ..., "N-1":4x4} into an ordered list of 4x4 c2w arrays, padded to
+  num_frames by repeating the last available pose (mirrors last-frame video padding in
+  sample_frames)."""
+  np = load_numpy()
+  n_avail = len(cam_dict)
+  mats = []
+  for i in range(n_avail):
+    key = str(i)
+    if key not in cam_dict:
+      raise ValueError(f"{name} missing key {key!r}")
+    m = np.asarray(cam_dict[key], dtype=np.float64)
+    if m.shape != (4, 4):
+      raise ValueError(f"{name}[{key}] must be [4,4], got {tuple(m.shape)}")
+    mats.append(m)
+  if not mats:
+    raise ValueError(f"{name} is empty")
+  if num_frames > n_avail:
+    mats.extend([mats[-1]] * (num_frames - n_avail))
+  return mats
+
+
+def load_hydra_cam_emb(camera_json_path: str, num_frames: int):
+  """Compute HyDRA-convention relative camera embeddings from a HM-World camera.json.
+
+  Replicates infer_hydra.py _apply_coordinate_transform + _compute_relative EXACTLY:
+    cam_idx = list(range(num_frames))[::4]              # N_lat indices (77 -> 20, 81 -> 21)
+    ref_c2w = transform(tgt_cam[0]); ref_w2c = inv(ref_c2w)
+    for each stream (cond, tgt), each idx: rel = ref_w2c @ transform(pose[idx]);
+                                           append rel[:3,:4].reshape(-1)  # (12,)
+  BOTH streams are made relative to the TARGET frame-0 pose. Returns
+  (cam_emb_con[N_lat,12], cam_emb_tgt[N_lat,12]) float32.
+  """
+  np = load_numpy()
+  import tensorflow as tf
+
+  with tf.io.gfile.GFile(camera_json_path, "r") as f:
+    data = json.load(f)
+  if "cond_cam" not in data or "tgt_cam" not in data:
+    raise ValueError(f"camera.json missing cond_cam/tgt_cam: {camera_json_path}")
+
+  cond_poses = _cam_dict_to_pose_list(data["cond_cam"], "cond_cam", num_frames)
+  tgt_poses = _cam_dict_to_pose_list(data["tgt_cam"], "tgt_cam", num_frames)
+
+  cam_idx = list(range(num_frames))[::4]  # HyDRA range(77)[::4] -> 20
+  ref_c2w = _apply_coordinate_transform(tgt_poses[0])
+  ref_w2c = np.linalg.inv(ref_c2w)
+
+  def to_rel(poses):
+    rel_list = []
+    for idx in cam_idx:
+      c2w = _apply_coordinate_transform(poses[idx])
+      rel = ref_w2c @ c2w
+      rel_list.append(rel[:3, :4].reshape(-1))
+    return np.stack(rel_list, axis=0).astype(np.float32)  # [N_lat, 12]
+
+  cam_emb_con = to_rel(cond_poses)
+  cam_emb_tgt = to_rel(tgt_poses)
+  if not (np.isfinite(cam_emb_con).all() and np.isfinite(cam_emb_tgt).all()):
+    raise ValueError(f"nonfinite cam_emb from {camera_json_path}")
+  return cam_emb_con, cam_emb_tgt
+
+
+def resolve_camera_uri(record: dict, camera_field: str, target_video_field: str, condition_video_field: str) -> str | None:
+  """camera.json path from the manifest camera_field if present, else derived from the
+  target (or condition) video's directory as <video_dir>/camera.json."""
+  cam = record.get(camera_field)
+  if cam:
+    return str(cam)
+  video = record.get(target_video_field) or record.get(condition_video_field)
+  if not video:
+    return None
+  return str(video).rsplit("/", 1)[0] + "/camera.json"
+
+
+def make_example(
+    latent: np.ndarray,
+    cond_latent: np.ndarray,
+    hidden_state: np.ndarray,
+    condition_output_field: str,
+    cam_emb_con: np.ndarray | None = None,
+    cam_emb_tgt: np.ndarray | None = None,
+) -> bytes:
   load_numpy()
   import tensorflow as tf
 
@@ -382,6 +489,9 @@ def make_example(latent: np.ndarray, cond_latent: np.ndarray, hidden_state: np.n
       condition_output_field: bytes_feature(serialize_tensor(cond_latent)),
       "encoder_hidden_states": bytes_feature(serialize_tensor(hidden_state)),
   }
+  if cam_emb_con is not None and cam_emb_tgt is not None:
+    features["cam_emb_con"] = bytes_feature(serialize_tensor(cam_emb_con))
+    features["cam_emb_tgt"] = bytes_feature(serialize_tensor(cam_emb_tgt))
   return tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()
 
 
@@ -589,7 +699,8 @@ def main() -> int:
       target_videos = []
       condition_videos = []
       prompts = []
-      for _, _, record in records:
+      cam_embs = []
+      for _, sample_id, record in records:
         target_uri = record.get(args.target_video_field)
         condition_uri = record.get(args.condition_video_field)
         caption = record.get(args.caption_field)
@@ -608,35 +719,59 @@ def main() -> int:
         )
         prompts.append(str(caption))
 
+        # HyDRA camera embeddings are OPTIONAL: a missing/bad camera.json is logged and
+        # skipped for this sample only, so the record is still encoded (no crash).
+        cam_emb_con = cam_emb_tgt = None
+        if args.with_camera:
+          camera_uri = resolve_camera_uri(
+              record, args.camera_field, args.target_video_field, args.condition_video_field
+          )
+          if not camera_uri:
+            print(f"camera skipped for sample_id={sample_id}: no camera path resolvable", flush=True)
+          else:
+            try:
+              cam_emb_con, cam_emb_tgt = load_hydra_cam_emb(camera_uri, num_frames)
+            except Exception as cam_exc:  # noqa: BLE001 - never fail the record on camera
+              cam_emb_con = cam_emb_tgt = None
+              print(f"camera skipped for sample_id={sample_id}: {cam_exc}", flush=True)
+        cam_embs.append((cam_emb_con, cam_emb_tgt))
+
       target_array = np.concatenate(target_videos, axis=0)
       condition_array = np.concatenate(condition_videos, axis=0)
       latents = encode_videos(pipeline, target_array)
       cond_latents = encode_videos(pipeline, condition_array)
       hidden_states = encode_prompts(pipeline, prompts, args.max_sequence_length)
 
-      encoded_records = list(zip(records, latents, cond_latents, hidden_states))
-      for (_, sample_id, _), latent, cond_latent, hidden_state in encoded_records:
+      encoded_records = list(zip(records, latents, cond_latents, hidden_states, cam_embs))
+      for (_, sample_id, _), latent, cond_latent, hidden_state, _ in encoded_records:
         assert_finite_encoded_record(sample_id, latent, cond_latent, hidden_state)
 
-      for (_, sample_id, record), latent, cond_latent, hidden_state in encoded_records:
-        writer.write(make_example(latent, cond_latent, hidden_state, args.condition_output_field))
-        metadata_writer.write(
-            {
-                "sample_id": sample_id,
-                "caption": record.get(args.caption_field),
-                "target_video": record.get(args.target_video_field),
-                "condition_video": record.get(args.condition_video_field),
-                "latent_shape": list(latent.shape),
-                "condition_latent_shape": list(cond_latent.shape),
-                "encoder_hidden_states_shape": list(hidden_state.shape),
-                "height": height,
-                "width": width,
-                "num_frames": num_frames,
-                "process_index": process_index,
-                "tfrec_path": writer.current_path,
-            },
+      for (_, sample_id, record), latent, cond_latent, hidden_state, (cam_emb_con, cam_emb_tgt) in encoded_records:
+        writer.write(
+            make_example(
+                latent, cond_latent, hidden_state, args.condition_output_field, cam_emb_con, cam_emb_tgt
+            )
         )
-        print(f"encoded sample_id={sample_id} latent_shape={latent.shape}", flush=True)
+        meta = {
+            "sample_id": sample_id,
+            "caption": record.get(args.caption_field),
+            "target_video": record.get(args.target_video_field),
+            "condition_video": record.get(args.condition_video_field),
+            "latent_shape": list(latent.shape),
+            "condition_latent_shape": list(cond_latent.shape),
+            "encoder_hidden_states_shape": list(hidden_state.shape),
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "process_index": process_index,
+            "tfrec_path": writer.current_path,
+        }
+        if cam_emb_con is not None and cam_emb_tgt is not None:
+          meta["cam_emb_con_shape"] = list(cam_emb_con.shape)
+          meta["cam_emb_tgt_shape"] = list(cam_emb_tgt.shape)
+        metadata_writer.write(meta)
+        cam_note = "" if cam_emb_con is None else f" cam_emb={cam_emb_con.shape}"
+        print(f"encoded sample_id={sample_id} latent_shape={latent.shape}{cam_note}", flush=True)
 
     def flush_batch_or_split(records, label: str) -> None:
       try:
