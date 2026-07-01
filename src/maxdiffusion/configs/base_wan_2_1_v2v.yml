@@ -36,6 +36,15 @@ model_type: 'T2V'
 # frame-concat of a conditioning clip and a target clip along the latent-frame axis.
 v2v_concat: True
 
+# V2V-1c partial fine-tune: only params whose path contains one of these
+# comma-separated substrings are trained; everything else is frozen via
+# optax.set_to_zero (HyDRA _freeze_and_mark_trainables). maxdiffusion names the
+# self-attention module `attn1` (HyDRA's `self_attn`). Empty => full fine-tune.
+v2v_trainable_param_substrings: "cam_encoder_con,cam_encoder_tgt,projector,attn1"
+# When True (with v2v_trainable_param_substrings set), checkpoints save ONLY the
+# trainable params; the frozen Wan2.1 base is restored + adapters overlaid on load.
+save_lora_only: False
+
 # Overrides the transformer from pretrained_model_name_or_path
 wan_transformer_pretrained_model_name_or_path: ''
 
