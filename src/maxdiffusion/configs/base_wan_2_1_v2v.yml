@@ -378,6 +378,26 @@ num_inference_steps: 30
 fps: 16
 save_final_checkpoint: False
 
+# ---------------------------------------------------------------------------
+# V2V-1e generation (src/maxdiffusion/generate_wan_v2v.py).
+# JAX port of HyDRA inference: given a conditioning clip (latents) + camera
+# (cam_emb_con/tgt) + text, seed the cond half CLEAN and iteratively denoise the
+# tgt half (FlowMatch scheduler), then VAE-decode the tgt clip. Inverse of the
+# training loss (wan_v2v_concat_trainer.v2v_concat_loss). Works for BOTH the
+# baseline (hydra=False) and hydra (hydra=True) models via the `hydra` flag; the
+# trained checkpoint is loaded via the training checkpoint path (checkpoint_dir).
+#
+# For the plumbing smoke, inputs come from ONE record of a -hydra-style-camera
+# tfrecord (cond_latents + cam_emb_con/tgt + encoder_hidden_states already
+# encoded), so the VAE encoder is not needed -- only the VAE DECODE at the end.
+# If v2v_record_tfrecord is empty, the first .tfrec under train_data_dir is used.
+v2v_record_tfrecord: ''
+v2v_record_index: 0
+v2v_output_video_name: 'v2v_output.mp4'
+# When True, run + print the V2V-1e plumbing gate checks (checkpoint load /
+# denoise-half finite / decode shape+range / cond-half-clean).
+v2v_gen_gate_checks: True
+
 # SDXL Lightning parameters
 lightning_from_pt: True
 # Empty or "ByteDance/SDXL-Lightning" to enable lightning.
