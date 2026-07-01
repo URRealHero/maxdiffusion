@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 import jaxopt
+import numpy as np
 import optax
 import tensorflow as tf
 from flax import nnx
@@ -251,6 +252,99 @@ def v2v_concat_loss(model, batch, noise_rng, dropout_rng, timesteps, scheduler, 
   return loss
 
 
+# ---------------------------------------------------------------------------
+# Camera-from-camera.json FALLBACK (used only when the tfrec has no cam_emb_*).
+#
+# Self-contained replica of tpu_tfrecord_encoder.encode_tv2v.load_hydra_cam_emb
+# (verified bit-exact against the re-encoded tv2v cam_emb: max|diff|=0). Kept
+# here so the trainer has no import dependency on the encoder package at train
+# time. Reads camera.json via tf.io.gfile (works for local and gs:// paths).
+# ---------------------------------------------------------------------------
+# Where to find <sample_id>/camera.json when the fallback fires. Overridable via
+# config keys v2v_camera_json_local_root / v2v_camera_json_gcs_root.
+V2V_CAMERA_JSON_LOCAL_ROOT = "/data-2u-2/spu/HM-World"
+V2V_CAMERA_JSON_GCS_ROOT = "gs://data_us_central1_a/hmworld_raw/HM-World/HM-World"
+
+
+def _v2v_apply_coordinate_transform(c2w):
+  """Unreal-world c2w (cm) -> HyDRA camera-convention c2w (m): permute columns
+  [1,2,0,3], flip Y, cm->m (encode_tv2v._apply_coordinate_transform)."""
+  t = np.array(c2w, dtype=np.float64)
+  t = t[:, [1, 2, 0, 3]]
+  t[:3, 1] *= -1.0
+  t[:3, 3] /= 100.0
+  return t
+
+
+def _v2v_load_hydra_cam_emb(camera_json_path, num_frames):
+  """Compute HyDRA-convention relative camera embeddings from a HM-World
+  camera.json (both streams relative to the TARGET frame-0 pose). num_frames is
+  the RAW frame count (e.g. 77); cam_idx = range(num_frames)[::4] -> N_lat rows.
+  Returns (cam_emb_con[N_lat,12], cam_emb_tgt[N_lat,12]) float32."""
+  with tf.io.gfile.GFile(camera_json_path, "r") as f:
+    data = json.load(f)
+  if "cond_cam" not in data or "tgt_cam" not in data:
+    raise ValueError(f"camera.json missing cond_cam/tgt_cam: {camera_json_path}")
+
+  def poses(key):
+    d = data[key]
+    n = len(d)
+    mats = [np.asarray(d[str(i)], dtype=np.float64) for i in range(n)]
+    if not mats:
+      raise ValueError(f"{key} empty in {camera_json_path}")
+    if num_frames > n:  # pad by repeating last pose (mirrors last-frame video pad)
+      mats.extend([mats[-1]] * (num_frames - n))
+    return mats
+
+  cond_poses = poses("cond_cam")
+  tgt_poses = poses("tgt_cam")
+  cam_idx = list(range(num_frames))[::4]
+  ref_w2c = np.linalg.inv(_v2v_apply_coordinate_transform(tgt_poses[0]))
+
+  def to_rel(ps):
+    return np.stack(
+        [(ref_w2c @ _v2v_apply_coordinate_transform(ps[i]))[:3, :4].reshape(-1) for i in cam_idx],
+        axis=0,
+    ).astype(np.float32)
+
+  con = to_rel(cond_poses)
+  tgt = to_rel(tgt_poses)
+  if not (np.isfinite(con).all() and np.isfinite(tgt).all()):
+    raise ValueError(f"nonfinite cam_emb from {camera_json_path}")
+  return con, tgt
+
+
+def _v2v_cam_from_json(sample_id, n_lat, local_root, gcs_root):
+  """tf.py_function body: locate <sample_id>/camera.json (local root first, then
+  GCS) and compute cam_emb_con/tgt for N_lat latent frames. num_frames for the
+  derivation = 4*(N_lat-1)+1 (20 latent -> 77 raw)."""
+  sid = sample_id.numpy().decode("utf-8") if hasattr(sample_id, "numpy") else str(sample_id)
+  if not sid:
+    raise ValueError(
+        "V2V camera fallback: record has NO cam_emb_con/tgt in the tfrec AND no "
+        "`sample_id` tfrec feature, so camera.json cannot be located. Re-encode the "
+        "data with `--with-camera`, or add a `sample_id` feature to the encoder."
+    )
+  n = int(n_lat.numpy()) if hasattr(n_lat, "numpy") else int(n_lat)
+  num_frames = 4 * (n - 1) + 1
+  local_root = local_root.numpy().decode("utf-8") if hasattr(local_root, "numpy") else str(local_root)
+  gcs_root = gcs_root.numpy().decode("utf-8") if hasattr(gcs_root, "numpy") else str(gcs_root)
+  local_path = f"{local_root.rstrip('/')}/{sid}/camera.json"
+  gcs_path = f"{gcs_root.rstrip('/')}/{sid}/camera.json"
+  path = local_path if tf.io.gfile.exists(local_path) else gcs_path
+  con, tgt = _v2v_load_hydra_cam_emb(path, num_frames)
+  return con, tgt
+
+
+def _v2v_cam_missing_error(sample_id):
+  """tf.py_function body for the fallback-disabled branch: fail loudly."""
+  sid = sample_id.numpy().decode("utf-8") if hasattr(sample_id, "numpy") else str(sample_id)
+  raise ValueError(
+      f"V2V record (sample_id={sid!r}) has no cam_emb_con/tgt in the tfrec and "
+      "v2v_camera_from_json_fallback=False. Enable the fallback or re-encode with --with-camera."
+  )
+
+
 class WanV2VConcatTrainer(WanTrainer):
   """Fine-tunes Wan2.1-T2V-1.3B with the V2V-1a per-block camera scaffold, on
   frame-concat (cond|tgt) latents, training only the camera/projector/self-attn
@@ -281,21 +375,89 @@ class WanV2VConcatTrainer(WanTrainer):
           "V2V training only supports dataset_type=tfrecord with cache_latents_text_encoder_outputs=True"
       )
 
+    # REAL WAN2.1 tv2v tfrecord schema (verified against a live record in
+    # gs://data_us_central1_a/hmworld_data/wan_2_1/tv2v_encoded_full-hydra-style-camera):
+    #   float feature `latents`               [16, N_lat, h, w]  -> internal tgt_latents
+    #   float feature `cond_latents`          [16, N_lat, h, w]  -> internal cond_latents
+    #   float feature `encoder_hidden_states` [512, 4096]
+    #   float feature `cam_emb_con`/`cam_emb_tgt` [N_lat, 12]  (present ONLY in the
+    #     --with-camera re-encode; ABSENT in older camera-less encodes)
+    # The encoder writes NO `sample_id` tfrec feature (it lives only in the metadata
+    # sidecar jsonl), so the camera.json fallback below can only locate a camera.json
+    # if a future encoder emits a `sample_id` feature.
+    #
+    # The OLD (pre-fix) loader read a feature named `tgt_latents`, which does NOT
+    # exist (the encoder writes `latents`), and required cam_emb_* unconditionally.
+    # Legacy singular aliases (`latent` / `condition_latent`) are also accepted so
+    # the loader is robust to either encoder naming convention.
+    cam_fallback = bool(getattr(config, "v2v_camera_from_json_fallback", True))
+    cam_local_root = str(getattr(config, "v2v_camera_json_local_root", V2V_CAMERA_JSON_LOCAL_ROOT))
+    cam_gcs_root = str(getattr(config, "v2v_camera_json_gcs_root", V2V_CAMERA_JSON_GCS_ROOT))
+
     feature_description = {
-        "cond_latents": tf.io.FixedLenFeature([], tf.string),
-        "tgt_latents": tf.io.FixedLenFeature([], tf.string),
-        "cam_emb_con": tf.io.FixedLenFeature([], tf.string),
-        "cam_emb_tgt": tf.io.FixedLenFeature([], tf.string),
+        # target latents: real key `latents`, legacy alias `latent`.
+        "latents": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "latent": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        # condition latents: real key `cond_latents`, legacy alias `condition_latent`.
+        "cond_latents": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "condition_latent": tf.io.FixedLenFeature([], tf.string, default_value=""),
         "encoder_hidden_states": tf.io.FixedLenFeature([], tf.string),
+        # camera + sample_id are OPTIONAL (absent in older/camera-less encodes).
+        "cam_emb_con": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "cam_emb_tgt": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "sample_id": tf.io.FixedLenFeature([], tf.string, default_value=""),
     }
 
+    def _pick(features, primary, alt):
+      """First non-empty serialized-tensor string among {primary, alt}."""
+      x = features[primary]
+      return tf.where(tf.strings.length(x) > 0, x, features[alt])
+
     def prepare_sample(features):
+      tgt_latents = tf.io.parse_tensor(_pick(features, "latents", "latent"), out_type=tf.float32)
+      cond_latents = tf.io.parse_tensor(_pick(features, "cond_latents", "condition_latent"), out_type=tf.float32)
+      encoder_hidden_states = tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32)
+
+      # N_lat = the cond temporal dim (axis 1 of [16, N_lat, h, w]).
+      n_lat = tf.shape(cond_latents)[1]
+      has_cam = tf.logical_and(
+          tf.strings.length(features["cam_emb_con"]) > 0,
+          tf.strings.length(features["cam_emb_tgt"]) > 0,
+      )
+
+      def _cam_from_tfrec():
+        return (
+            tf.io.parse_tensor(features["cam_emb_con"], out_type=tf.float32),
+            tf.io.parse_tensor(features["cam_emb_tgt"], out_type=tf.float32),
+        )
+
+      def _cam_from_json():
+        con, tgt = tf.py_function(
+            func=_v2v_cam_from_json,
+            inp=[features["sample_id"], n_lat, cam_local_root, cam_gcs_root],
+            Tout=[tf.float32, tf.float32],
+        )
+        con.set_shape([None, 12])
+        tgt.set_shape([None, 12])
+        return con, tgt
+
+      def _cam_error():
+        con, tgt = tf.py_function(func=_v2v_cam_missing_error, inp=[features["sample_id"]], Tout=[tf.float32, tf.float32])
+        con.set_shape([None, 12])
+        tgt.set_shape([None, 12])
+        return con, tgt
+
+      # If cam_emb is in the tfrec -> use it directly; else -> compute from
+      # camera.json (fallback) or fail loudly when the fallback is disabled.
+      false_branch = _cam_from_json if cam_fallback else _cam_error
+      cam_emb_con, cam_emb_tgt = tf.cond(has_cam, _cam_from_tfrec, false_branch)
+
       return {
-          "cond_latents": tf.io.parse_tensor(features["cond_latents"], out_type=tf.float32),
-          "tgt_latents": tf.io.parse_tensor(features["tgt_latents"], out_type=tf.float32),
-          "cam_emb_con": tf.io.parse_tensor(features["cam_emb_con"], out_type=tf.float32),
-          "cam_emb_tgt": tf.io.parse_tensor(features["cam_emb_tgt"], out_type=tf.float32),
-          "encoder_hidden_states": tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32),
+          "cond_latents": cond_latents,
+          "tgt_latents": tgt_latents,
+          "cam_emb_con": cam_emb_con,
+          "cam_emb_tgt": cam_emb_tgt,
+          "encoder_hidden_states": encoder_hidden_states,
       }
 
     return make_data_iterator(

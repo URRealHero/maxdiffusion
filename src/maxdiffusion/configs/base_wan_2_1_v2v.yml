@@ -45,6 +45,18 @@ v2v_trainable_param_substrings: "cam_encoder_con,cam_encoder_tgt,projector,attn1
 # trainable params; the frozen Wan2.1 base is restored + adapters overlaid on load.
 save_lora_only: False
 
+# Camera-in-the-batch policy. The re-encoded tv2v tfrecs carry cam_emb_con/cam_emb_tgt
+# [N_lat,12] directly (used as-is). For older camera-less encodes, when this is True the
+# loader computes them on the fly from each sample's camera.json (HyDRA convention).
+# NOTE: the fallback needs a per-record identifier to locate camera.json; the current
+# encoder writes NO `sample_id` tfrec feature, so the fallback only works if a future
+# encoder emits one. With the current --with-camera data the primary (tfrec) path is used.
+v2v_camera_from_json_fallback: True
+# Roots under which <sample_id>/camera.json is looked up by the fallback (local first,
+# then GCS). Only consulted when a record lacks cam_emb_* AND carries a sample_id.
+v2v_camera_json_local_root: '/data-2u-2/spu/HM-World'
+v2v_camera_json_gcs_root: 'gs://data_us_central1_a/hmworld_raw/HM-World/HM-World'
+
 # Overrides the transformer from pretrained_model_name_or_path
 wan_transformer_pretrained_model_name_or_path: ''
 
@@ -236,7 +248,10 @@ cache_latents_text_encoder_outputs: True
 # transformed dataset is saved at dataset_save_location
 dataset_save_location: ''
 load_tfrecord_cached: True
-train_data_dir: ''
+# Re-encoded WAN2.1 tv2v tfrecords (77 raw -> 20 latent frames, WITH camera):
+#   latents/cond_latents [16,20,60,104], encoder_hidden_states [512,4096],
+#   cam_emb_con/cam_emb_tgt [20,12].
+train_data_dir: 'gs://data_us_central1_a/hmworld_data/wan_2_1/tv2v_encoded_full-hydra-style-camera'
 dataset_config_name: ''
 jax_cache_dir: ''
 hf_data_dir: ''
