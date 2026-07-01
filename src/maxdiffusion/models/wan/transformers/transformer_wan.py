@@ -17,6 +17,7 @@ limitations under the License.
 from typing import Tuple, Optional, Dict, Union, Any
 import contextlib
 import math
+import os
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -685,7 +686,7 @@ class WanTransformerBlock(nnx.Module):
           norm_hidden_states = (self.norm1(hidden_states.astype(jnp.float32)) * (1 + scale_msa) + shift_msa).astype(
               hidden_states.dtype
           )
-        if self.v2v_concat and cam_emb_con is not None:
+        if self.v2v_concat and cam_emb_con is not None and not os.environ.get("V2V_DBG_NO_CAM"):
           # V2V-1a per-block camera injection (HyDRA wan_video_dit.py:566-572):
           # add cam_encoder_con to the cond/first half and cam_encoder_tgt to the
           # tgt/second half, broadcasting over the (h, w) spatial axes.
