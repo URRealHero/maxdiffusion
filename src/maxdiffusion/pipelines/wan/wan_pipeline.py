@@ -282,6 +282,15 @@ def create_sharded_logical_transformer(
         )
       params = flax.traverse_util.unflatten_dict(flat_params)
 
+    # V2V-1a per-block camera params (cam_encoder_con/tgt + projector) are NOT in
+    # the base checkpoint either, so eval_shape leaves them abstract. Fill them
+    # here with the same zero/identity init the model uses (no-op at init).
+    if bool(wan_config.get("v2v_concat", False)):
+      from ...models.wan.wan_utils import init_wan_v2v_params
+      flat_params = flax.traverse_util.flatten_dict(params)
+      flat_params.update(init_wan_v2v_params(eval_lora_shapes))
+      params = flax.traverse_util.unflatten_dict(flat_params)
+
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),
       params,

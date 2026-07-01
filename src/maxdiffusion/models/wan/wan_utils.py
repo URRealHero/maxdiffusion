@@ -651,6 +651,32 @@ def init_wan_lora_params(eval_shapes: dict, seed: int = 0):
   return out
 
 
+def init_wan_v2v_params(eval_shapes: dict):
+  """Fresh init for V2V-1a per-block camera params, which are NOT in the base
+  checkpoint (so eval_shape leaves them abstract). Mirrors the WanTransformerBlock
+  init: cam_encoder_{con,tgt} zero-init (kernel + bias), projector identity-init
+  (kernel = I, bias = 0). Zero + identity => the v2v scaffold is a numerical no-op
+  at start of training even on the real pretrained weights. Returns
+  {flat_path_tuple: jnp.array} matching the model param dict (scan-stacked when
+  scan_layers, or per-layer under blocks.<idx>.* otherwise).
+  """
+  out = {}
+  targets = ("cam_encoder_con", "cam_encoder_tgt", "projector")
+  for orig_path, shaped in flatten_dict(eval_shapes).items():
+    sp = tuple(str(p) for p in orig_path)
+    if not any(t in sp for t in targets):
+      continue
+    shape = shaped.shape
+    if "projector" in sp and sp[-1] == "kernel":
+      # Identity on the last two (dim, dim) axes, broadcast over any leading
+      # (scan layer) axis so each block's projector starts as the identity map.
+      eye = jnp.eye(shape[-2], shape[-1], dtype=jnp.float32)
+      out[orig_path] = jnp.broadcast_to(eye, shape)
+    else:
+      out[orig_path] = jnp.zeros(shape, dtype=jnp.float32)
+  return out
+
+
 def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, num_layers: int = 30):
   """Load a DiffSynth/CS LoRA safetensors into a flax LoRA param dict.
 
