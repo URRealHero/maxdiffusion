@@ -499,6 +499,7 @@ class WanTransformerBlock(nnx.Module):
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
+      v2v_concat: bool = False,
   ):
     self.enable_jax_named_scopes = enable_jax_named_scopes
 
@@ -583,6 +584,51 @@ class WanTransformerBlock(nnx.Module):
         jax.random.normal(key, (1, 6, dim)) / dim**0.5,
     )
 
+    # V2V-1a per-block camera injection + projector (ports HyDRA DiTBlock, see
+    # HyDRA/diffsynth/models/wan_video_dit.py:558-575). Zero-init cam encoders +
+    # identity-init projector => at init this block is behaviorally identical to
+    # base even with v2v_concat=True; they only diverge once trained.
+    self.v2v_concat = v2v_concat
+    if v2v_concat:
+
+      def _eye_init(key, shape, dtype=jnp.float32):
+        return jnp.eye(shape[0], shape[1], dtype=dtype)
+
+      self.cam_encoder_con = nnx.Linear(
+          12,
+          dim,
+          rngs=rngs,
+          dtype=dtype,
+          param_dtype=weights_dtype,
+          precision=precision,
+          kernel_init=nnx.initializers.zeros,
+          bias_init=nnx.initializers.zeros,
+      )
+      self.cam_encoder_tgt = nnx.Linear(
+          12,
+          dim,
+          rngs=rngs,
+          dtype=dtype,
+          param_dtype=weights_dtype,
+          precision=precision,
+          kernel_init=nnx.initializers.zeros,
+          bias_init=nnx.initializers.zeros,
+      )
+      self.projector = nnx.Linear(
+          dim,
+          dim,
+          rngs=rngs,
+          dtype=dtype,
+          param_dtype=weights_dtype,
+          precision=precision,
+          kernel_init=_eye_init,
+          bias_init=nnx.initializers.zeros,
+      )
+    else:
+      self.cam_encoder_con = nnx.data(None)
+      self.cam_encoder_tgt = nnx.data(None)
+      self.projector = nnx.data(None)
+
   def conditional_named_scope(self, name: str):
     """Return a JAX named scope if enabled, otherwise a null context."""
     return jax.named_scope(name) if self.enable_jax_named_scopes else contextlib.nullcontext()
@@ -597,6 +643,9 @@ class WanTransformerBlock(nnx.Module):
       rngs: nnx.Rngs = None,
       encoder_attention_mask: Optional[jax.Array] = None,
       cached_kv: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
+      cam_emb_con: Optional[jax.Array] = None,
+      cam_emb_tgt: Optional[jax.Array] = None,
+      grid_thw: Optional[Tuple[int, int, int]] = None,
   ):
     with self.conditional_named_scope("transformer_block"):
       # Support both global [B, 6, dim] and per-token [B, seq_len, 6, dim] temb.
@@ -636,6 +685,19 @@ class WanTransformerBlock(nnx.Module):
           norm_hidden_states = (self.norm1(hidden_states.astype(jnp.float32)) * (1 + scale_msa) + shift_msa).astype(
               hidden_states.dtype
           )
+        if self.v2v_concat and cam_emb_con is not None:
+          # V2V-1a per-block camera injection (HyDRA wan_video_dit.py:566-572):
+          # add cam_encoder_con to the cond/first half and cam_encoder_tgt to the
+          # tgt/second half, broadcasting over the (h, w) spatial axes.
+          f, h, w = grid_thw
+          b = norm_hidden_states.shape[0]
+          nhs = norm_hidden_states.reshape(b, f, h, w, -1)
+          c_con = self.cam_encoder_con(cam_emb_con).astype(norm_hidden_states.dtype)  # [B, f//2, dim]
+          c_tgt = self.cam_encoder_tgt(cam_emb_tgt).astype(norm_hidden_states.dtype)  # [B, f//2, dim]
+          first_half = nhs[:, : f // 2, :, :, :] + c_con[:, :, None, None, :]
+          second_half = nhs[:, f // 2 :, :, :, :] + c_tgt[:, :, None, None, :]
+          nhs = jnp.concatenate([first_half, second_half], axis=1)
+          norm_hidden_states = nhs.reshape(b, f * h * w, -1)
         with self.conditional_named_scope("self_attn_attn"):
           attn_output = self.attn1(
               hidden_states=norm_hidden_states,
@@ -644,6 +706,10 @@ class WanTransformerBlock(nnx.Module):
               deterministic=deterministic,
               rngs=rngs,
           )
+        if self.v2v_concat:
+          # V2V-1a projector wraps the self-attention output (HyDRA:575).
+          # Identity-init => numerically a no-op at start of training.
+          attn_output = self.projector(attn_output)
         with self.conditional_named_scope("self_attn_residual"):
           hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(hidden_states.dtype)
 
@@ -728,6 +794,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       add_control_adapter: bool = False,
       in_dim_control_adapter: int = 24,
       downscale_factor_control_adapter: int = 8,
+      v2v_concat: bool = False,
       lora_rank: int = 0,
       lora_alpha: float = 0.0,
       lora_target_modules: Optional[tuple] = None,
@@ -737,6 +804,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     self.num_layers = num_layers
     self.scan_layers = scan_layers
     self.enable_jax_named_scopes = enable_jax_named_scopes
+    self.v2v_concat = v2v_concat
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -817,6 +885,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
           lora_rank=lora_rank,
           lora_alpha=lora_alpha,
           lora_target_modules=lora_target_modules,
+          v2v_concat=v2v_concat,
       )
 
     self.gradient_checkpoint = GradientCheckpointType.from_str(remat_policy)
@@ -848,6 +917,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
+            v2v_concat=v2v_concat,
         )
         blocks.append(block)
       self.blocks = nnx.data(blocks)
@@ -945,6 +1015,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
       control_camera_latents_input: Optional[jax.Array] = None,
+      cam_emb_con: Optional[jax.Array] = None,
+      cam_emb_tgt: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
     hidden_states = nn.with_logical_constraint(hidden_states, ("batch", None, None, None, None))
     batch_size, _, num_frames, height, width = hidden_states.shape
@@ -952,6 +1024,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p_h
     post_patch_width = width // p_w
+    # V2V-1a: grid dims shared across all blocks for per-block camera injection.
+    grid_thw = (post_patch_num_frames, post_patch_height, post_patch_width)
 
     hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
     with self.conditional_named_scope("rotary_embedding"):
@@ -1037,6 +1111,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
               rngs_carry,
               encoder_attention_mask,
               cached_kv=layer_kv_cache,
+              cam_emb_con=cam_emb_con,
+              cam_emb_tgt=cam_emb_tgt,
+              grid_thw=grid_thw,
           )
           new_carry = (hidden_states, rngs_carry)
           return new_carry, None
@@ -1079,6 +1156,9 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
                 rngs,
                 encoder_attention_mask=encoder_attention_mask,
                 cached_kv=l_kv,
+                cam_emb_con=cam_emb_con,
+                cam_emb_tgt=cam_emb_tgt,
+                grid_thw=grid_thw,
             )
 
           rematted_layer_forward = self.gradient_checkpoint.apply(
