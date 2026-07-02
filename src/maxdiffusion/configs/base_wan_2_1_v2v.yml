@@ -417,6 +417,16 @@ wan_hydra_ckpt_path: ''
 # uses cfg 5.0 with a long Chinese negative prompt; dump its T5 embedding and
 # point this at it. Empty => no CFG (guidance_scale must then be 1.0 to matter).
 v2v_neg_embedding_path: ''
+# V2V-1f held-out eval sweep: jsonl manifest rows {sample_id, tfrec, index}.
+# When set, generate_wan_v2v runs the manifest sweep instead of the single-record
+# path: rows are strided across hosts (host_index::host_count), each denoise
+# batch packs data*fsdp DISTINCT records, done sids are skipped (resume), and
+# outputs land at v2v_eval_output_dir/{sample_id}_gen.mp4.
+v2v_eval_manifest: ''
+v2v_eval_output_dir: ''
+v2v_eval_host_index: 0
+v2v_eval_host_count: 1
+v2v_eval_limit: 0  # >0 = cap this host's shard (smoke)
 # When True, run + print the V2V-1e plumbing gate checks (checkpoint load /
 # denoise-half finite / decode shape+range / cond-half-clean).
 v2v_gen_gate_checks: True

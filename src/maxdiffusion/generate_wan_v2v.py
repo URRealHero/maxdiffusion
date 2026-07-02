@@ -53,6 +53,7 @@ limitations under the License.
 #     replicate_vae=True vae_spatial=4 \
 #     output_dir=/home/spu9/maxdiffusion_outputs
 
+import json
 import os
 import sys
 import time
@@ -290,6 +291,111 @@ def save_video(config, video_bhwc):
   return local_path
 
 
+# ---------------------------------------------------------------------------
+# Held-out eval sweep (V2V-1f): manifest-driven multi-clip generation.
+# Manifest = jsonl rows {sample_id, tfrec, index}. Rows are sharded striding by
+# host (v2v_eval_host_index/count), already-generated sids are skipped
+# (idempotent resume), and each denoise batch packs num_data_replicas DISTINCT
+# records (vs run()'s single record replicated), so a 4-chip host generates 4
+# clips per denoise pass. Outputs {sample_id}_gen.mp4 under v2v_eval_output_dir.
+# ---------------------------------------------------------------------------
+def _load_manifest_rows(config):
+  path = str(getattr(config, "v2v_eval_manifest", "") or "").strip()
+  rows = []
+  with tf.io.gfile.GFile(path, "r") as f:
+    for line in f:
+      line = line.strip()
+      if line:
+        rows.append(json.loads(line))
+  hi = int(getattr(config, "v2v_eval_host_index", 0))
+  hc = int(getattr(config, "v2v_eval_host_count", 1))
+  shard = rows[hi::hc]
+  limit = int(getattr(config, "v2v_eval_limit", 0))
+  if limit > 0:
+    shard = shard[:limit]
+  max_logging.log(f"V2V-1f: manifest {path}: {len(rows)} rows -> host {hi}/{hc} shard {len(shard)} (limit={limit})")
+  return shard
+
+
+def _read_records_grouped(rows):
+  """Read all needed records with ONE sequential pass per tfrec file (records are
+  ~10MB; per-index skip() would re-read the file prefix for every row)."""
+  by_file = {}
+  for r in rows:
+    by_file.setdefault(r["tfrec"], {})[int(r["index"])] = r["sample_id"]
+  out = {}  # sample_id -> feature dict
+  for path, wanted in by_file.items():
+    max_idx = max(wanted)
+    for i, raw in enumerate(tf.data.TFRecordDataset([path]).take(max_idx + 1)):
+      if i not in wanted:
+        continue
+      f = tf.io.parse_single_example(raw, _FEATURE_DESCRIPTION)
+      cond = tf.io.parse_tensor(_pick(f, "cond_latents", "condition_latent"), out_type=tf.float32).numpy()
+      ehs = tf.io.parse_tensor(f["encoder_hidden_states"], out_type=tf.float32).numpy()
+      if not (tf.strings.length(f["cam_emb_con"]).numpy() > 0 and tf.strings.length(f["cam_emb_tgt"]).numpy() > 0):
+        raise ValueError(f"{path}#{i} has no cam_emb_con/tgt")
+      cam_c = tf.io.parse_tensor(f["cam_emb_con"], out_type=tf.float32).numpy()
+      cam_t = tf.io.parse_tensor(f["cam_emb_tgt"], out_type=tf.float32).numpy()
+      out[wanted[i]] = (cond, cam_c, cam_t, ehs)
+  return out
+
+
+def run_sweep(config):
+  out_dir = str(getattr(config, "v2v_eval_output_dir", "") or "").strip().rstrip("/")
+  if not out_dir:
+    raise ValueError("v2v_eval_output_dir must be set in sweep mode")
+  rows = _load_manifest_rows(config)
+  rows = [r for r in rows if not tf.io.gfile.exists(f"{out_dir}/{r['sample_id']}_gen.mp4")]
+  max_logging.log(f"V2V-1f: {len(rows)} clips to generate after resume-skip")
+  if not rows:
+    return
+
+  checkpointer = WanCheckpointerV2V(config=config)
+  pipeline, _opt, step = checkpointer.load_checkpoint()
+  max_logging.log(f"V2V-1f: checkpoint loaded (step={step}, hydra={getattr(config, 'hydra', False)})")
+
+  ehs_neg = None
+  neg_path = str(getattr(config, "v2v_neg_embedding_path", "") or "").strip()
+  if neg_path:
+    with tf.io.gfile.GFile(neg_path, "rb") as fnp:
+      ehs_neg = np.load(fnp)
+    if ehs_neg.ndim == 2:
+      ehs_neg = ehs_neg[None]
+
+  mesh_shape = dict(zip(config.mesh_axes, pipeline.mesh.devices.shape))
+  B = int(mesh_shape.get("data", 1)) * int(mesh_shape.get("fsdp", 1))
+  max_logging.log(f"V2V-1f: batch = {B} distinct records per denoise pass")
+
+  features = _read_records_grouped(rows)
+  todo = [r["sample_id"] for r in rows]
+  t_start = time.time()
+  for c0 in range(0, len(todo), B):
+    chunk = todo[c0 : c0 + B]
+    real = len(chunk)
+    padded = chunk + [chunk[-1]] * (B - real)
+    cond = np.stack([features[s][0] for s in padded])
+    cam_c = np.stack([features[s][1] for s in padded])
+    cam_t = np.stack([features[s][2] for s in padded])
+    ehs = np.stack([features[s][3] for s in padded])
+    neg = np.repeat(ehs_neg, B, axis=0) if ehs_neg is not None else None
+    tgt, info = denoise_v2v(pipeline, config, cond, cam_c, cam_t, ehs, encoder_hidden_states_neg=neg)
+    if not info["tgt_finite"]:
+      max_logging.log(f"V2V-1f: WARNING nonfinite tgt in chunk {chunk} — skipping save")
+      continue
+    for j in range(real):
+      sid = chunk[j]
+      den = pipeline._denormalize_latents(tgt[j : j + 1])
+      video = pipeline._decode_latents_to_video(den)
+      local = f"{sid}_gen.mp4"
+      export_to_video(video[0], local, fps=int(config.fps))
+      tf.io.gfile.copy(local, f"{out_dir}/{sid}_gen.mp4", overwrite=True)
+      os.remove(local)
+    done = c0 + real
+    rate = (time.time() - t_start) / max(done, 1)
+    max_logging.log(f"V2V-1f: {done}/{len(todo)} clips done ({rate:.1f}s/clip incl. compile)")
+  max_logging.log("V2V-1f: SWEEP SHARD COMPLETE")
+
+
 def run(config):
   # 1. Load the trained v2v checkpoint (base + adapters) via the training path.
   load_start = time.perf_counter()
@@ -399,7 +505,10 @@ def main(argv: Sequence[str]) -> None:
   config = pyconfig.config
   max_utils.ensure_machinelearning_job_runs(config)
   with transformer_engine_context():
-    run(config)
+    if str(getattr(config, "v2v_eval_manifest", "") or "").strip():
+      run_sweep(config)
+    else:
+      run(config)
 
 
 if __name__ == "__main__":
