@@ -1880,9 +1880,14 @@ class FlaxWanAttention(nnx.Module):
       encoder_hidden_states = hidden_states
 
     # V2V-2a: HyDRA memory-encoding self-attention path. Gated by self.hydra
-    # (self-attention only) + the presence of grid_thw/rotary_emb. When hydra=False
-    # this branch is never entered, so the baseline is byte-for-byte unchanged.
-    if self.hydra and is_self_attention and grid_thw is not None and rotary_emb is not None:
+    # (construction-time: hydra AND is_self_attention, so cross-attn can never
+    # enter) + the presence of grid_thw/rotary_emb. When hydra=False this branch
+    # is never entered, so the baseline is byte-for-byte unchanged.
+    # Do NOT gate on the runtime `is_self_attention` here: WanTransformerBlock
+    # calls attn1 with encoder_hidden_states=norm_hidden_states (non-None), so a
+    # runtime encoder-is-None check makes this branch unreachable from WanModel
+    # and hydra=True silently degenerates to the baseline.
+    if self.hydra and grid_thw is not None and rotary_emb is not None:
       return self._hydra_forward(hidden_states, rotary_emb, grid_thw, dtype, deterministic, rngs)
 
     is_i2v_cross_attention = self.added_kv_proj_dim is not None and not is_self_attention
