@@ -259,6 +259,18 @@ load_tfrecord_cached: True
 #   latents/cond_latents [16,20,60,104], encoder_hidden_states [512,4096],
 #   cam_emb_con/cam_emb_tgt [20,12].
 train_data_dir: 'gs://data_us_central1_a/hmworld_data/wan_2_1/tv2v_encoded_full-hydra-style-camera'
+
+# Train/eval split by sample_id (held-out set). The re-encoded tv2v tfrecs carry a
+# `sample_id` bytes feature; the loader filters records via an in-graph
+# tf.lookup.StaticHashTable (multi-host safe) BEFORE batching.
+#   v2v_heldout_sids_file: GCS/local path to the held-out sids .txt (one sid per line).
+#                          Empty (default) => no split filtering (current behavior).
+#   v2v_split_mode: 'all'  -> no filter (default, strict no-op).
+#                   'train' -> EXCLUDE the held-out sids (train on full - held-out).
+#                   'eval'  -> INCLUDE ONLY the held-out sids (eval on held-out).
+# When v2v_split_mode is 'train'/'eval', v2v_heldout_sids_file must be set.
+v2v_heldout_sids_file: ''
+v2v_split_mode: 'all'
 dataset_config_name: ''
 jax_cache_dir: ''
 hf_data_dir: ''

@@ -56,8 +56,13 @@ def make_data_iterator(
     prepare_sample_fn=None,
     is_training=True,
     pipeline=None,
+    filter_fn=None,
 ):
-  """Make data iterator for SD1, 2, XL, dataset_types in (hf, tf, tfrecord, grain, synthetic)"""
+  """Make data iterator for SD1, 2, XL, dataset_types in (hf, tf, tfrecord, grain, synthetic)
+
+  filter_fn: optional tf.data predicate over the PARSED record (before prepare_sample /
+    batching), used by the tfrecord path. None => no filtering (default, unchanged).
+  """
 
   if config.dataset_type == "hf" or config.dataset_type == "tf":
     if tokenize_fn is None or image_transforms_fn is None:
@@ -111,6 +116,7 @@ def make_data_iterator(
         feature_description,
         prepare_sample_fn,
         is_training,
+        filter_fn=filter_fn,
     )
   elif config.dataset_type == "synthetic":
     return synthetic_data_iterator.make_synthetic_iterator(

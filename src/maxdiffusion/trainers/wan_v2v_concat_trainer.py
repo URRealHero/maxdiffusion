@@ -345,6 +345,69 @@ def _v2v_cam_missing_error(sample_id):
   )
 
 
+# ---------------------------------------------------------------------------
+# Train/eval split by sample_id (held-out set).
+#
+# The re-encoded tv2v tfrecs carry a `sample_id` bytes feature. We train on
+# (full - held-out) and eval on the held-out set. The split is applied as a
+# tf.data.filter over the PARSED record, using an in-graph tf.lookup.StaticHashTable
+# (sid -> 1 for held-out, default 0) -- NOT a py_function -- so it stays efficient
+# and multi-host safe (every host builds the identical table from the same file).
+# ---------------------------------------------------------------------------
+def _v2v_load_heldout_sids(path):
+  """Read the held-out sample_id list (one sid per line) via tf.io.gfile.
+
+  Blank lines and surrounding whitespace are stripped; works for local and gs://.
+  """
+  with tf.io.gfile.GFile(path, "r") as f:
+    raw = f.read()
+  return [s.strip() for s in raw.splitlines() if s.strip()]
+
+
+def _v2v_make_split_filter(config):
+  """Build the tf.data filter predicate for the sample_id train/eval split.
+
+  Returns None (no filtering -> current behavior) when `v2v_split_mode` == 'all'.
+  Otherwise reads `v2v_heldout_sids_file` into an in-graph StaticHashTable and
+  returns a predicate over the PARSED feature dict (keyed on features['sample_id']):
+    - 'train': keep records whose sample_id is NOT in the held-out set.
+    - 'eval' : keep records whose sample_id IS in the held-out set.
+  A record with no sample_id feature parses to an empty string (default_value ""),
+  which is never in the held-out set -> kept by 'train', dropped by 'eval'.
+  """
+  mode = str(getattr(config, "v2v_split_mode", "all") or "all").strip().lower()
+  if mode == "all":
+    return None  # strict no-op: bit-identical to the pre-split behavior.
+  if mode not in ("train", "eval"):
+    raise ValueError(f"v2v_split_mode must be one of all/train/eval, got {mode!r}.")
+
+  path = str(getattr(config, "v2v_heldout_sids_file", "") or "").strip()
+  if not path:
+    raise ValueError(
+        f"v2v_split_mode={mode!r} requires v2v_heldout_sids_file to be set "
+        "(path to the held-out sample_id list, one sid per line)."
+    )
+  sids = _v2v_load_heldout_sids(path)
+  if not sids:
+    raise ValueError(f"v2v_heldout_sids_file {path!r} is empty; no held-out sids to split on.")
+
+  keys = tf.constant(sids, dtype=tf.string)
+  values = tf.ones([len(sids)], dtype=tf.int32)
+  table = tf.lookup.StaticHashTable(tf.lookup.KeyValueTensorInitializer(keys, values), default_value=0)
+  keep_heldout = mode == "eval"
+  max_logging.log(
+      f"V2V split filter: mode={mode} ("
+      f"{'INCLUDE ONLY' if keep_heldout else 'EXCLUDE'} held-out); "
+      f"{len(sids)} held-out sids from {path}."
+  )
+
+  def _split_filter(features):
+    is_heldout = tf.equal(table.lookup(features["sample_id"]), 1)
+    return is_heldout if keep_heldout else tf.logical_not(is_heldout)
+
+  return _split_filter
+
+
 class WanV2VConcatTrainer(WanTrainer):
   """Fine-tunes Wan2.1-T2V-1.3B with the V2V-1a per-block camera scaffold, on
   frame-concat (cond|tgt) latents, training only the camera/projector/self-attn
@@ -382,9 +445,10 @@ class WanV2VConcatTrainer(WanTrainer):
     #   float feature `encoder_hidden_states` [512, 4096]
     #   float feature `cam_emb_con`/`cam_emb_tgt` [N_lat, 12]  (present ONLY in the
     #     --with-camera re-encode; ABSENT in older camera-less encodes)
-    # The encoder writes NO `sample_id` tfrec feature (it lives only in the metadata
-    # sidecar jsonl), so the camera.json fallback below can only locate a camera.json
-    # if a future encoder emits a `sample_id` feature.
+    #   bytes feature `sample_id`             (present in the re-encode; used for the
+    #     train/eval held-out split filter below and the camera.json fallback). Older
+    #     encodes lack it -> parses to "" (default_value), which the split filter and
+    #     fallback both handle gracefully.
     #
     # The OLD (pre-fix) loader read a feature named `tgt_latents`, which does NOT
     # exist (the encoder writes `latents`), and required cam_emb_* unconditionally.
@@ -460,6 +524,11 @@ class WanV2VConcatTrainer(WanTrainer):
           "encoder_hidden_states": encoder_hidden_states,
       }
 
+    # Train/eval split by sample_id: built here (once per host) so the StaticHashTable
+    # is captured by the tf.data graph and applied on the PARSED record BEFORE batching
+    # (inside _make_tfrecord_iterator). None when v2v_split_mode == 'all' -> no filter.
+    split_filter_fn = _v2v_make_split_filter(config)
+
     return make_data_iterator(
         config,
         jax.process_index(),
@@ -469,6 +538,7 @@ class WanV2VConcatTrainer(WanTrainer):
         feature_description=feature_description,
         prepare_sample_fn=prepare_sample,
         is_training=is_training,
+        filter_fn=split_filter_fn,
     )
 
   def get_train_step(self, pipeline, mesh, state_shardings, data_shardings):

@@ -90,6 +90,7 @@ def _make_tfrecord_iterator(
     prepare_sample_fn,
     dataset_path,
     is_training: bool,
+    filter_fn=None,
 ):
   # set load_tfrecord_cached to True in config to use pre-processed tfrecord dataset.
   # pedagogical_examples/dataset_tf_cache_to_tfrecord.py to convert tf preprocessed dataset to tfrecord.
@@ -170,9 +171,13 @@ def _make_tfrecord_iterator(
           num_parallel_calls=4,
           deterministic=False,
       ).shard(num_shards=dataloading_host_count, index=dataloading_host_index)
+    ds = ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
+    # Optional split filter on the PARSED record (e.g. sample_id held-out split),
+    # applied BEFORE prepare_sample + batching. None => no filtering (unchanged).
+    if filter_fn is not None:
+      ds = ds.filter(filter_fn)
     ds = (
-        ds.map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
-        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+        ds.map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
         .shuffle(global_batch_size * 10)
         .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
         .repeat(-1)
@@ -194,10 +199,16 @@ def _make_tfrecord_iterator(
       ds = ds.concatenate(padding_ds)
       max_logging.log(f"Padded evaluation dataset with {num_to_pad} samples.")
 
+    ds = ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index).map(
+        _parse_tfrecord_fn, num_parallel_calls=AUTOTUNE
+    )
+    # Optional split filter on the PARSED record, BEFORE prepare_sample + batching.
+    # None => no filtering (unchanged). drop_remainder=False tolerates the smaller
+    # post-filter count (the pre-filter padding above may over-pad harmlessly).
+    if filter_fn is not None:
+      ds = ds.filter(filter_fn)
     ds = (
-        ds.shard(num_shards=dataloading_host_count, index=dataloading_host_index)
-        .map(_parse_tfrecord_fn, num_parallel_calls=AUTOTUNE)
-        .map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
+        ds.map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
         .batch(global_batch_size // dataloading_host_count, drop_remainder=False)
         .prefetch(AUTOTUNE)
     )
@@ -215,10 +226,14 @@ def make_tfrecord_iterator(
     feature_description,
     prepare_sample_fn,
     is_training,
+    filter_fn=None,
 ):
   """Iterator for TFRecord format. For Laion dataset,
   check out preparation script
   maxdiffusion/pedagogical_examples/to_tfrecords.py
+
+  filter_fn: optional tf.data predicate over the parsed record, applied before
+    prepare_sample + batching. None => no filtering (default, unchanged).
   """
   # Currently only support evaluation on tfrecord. To avoid influencing previous reference, judge whether is training dataset.
   # TODO: refactor to support evaluation on all dataset format.
@@ -233,4 +248,5 @@ def make_tfrecord_iterator(
       prepare_sample_fn,
       dataset_path,
       is_training,
+      filter_fn=filter_fn,
   )
