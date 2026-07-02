@@ -480,6 +480,7 @@ def make_example(
     condition_output_field: str,
     cam_emb_con: np.ndarray | None = None,
     cam_emb_tgt: np.ndarray | None = None,
+    sample_id: str | None = None,
 ) -> bytes:
   load_numpy()
   import tensorflow as tf
@@ -492,6 +493,11 @@ def make_example(
   if cam_emb_con is not None and cam_emb_tgt is not None:
     features["cam_emb_con"] = bytes_feature(serialize_tensor(cam_emb_con))
     features["cam_emb_tgt"] = bytes_feature(serialize_tensor(cam_emb_tgt))
+  # Self-identifying records: embed sample_id so train/eval splits can be selected
+  # by sid at load time (exclude the held-out set for training, keep it for eval)
+  # without re-encoding. Mirrors encode_concat_camera.make_example.
+  if sample_id is not None:
+    features["sample_id"] = bytes_feature(str(sample_id).encode("utf-8"))
   return tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()
 
 
@@ -749,7 +755,8 @@ def main() -> int:
       for (_, sample_id, record), latent, cond_latent, hidden_state, (cam_emb_con, cam_emb_tgt) in encoded_records:
         writer.write(
             make_example(
-                latent, cond_latent, hidden_state, args.condition_output_field, cam_emb_con, cam_emb_tgt
+                latent, cond_latent, hidden_state, args.condition_output_field, cam_emb_con, cam_emb_tgt,
+                sample_id=sample_id,
             )
         )
         meta = {
