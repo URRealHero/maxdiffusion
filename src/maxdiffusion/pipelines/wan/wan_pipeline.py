@@ -301,6 +301,24 @@ def create_sharded_logical_transformer(
       flat_params.update(init_wan_hydra_params(eval_lora_shapes, seed=int(getattr(config, "seed", 0))))
       params = flax.traverse_util.unflatten_dict(flat_params)
 
+    # Official HyDRA checkpoint overlay (mechanism-verification path): replaces the
+    # fresh-init v2v/hydra params AND the base self-attention with the TRAINED
+    # official weights (18 tensors/block; frozen families verified bit-equal to the
+    # base, so they stay from the diffusers load). Applied AFTER the fresh inits so
+    # it wins. Requires v2v_concat=True and hydra=True (target params absent otherwise).
+    hydra_ckpt = str(getattr(config, "wan_hydra_ckpt_path", "") or "")
+    if hydra_ckpt:
+      if not (bool(wan_config.get("v2v_concat", False)) and bool(wan_config.get("hydra", False))):
+        raise ValueError("wan_hydra_ckpt_path requires v2v_concat=True and hydra=True.")
+      from ...models.wan.wan_utils import load_wan_hydra_official
+      flat_params = flax.traverse_util.flatten_dict(params)
+      flat_params.update(
+          load_wan_hydra_official(
+              hydra_ckpt, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"]
+          )
+      )
+      params = flax.traverse_util.unflatten_dict(flat_params)
+
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),
       params,

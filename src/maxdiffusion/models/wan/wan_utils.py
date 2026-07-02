@@ -750,6 +750,116 @@ def load_wan_lora(lora_path: str, eval_shapes: dict, scan_layers: bool = True, n
   return out
 
 
+# Official HyDRA checkpoint (DiffSynth naming) -> our nnx paths. Only the TRAINED
+# families are mapped; the frozen families (cross_attn, ffn, norms, embeddings,
+# head, modulation) were verified BIT-EQUAL to the Wan2.1-1.3B base
+# (525/525 tensors), so they come from the normal diffusers base load.
+# 18 tensors per block x 30 blocks = 540 mapped tensors total.
+_HYDRA_SELF_ATTN_TO_NNX = {
+    "q": ("query", "kernel", "bias"),
+    "k": ("key", "kernel", "bias"),
+    "v": ("value", "kernel", "bias"),
+    "o": ("proj_attn", "kernel", "bias"),
+}
+
+
+def _hydra_official_key_to_nnx_path(key: str):
+  """Map one official hydra.ckpt key -> (block_index, nnx_path, transform) or None to
+  skip (frozen family). transform: 'linear' (swap last two axes), 'conv3d'
+  (torch [out,in,kd,kh,kw] -> flax [kd,kh,kw,in,out]), or 'none' (1-d params)."""
+  parts = key.split(".")
+  if parts[0] != "blocks" or len(parts) < 4:
+    return None
+  try:
+    block_index = int(parts[1])
+  except ValueError:
+    return None
+  module, rest = parts[2], parts[3:]
+  if module in ("cam_encoder_con", "cam_encoder_tgt", "projector"):
+    # nn.Linear weight/bias
+    leaf = "kernel" if rest[-1] == "weight" else "bias"
+    tr = "linear" if leaf == "kernel" else "none"
+    return block_index, ("blocks", module, leaf), tr
+  if module == "self_attn":
+    sub = rest[0]
+    if sub in _HYDRA_SELF_ATTN_TO_NNX:
+      name, wleaf, bleaf = _HYDRA_SELF_ATTN_TO_NNX[sub]
+      leaf = wleaf if rest[-1] == "weight" else bleaf
+      tr = "linear" if rest[-1] == "weight" else "none"
+      return block_index, ("blocks", "attn1", name, leaf), tr
+    if sub in ("norm_q", "norm_k") and rest[-1] == "weight":
+      return block_index, ("blocks", "attn1", sub, "scale"), "none"
+    if sub == "tokenizer" and rest[-2:] == ["conv", "weight"]:
+      return block_index, ("blocks", "attn1", "tokenizer", "conv", "kernel"), "conv3d"
+    if sub == "tokenizer" and rest[-2:] == ["conv", "bias"]:
+      return block_index, ("blocks", "attn1", "tokenizer", "conv", "bias"), "none"
+  # frozen family (cross_attn / ffn / norm3 / modulation / non-block) -> base load
+  return None
+
+
+def load_wan_hydra_official(ckpt_path: str, eval_shapes: dict, scan_layers: bool = True, num_layers: int = 30):
+  """Load the official HyDRA checkpoint's TRAINED tensors (self_attn incl.
+  MemoryTokenizer + cam_encoder_con/tgt + projector, 18/block) onto our model.
+
+  ckpt_path must be a safetensors export of hydra.ckpt (state_dict). Returns
+  {nnx_path_tuple: jnp.array}, scan-stacked when scan_layers. Raises if any
+  block is missing a mapped tensor or a shape mismatches — partial loads would
+  silently produce a wrong model.
+  """
+  if not os.path.isfile(ckpt_path):
+    raise FileNotFoundError(f"Official HyDRA ckpt not found: {ckpt_path} (expected a local .safetensors path)")
+  max_logging.log(f"Loading official HyDRA weights from {ckpt_path}")
+
+  shapes = {tuple(str(p) for p in k): v for k, v in flatten_dict(eval_shapes).items()}
+
+  out = {}
+  filled = {}  # nnx_path -> set(block_index), to prove full 30-block coverage
+  skipped = n_mapped = 0
+  with safe_open(ckpt_path, framework="pt") as f:
+    for key in f.keys():
+      mapped = _hydra_official_key_to_nnx_path(key)
+      if mapped is None:
+        skipped += 1
+        continue
+      block_index, nnx_path, tr = mapped
+      tensor = torch2jax(f.get_tensor(key)).astype(jnp.float32)
+      if tr == "linear":
+        tensor = jnp.swapaxes(tensor, -1, -2)  # torch [out,in] -> nnx [in,out]
+      elif tr == "conv3d":
+        tensor = jnp.transpose(tensor, (2, 3, 4, 1, 0))  # [out,in,kd,kh,kw] -> [kd,kh,kw,in,out]
+      n_mapped += 1
+      if scan_layers:
+        target = shapes.get(nnx_path)
+        if target is None:
+          raise ValueError(f"HyDRA target {nnx_path} not in model params (v2v_concat/hydra set?)")
+        if tensor.shape != target.shape[1:]:
+          raise ValueError(f"HyDRA shape mismatch at {key} -> {nnx_path}: {tensor.shape} vs {target.shape[1:]}")
+        if nnx_path not in out:
+          out[nnx_path] = jnp.zeros(target.shape, dtype=jnp.float32)
+        out[nnx_path] = out[nnx_path].at[block_index].set(tensor)
+        filled.setdefault(nnx_path, set()).add(block_index)
+      else:
+        path = ("blocks", block_index) + nnx_path[1:]
+        target = shapes.get(tuple(str(p) for p in path))
+        if target is not None and tensor.shape != target.shape:
+          raise ValueError(f"HyDRA shape mismatch at {key} -> {path}: {tensor.shape} vs {target.shape}")
+        out[path] = tensor
+        filled.setdefault(nnx_path, set()).add(block_index)
+
+  expected_paths = 18  # 8 qkvo w/b + 2 norm scales + 2 tokenizer + 4 cam + 2 projector
+  incomplete = {p: sorted(set(range(num_layers)) - bs) for p, bs in filled.items() if len(bs) != num_layers}
+  if len(filled) != expected_paths or incomplete:
+    raise ValueError(
+        f"Official HyDRA load incomplete: {len(filled)}/{expected_paths} param families, "
+        f"missing blocks: { {('/'.join(p)): v for p, v in incomplete.items()} }"
+    )
+  max_logging.log(
+      f"WAN HyDRA official: mapped {n_mapped} tensors -> {len(out)} params "
+      f"({len(filled)} families x {num_layers} blocks), skipped {skipped} frozen/base keys"
+  )
+  return out
+
+
 def load_wan_vae(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,

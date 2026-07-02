@@ -406,6 +406,17 @@ save_final_checkpoint: False
 v2v_record_tfrecord: ''
 v2v_record_index: 0
 v2v_output_video_name: 'v2v_output.mp4'
+# Official HyDRA checkpoint overlay (safetensors export of hydra.ckpt). When set,
+# the 540 TRAINED tensors (self_attn incl. tokenizer + cam encoders + projector,
+# 18/block) are loaded over the base + fresh-init params at pipeline load time.
+# Frozen families verified bit-equal to the Wan2.1-1.3B base. Requires
+# v2v_concat=True hydra=True. Used to certify our mechanism vs official HyDRA.
+wan_hydra_ckpt_path: ''
+# Optional negative text embedding (.npy, [512,4096]) for CFG in v2v generation
+# (the tfrecords carry only the positive embedding). Official HyDRA inference
+# uses cfg 5.0 with a long Chinese negative prompt; dump its T5 embedding and
+# point this at it. Empty => no CFG (guidance_scale must then be 1.0 to matter).
+v2v_neg_embedding_path: ''
 # When True, run + print the V2V-1e plumbing gate checks (checkpoint load /
 # denoise-half finite / decode shape+range / cond-half-clean).
 v2v_gen_gate_checks: True

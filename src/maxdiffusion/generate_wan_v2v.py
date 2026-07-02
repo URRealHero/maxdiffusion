@@ -315,6 +315,17 @@ def run(config):
   cam_emb_tgt = cam_tgt_np[None]
   ehs = ehs_np[None]
 
+  # Optional negative text embedding for CFG (official HyDRA runs cfg 5.0 with a
+  # Chinese negative prompt; the tfrecords carry only the positive embedding).
+  ehs_neg = None
+  neg_path = str(getattr(config, "v2v_neg_embedding_path", "") or "").strip()
+  if neg_path:
+    with tf.io.gfile.GFile(neg_path, "rb") as fnp:
+      ehs_neg = np.load(fnp)
+    if ehs_neg.ndim == 2:
+      ehs_neg = ehs_neg[None]  # [1,512,4096]
+    max_logging.log(f"V2V-1e: loaded negative embedding {ehs_neg.shape} from {neg_path} (cfg={config.guidance_scale})")
+
   # The flash-attention shard_map shards the batch axis over data/fsdp, so a
   # batch of 1 is not evenly divisible by an fsdp>1 mesh. Tile the single record
   # up to the device count (pure data-parallel replicas -> batch 1 per device,
@@ -327,11 +338,15 @@ def run(config):
     cam_emb_con = np.repeat(cam_emb_con, num_data_replicas, axis=0)
     cam_emb_tgt = np.repeat(cam_emb_tgt, num_data_replicas, axis=0)
     ehs = np.repeat(ehs, num_data_replicas, axis=0)
+    if ehs_neg is not None:
+      ehs_neg = np.repeat(ehs_neg, num_data_replicas, axis=0)
     max_logging.log(f"V2V-1e: tiled batch 1 -> {num_data_replicas} (data*fsdp) for even shard_map division")
 
   # 3. Denoise the tgt half (HyDRA loop).
   denoise_start = time.perf_counter()
-  tgt_latents, info = denoise_v2v(pipeline, config, cond_latents, cam_emb_con, cam_emb_tgt, ehs)
+  tgt_latents, info = denoise_v2v(
+      pipeline, config, cond_latents, cam_emb_con, cam_emb_tgt, ehs, encoder_hidden_states_neg=ehs_neg
+  )
   max_logging.log(f"V2V-1e: denoise ({config.num_inference_steps} steps) in {time.perf_counter() - denoise_start:.1f}s")
 
   # 4. VAE-decode the tgt half (denormalize -> decode), reusing the pipeline path.
