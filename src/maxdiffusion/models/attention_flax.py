@@ -1725,7 +1725,7 @@ class FlaxWanAttention(nnx.Module):
 
     return q, k, v, k_comp, v_comp, similarity, freqs_comp
 
-  def _dynamic_retrieval_attention(self, q, k, v, k_comp, v_comp, similarity, grid_thw):
+  def _dynamic_retrieval_attention(self, q, k, v, k_comp, v_comp, similarity, grid_thw, _frame_chunk=None):
     """V2V-2b: faithful JAX/flax.nnx port of HyDRA's ``DynamicRetrievalAttention``
     (sparse per-frame retrieval), the mixed-resolution ``forward`` path with
     k_comp/v_comp provided (HyDRA/diffsynth/models/wan_video_dit.py:259-303 +
@@ -1838,7 +1838,32 @@ class FlaxWanAttention(nnx.Module):
         float32_qk_product=self.attention_op.float32_qk_product,
         use_memory_efficient_attention=False,
     )
-    out = jax.vmap(attn_fn, in_axes=(1, 1, 1), out_axes=1)(q_f, k_all, v_all)  # [B, F, HW, inner]
+    # Chunk the frame axis: a single vmap over ALL F materializes the attention
+    # scores for every frame at once ([F, heads, HW, 5*HW+10*HW_comp] ~ 17.5GB bf16
+    # at the real grid F=40, HW=1560) and OOMs v6e HBM (49.7G needed vs 31.25G,
+    # measured). jax.lax.map ALONE does not fix training: scan saves every chunk's
+    # softmax residuals for backward, so the live set is unchanged (measured 56.5G).
+    # jax.checkpoint on the chunk body makes scan keep only the chunk INPUTS
+    # (slices of qc/kc/vc, already materialized) and recompute the chunk attention
+    # during backward -> peak ~= one chunk fwd+bwd. Math is identical to the full
+    # vmap (equivalence test in wan_hydra_gate_test.py).
+    frame_chunk = _frame_chunk or next((c for c in (4, 5, 8, 2) if F % c == 0), F)
+    if frame_chunk == F:
+      out = jax.vmap(attn_fn, in_axes=(1, 1, 1), out_axes=1)(q_f, k_all, v_all)  # [B, F, HW, inner]
+    else:
+      n_chunks = F // frame_chunk
+      S = k_all.shape[2]
+
+      @jax.checkpoint
+      def _attend_chunk(args):
+        qq, kk, vv = args  # each [B, frame_chunk, ...]
+        return jax.vmap(attn_fn, in_axes=(1, 1, 1), out_axes=1)(qq, kk, vv)
+
+      qc = jnp.moveaxis(q_f.reshape(B, n_chunks, frame_chunk, HW, inner), 1, 0)
+      kc = jnp.moveaxis(k_all.reshape(B, n_chunks, frame_chunk, S, inner), 1, 0)
+      vc = jnp.moveaxis(v_all.reshape(B, n_chunks, frame_chunk, S, inner), 1, 0)
+      out = jax.lax.map(_attend_chunk, (qc, kc, vc))  # [n_chunks, B, frame_chunk, HW, inner]
+      out = jnp.moveaxis(out, 0, 1).reshape(B, F, HW, inner)
     out = out.reshape(B, F * HW, inner)
     return out
 

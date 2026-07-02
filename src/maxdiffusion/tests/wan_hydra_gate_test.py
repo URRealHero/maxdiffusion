@@ -130,6 +130,16 @@ class WanHydraGateTest(unittest.TestCase):
         "hydra=False output changed when grid_thw was passed.",
     )
 
+  def test_chunked_retrieval_matches_full_vmap(self):
+    """The frame-chunked retrieval (HBM fix) must equal the full-vmap path."""
+    attn = self._build(hydra=True)
+    with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      q, k, v, k_comp, v_comp, sim, _ = attn._hydra_memory_encode(self.x, self.rotary, GRID_THW)
+      out_full = attn._dynamic_retrieval_attention(q, k, v, k_comp, v_comp, sim, GRID_THW, _frame_chunk=GRID_THW[0])
+      out_chunked = attn._dynamic_retrieval_attention(q, k, v, k_comp, v_comp, sim, GRID_THW)
+    max_diff = float(jnp.max(jnp.abs(out_full - out_chunked)))
+    self.assertLess(max_diff, 1e-5, f"chunked retrieval diverges from full vmap: max|diff|={max_diff}")
+
   def test_cross_attention_never_enters_hydra(self):
     """Construction-time gate: is_self_attention=False disables hydra even if
     requested, so cross-attention can never take the memory path."""
