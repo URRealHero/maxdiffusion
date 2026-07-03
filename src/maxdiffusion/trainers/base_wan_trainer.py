@@ -99,8 +99,21 @@ class BaseWanTrainer(abc.ABC):
     pass
 
   def create_scheduler(self):
-    """Creates and initializes the Flow Match scheduler for training."""
-    noise_scheduler = FlaxFlowMatchScheduler(dtype=jnp.float32)
+    """Creates and initializes the Flow Match scheduler for training.
+
+    train_flow_shift (opt-in, default -1 = keep the scheduler default 3.0 so
+    existing 2.1/2.2 training recipes are unchanged) sets the TRAINING noise
+    schedule's shift. HyDRA trains at shift=5 (HyDRAPipeline FlowMatchScheduler
+    shift=5, kept by set_timesteps(training=True)); training at 3.0 while
+    evaluating at flow_shift=5.0 undersamples the high-noise region the
+    inference schedule visits and mismatches the loss weighting bell.
+    """
+    train_shift = float(getattr(self.config, "train_flow_shift", -1.0) or -1.0)
+    if train_shift > 0:
+      noise_scheduler = FlaxFlowMatchScheduler(shift=train_shift, dtype=jnp.float32)
+      max_logging.log(f"Training FlowMatch scheduler: shift={train_shift} (train_flow_shift)")
+    else:
+      noise_scheduler = FlaxFlowMatchScheduler(dtype=jnp.float32)
     noise_scheduler_state = noise_scheduler.create_state()
     noise_scheduler_state = noise_scheduler.set_timesteps(noise_scheduler_state, num_inference_steps=1000, training=True)
     return noise_scheduler, noise_scheduler_state

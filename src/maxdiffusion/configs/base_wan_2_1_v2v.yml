@@ -372,6 +372,11 @@ width: 832
 num_frames: 77
 guidance_scale: 5.0
 flow_shift: 3.0
+# TRAINING noise-schedule shift (official HyDRA trains AND infers at shift=5:
+# HyDRAPipeline FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)).
+# Our first retrains used the scheduler default 3.0 — a recipe deviation. -1 =
+# keep default (other model families unchanged); 5.0 = HyDRA-faithful.
+train_flow_shift: 5.0
 
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
 use_cfg_cache: False
