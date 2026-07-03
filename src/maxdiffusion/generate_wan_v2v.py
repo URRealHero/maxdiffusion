@@ -303,10 +303,17 @@ def _load_manifest_rows(config):
   path = str(getattr(config, "v2v_eval_manifest", "") or "").strip()
   rows = []
   with tf.io.gfile.GFile(path, "r") as f:
-    for line in f:
+    for line_no, line in enumerate(f):
       line = line.strip()
-      if line:
-        rows.append(json.loads(line))
+      if not line:
+        continue
+      r = json.loads(line)
+      # Fail loudly per-row: a null tfrec (the encoder metadata writes tfrec_path
+      # null at shard-rotation boundaries) would otherwise crash the WHOLE host
+      # shard deep inside TFRecordDataset with an opaque None->Tensor ValueError.
+      if not r.get("tfrec") or r.get("index") is None or not r.get("sample_id"):
+        raise ValueError(f"manifest {path} line {line_no}: bad row {r!r} (need sample_id/tfrec/index)")
+      rows.append(r)
   hi = int(getattr(config, "v2v_eval_host_index", 0))
   hc = int(getattr(config, "v2v_eval_host_count", 1))
   shard = rows[hi::hc]
