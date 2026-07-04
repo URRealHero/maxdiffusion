@@ -30,13 +30,15 @@ from maxdiffusion import max_logging, max_utils, pyconfig
 from maxdiffusion.max_utils import create_device_mesh, get_flash_block_sizes
 from maxdiffusion.models.attention_flax import _tpu_flash_attention
 
-HEADS = 12
+import os
+HEADS = int(os.environ.get("PROBE_HEADS", "12"))
 DIM_HEAD = 128
 INNER = HEADS * DIM_HEAD
-BATCH = 2
+BATCH = int(os.environ.get("PROBE_BATCH", "2"))
 # (label, seq_len): 16384 = 4 shards x 4096, block-alignable at 512/1024/2048.
 # 15600 = the real v2v shard size as a total (not alignable); 62400 = real v2v seq.
-PROBE_SEQS = [("padded-15600", 15600), ("real-62400", 62400)]
+_seq_env = os.environ.get("PROBE_SEQ", "")
+PROBE_SEQS = [(f"seq-{_seq_env}", int(_seq_env))] if _seq_env else [("padded-15600", 15600), ("real-62400", 62400)]
 
 AXIS_Q = ("activation_batch", "activation_self_attn_heads", "activation_self_attn_q_length", "activation_kv")
 AXIS_KV = ("activation_batch", "activation_self_attn_heads", "activation_kv_length", "activation_kv")
@@ -168,7 +170,7 @@ def main(argv):
     return f
 
   g_ref = jax.grad(dense_loss, argnums=(0, 1, 2))(q, k, v)
-  for kernel in ("tokamax_ring",):
+  for kernel in os.environ.get("PROBE_GRAD_KERNELS", "tokamax_ring").split(","):
     try:
       g_k = jax.grad(kernel_loss(kernel), argnums=(0, 1, 2))(q, k, v)
       for name, a, b_ in zip(("dq", "dk", "dv"), g_ref, g_k):
