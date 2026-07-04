@@ -36,7 +36,7 @@ INNER = HEADS * DIM_HEAD
 BATCH = 2
 # (label, seq_len): 16384 = 4 shards x 4096, block-alignable at 512/1024/2048.
 # 15600 = the real v2v shard size as a total (not alignable); 62400 = real v2v seq.
-PROBE_SEQS = [("alignable-16384", 16384)]
+PROBE_SEQS = [("padded-15600", 15600), ("real-62400", 62400)]
 
 AXIS_Q = ("activation_batch", "activation_self_attn_heads", "activation_self_attn_q_length", "activation_kv")
 AXIS_KV = ("activation_batch", "activation_self_attn_heads", "activation_kv_length", "activation_kv")
@@ -135,6 +135,48 @@ def main(argv):
         max_logging.log(f"[{label}] {kernel:13s} vs ref[{rname:18s}]: {stats(out, ref)}")
     if len(results) == 2:
       max_logging.log(f"[{label}] ring vs flash          : {stats(results['tokamax_ring'], results['flash'])}")
+  # ---- gradient parity (seq 4096, unpadded): d/dq,k,v of <out, cot> ----
+  seq = 4096
+  kq, kk, kv, kc = jax.random.split(jax.random.key(7), 4)
+  q = jax.random.normal(kq, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
+  k = jax.random.normal(kk, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
+  v = jax.random.normal(kv, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
+  cot = jax.random.normal(kc, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
+
+  def dense_loss(qq, kk_, vv):
+    b, s_, _ = qq.shape
+    qh = qq.reshape(b, s_, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
+    kh = kk_.reshape(b, s_, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
+    vh = vv.reshape(b, s_, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
+    probs = jax.nn.softmax(jnp.einsum("bhqd,bhkd->bhqk", qh, kh), axis=-1)
+    out = jnp.einsum("bhqk,bhkd->bhqd", probs, vh).transpose(0, 2, 1, 3).reshape(b, s_, INNER)
+    return jnp.sum(out * cot)
+
+  block_sizes = get_flash_block_sizes(config)
+  def kernel_loss(kernel):
+    def f(qq, kk_, vv):
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        out = _tpu_flash_attention(
+            qq.astype(jnp.bfloat16), kk_.astype(jnp.bfloat16), vv.astype(jnp.bfloat16),
+            heads=HEADS, mesh=mesh, axis_names_q=AXIS_Q, axis_names_kv=AXIS_KV,
+            flash_block_sizes=block_sizes, dtype=jnp.bfloat16, attention_kernel=kernel,
+            mask_padding_tokens=bool(getattr(config, "mask_padding_tokens", True)),
+            use_base2_exp=bool(getattr(config, "use_base2_exp", False)),
+            use_experimental_scheduler=bool(getattr(config, "use_experimental_scheduler", False)),
+        )
+      return jnp.sum(out.astype(jnp.float32) * cot)
+    return f
+
+  g_ref = jax.grad(dense_loss, argnums=(0, 1, 2))(q, k, v)
+  for kernel in ("tokamax_ring",):
+    try:
+      g_k = jax.grad(kernel_loss(kernel), argnums=(0, 1, 2))(q, k, v)
+      for name, a, b_ in zip(("dq", "dk", "dv"), g_ref, g_k):
+        d = np.abs(np.asarray(a, dtype=np.float32) - np.asarray(b_, dtype=np.float32))
+        rel = d.max() / (np.abs(np.asarray(a)).max() + 1e-9)
+        max_logging.log(f"[grad-4096] {kernel} {name}: max|d|={d.max():.4f} relmax={rel:.4f}")
+    except Exception as e:
+      max_logging.log(f"[grad-4096] {kernel} FAILED: {type(e).__name__}: {str(e)[:200]}")
   max_logging.log("PROBE DONE")
 
 
