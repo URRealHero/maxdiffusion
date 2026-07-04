@@ -13,6 +13,7 @@ Run on debug-8 (single host, fsdp=8), once per model config:
       probe_tag=official|ours5000|...
 Prints: per-timestep mean loss over N fixed records.
 """
+import os
 import sys
 
 import jax
@@ -53,7 +54,7 @@ def load_batch():
 def main(argv):
   pyconfig.initialize(argv, validate_training=False)
   config = pyconfig.config
-  tag = str(getattr(config, "probe_tag", "model"))
+  tag = os.environ.get("PROBE_TAG", "model")
   checkpointer = WanCheckpointerV2V(config=config)
   pipeline, _, step = checkpointer.load_checkpoint()
   max_logging.log(f"[{tag}] loaded (ckpt step={step})")
