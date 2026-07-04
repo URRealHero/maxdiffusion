@@ -36,13 +36,13 @@ INNER = HEADS * DIM_HEAD
 BATCH = 2
 # (label, seq_len): 16384 = 4 shards x 4096, block-alignable at 512/1024/2048.
 # 15600 = the real v2v shard size as a total (not alignable); 62400 = real v2v seq.
-PROBE_SEQS = [("alignable-16384", 16384), ("v2v-like-15600", 15600), ("real-62400", 62400)]
+PROBE_SEQS = [("alignable-16384", 16384), ("v2v-like-15600", 15600)]
 
 AXIS_Q = ("activation_batch", "activation_self_attn_heads", "activation_self_attn_q_length", "activation_kv")
 AXIS_KV = ("activation_batch", "activation_self_attn_heads", "activation_kv_length", "activation_kv")
 
 
-def dense_reference(q, k, v, q_chunk=2048):
+def dense_reference(q, k, v, scale, q_chunk=2048):
   """fp32 full-softmax attention, q-chunked so the score matrix never exceeds
   [q_chunk, S] per (batch, head). Exact math, bounded memory. [B,S,H*D] in/out."""
   b, s, _ = q.shape
@@ -51,9 +51,9 @@ def dense_reference(q, k, v, q_chunk=2048):
   vh = v.reshape(b, s, HEADS, DIM_HEAD).astype(jnp.float32)
 
   @jax.jit
-  def one_chunk(q_blk, k_bh, v_bh):
+  def one_chunk(q_blk, k_bh, v_bh, scale):
     # q_blk [C, D], k_bh/v_bh [S, D]
-    scores = (q_blk @ k_bh.T) / jnp.sqrt(DIM_HEAD)  # [C, S]
+    scores = (q_blk @ k_bh.T) * scale  # [C, S]
     return jax.nn.softmax(scores, axis=-1) @ v_bh  # [C, D]
 
   out = np.zeros((b, s, HEADS, DIM_HEAD), dtype=np.float32)
@@ -62,7 +62,7 @@ def dense_reference(q, k, v, q_chunk=2048):
       k_bh, v_bh = kh[bi, :, h, :], vh[bi, :, h, :]
       for start in range(0, s, q_chunk):
         blk = qh[bi, start : start + q_chunk, h, :]
-        out[bi, start : start + q_chunk, h, :] = np.asarray(one_chunk(blk, k_bh, v_bh))
+        out[bi, start : start + q_chunk, h, :] = np.asarray(one_chunk(blk, k_bh, v_bh, scale))
   return out.reshape(b, s, INNER)
 
 
@@ -100,7 +100,9 @@ def main(argv):
     k = jax.random.normal(kk, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
     v = jax.random.normal(kv, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
 
-    ref = np.asarray(dense_reference(q, k, v)).astype(np.float32)
+    # Which softmax temperature does each kernel implement? Compare against BOTH.
+    ref_scaled = dense_reference(q, k, v, 1.0 / np.sqrt(DIM_HEAD)).astype(np.float32)
+    ref_unscaled = dense_reference(q, k, v, 1.0).astype(np.float32)
     results = {}
     for kernel in ("flash", "tokamax_ring"):
       try:
@@ -113,7 +115,8 @@ def main(argv):
       return f"max|d|={d.max():.4f} mean|d|={d.mean():.6f}"
 
     for kernel, out in results.items():
-      max_logging.log(f"[{label}] {kernel:13s} vs dense-ref : {stats(out, ref)}")
+      max_logging.log(f"[{label}] {kernel:13s} vs ref(1/sqrt(d)) : {stats(out, ref_scaled)}")
+      max_logging.log(f"[{label}] {kernel:13s} vs ref(unscaled)  : {stats(out, ref_unscaled)}")
     if len(results) == 2:
       max_logging.log(f"[{label}] ring vs flash          : {stats(results['tokamax_ring'], results['flash'])}")
   max_logging.log("PROBE DONE")
