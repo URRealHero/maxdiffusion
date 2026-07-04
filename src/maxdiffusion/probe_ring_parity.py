@@ -104,14 +104,21 @@ def main(argv):
 
     # Temperature grid: which softmax scale does each kernel implement?
     LOG2E = float(np.log2(np.e))
+    n_shards = int(mesh.shape.get("context", 1))
     refs = {
         "1/sqrt(dh)": dense_reference(q, k, v, 1.0 / np.sqrt(DIM_HEAD)).astype(np.float32),
         "unscaled": dense_reference(q, k, v, 1.0).astype(np.float32),
-        "log2e/sqrt(dh)": dense_reference(q, k, v, LOG2E / np.sqrt(DIM_HEAD)).astype(np.float32),
-        "1/dh": dense_reference(q, k, v, 1.0 / DIM_HEAD).astype(np.float32),
-        "1/sqrt(inner)": dense_reference(q, k, v, 1.0 / np.sqrt(INNER)).astype(np.float32),
-        "sqrt(dh)... none*log2e": dense_reference(q, k, v, LOG2E).astype(np.float32),
     }
+    if n_shards > 1:
+      # Block-diagonal hypothesis: each ctx shard attends ONLY its own chunk
+      # (no kv exchange in the legacy flash branch under sequence sharding).
+      for sc_name, sc in (("1/sqrt(dh)", 1.0 / np.sqrt(DIM_HEAD)), ("unscaled", 1.0)):
+        chunks = []
+        csz = seq // n_shards
+        for ci in range(n_shards):
+          sl = slice(ci * csz, (ci + 1) * csz)
+          chunks.append(dense_reference(q[:, sl], k[:, sl], v[:, sl], sc))
+        refs[f"blockdiag-{sc_name}"] = np.concatenate(chunks, axis=1).astype(np.float32)
     results = {}
     for kernel in ("flash", "tokamax_ring"):
       try:
