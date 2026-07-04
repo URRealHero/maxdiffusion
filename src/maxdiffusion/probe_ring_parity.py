@@ -42,16 +42,28 @@ AXIS_Q = ("activation_batch", "activation_self_attn_heads", "activation_self_att
 AXIS_KV = ("activation_batch", "activation_self_attn_heads", "activation_kv_length", "activation_kv")
 
 
-def dense_reference(q, k, v):
-  """fp32 full-softmax attention on unsharded arrays. [B, S, H*D] layout in/out."""
+def dense_reference(q, k, v, q_chunk=2048):
+  """fp32 full-softmax attention, q-chunked so the score matrix never exceeds
+  [q_chunk, S] per (batch, head). Exact math, bounded memory. [B,S,H*D] in/out."""
   b, s, _ = q.shape
-  qh = q.reshape(b, s, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
-  kh = k.reshape(b, s, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
-  vh = v.reshape(b, s, HEADS, DIM_HEAD).transpose(0, 2, 1, 3).astype(jnp.float32)
-  scores = jnp.einsum("bhqd,bhkd->bhqk", qh, kh) / jnp.sqrt(DIM_HEAD)
-  probs = jax.nn.softmax(scores, axis=-1)
-  out = jnp.einsum("bhqk,bhkd->bhqd", probs, vh)
-  return out.transpose(0, 2, 1, 3).reshape(b, s, INNER)
+  qh = q.reshape(b, s, HEADS, DIM_HEAD).astype(jnp.float32)
+  kh = k.reshape(b, s, HEADS, DIM_HEAD).astype(jnp.float32)
+  vh = v.reshape(b, s, HEADS, DIM_HEAD).astype(jnp.float32)
+
+  @jax.jit
+  def one_chunk(q_blk, k_bh, v_bh):
+    # q_blk [C, D], k_bh/v_bh [S, D]
+    scores = (q_blk @ k_bh.T) / jnp.sqrt(DIM_HEAD)  # [C, S]
+    return jax.nn.softmax(scores, axis=-1) @ v_bh  # [C, D]
+
+  out = np.zeros((b, s, HEADS, DIM_HEAD), dtype=np.float32)
+  for bi in range(b):
+    for h in range(HEADS):
+      k_bh, v_bh = kh[bi, :, h, :], vh[bi, :, h, :]
+      for start in range(0, s, q_chunk):
+        blk = qh[bi, start : start + q_chunk, h, :]
+        out[bi, start : start + q_chunk, h, :] = np.asarray(one_chunk(blk, k_bh, v_bh))
+  return out.reshape(b, s, INNER)
 
 
 def run_kernel(kernel, q, k, v, mesh, config):
