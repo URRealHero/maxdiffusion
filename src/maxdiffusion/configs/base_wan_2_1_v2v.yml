@@ -432,6 +432,11 @@ v2v_eval_output_dir: ''
 v2v_eval_host_index: 0
 v2v_eval_host_count: 1
 v2v_eval_limit: 0  # >0 = cap this host's shard (smoke)
+# After finishing its own shard, a worker sweeps the FULL manifest for clips still
+# missing on GCS (a dead worker's shard) — kills the straggler tail. Hashed per-host
+# ordering + per-batch existence re-checks bound duplicate work. Auto-off when
+# host_count==1 or a limit is set.
+v2v_eval_steal: True
 # When True, run + print the V2V-1e plumbing gate checks (checkpoint load /
 # denoise-half finite / decode shape+range / cond-half-clean).
 v2v_gen_gate_checks: True

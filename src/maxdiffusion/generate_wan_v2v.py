@@ -321,7 +321,7 @@ def _load_manifest_rows(config):
   if limit > 0:
     shard = shard[:limit]
   max_logging.log(f"V2V-1f: manifest {path}: {len(rows)} rows -> host {hi}/{hc} shard {len(shard)} (limit={limit})")
-  return shard
+  return shard, rows
 
 
 def _read_records_grouped(rows):
@@ -351,10 +351,12 @@ def run_sweep(config):
   out_dir = str(getattr(config, "v2v_eval_output_dir", "") or "").strip().rstrip("/")
   if not out_dir:
     raise ValueError("v2v_eval_output_dir must be set in sweep mode")
-  rows = _load_manifest_rows(config)
+  rows, rows_all = _load_manifest_rows(config)
   rows = [r for r in rows if not tf.io.gfile.exists(f"{out_dir}/{r['sample_id']}_gen.mp4")]
-  max_logging.log(f"V2V-1f: {len(rows)} clips to generate after resume-skip")
-  if not rows:
+  steal = bool(getattr(config, "v2v_eval_steal", True)) and int(getattr(config, "v2v_eval_host_count", 1)) > 1 \
+      and int(getattr(config, "v2v_eval_limit", 0)) == 0
+  max_logging.log(f"V2V-1f: {len(rows)} clips to generate after resume-skip (steal={steal})")
+  if not rows and not steal:
     return
 
   checkpointer = WanCheckpointerV2V(config=config)
@@ -373,11 +375,10 @@ def run_sweep(config):
   B = int(mesh_shape.get("data", 1)) * int(mesh_shape.get("fsdp", 1))
   max_logging.log(f"V2V-1f: batch = {B} distinct records per denoise pass")
 
-  features = _read_records_grouped(rows)
-  todo = [r["sample_id"] for r in rows]
   t_start = time.time()
-  for c0 in range(0, len(todo), B):
-    chunk = todo[c0 : c0 + B]
+  n_done = [0]
+
+  def _gen_batch(chunk, features, label):
     real = len(chunk)
     padded = chunk + [chunk[-1]] * (B - real)
     cond = np.stack([features[s][0] for s in padded])
@@ -388,7 +389,7 @@ def run_sweep(config):
     tgt, info = denoise_v2v(pipeline, config, cond, cam_c, cam_t, ehs, encoder_hidden_states_neg=neg)
     if not info["tgt_finite"]:
       max_logging.log(f"V2V-1f: WARNING nonfinite tgt in chunk {chunk} — skipping save")
-      continue
+      return
     for j in range(real):
       sid = chunk[j]
       den = pipeline._denormalize_latents(tgt[j : j + 1])
@@ -397,9 +398,33 @@ def run_sweep(config):
       export_to_video(video[0], local, fps=int(config.fps))
       tf.io.gfile.copy(local, f"{out_dir}/{sid}_gen.mp4", overwrite=True)
       os.remove(local)
-    done = c0 + real
-    rate = (time.time() - t_start) / max(done, 1)
-    max_logging.log(f"V2V-1f: {done}/{len(todo)} clips done ({rate:.1f}s/clip incl. compile)")
+      n_done[0] += 1
+    rate = (time.time() - t_start) / max(n_done[0], 1)
+    max_logging.log(f"V2V-1f: {n_done[0]} clips done [{label}] ({rate:.1f}s/clip incl. compile)")
+
+  # PRIMARY pass: this host's static shard.
+  if rows:
+    features = _read_records_grouped(rows)
+    todo = [r["sample_id"] for r in rows]
+    for c0 in range(0, len(todo), B):
+      _gen_batch(todo[c0 : c0 + B], features, "own-shard")
+
+  # STEAL pass (kills the straggler tail): after finishing our shard, sweep the FULL
+  # manifest for sids still missing on GCS (a crashed worker's shard) and generate
+  # them. Per-host hashed ordering makes racing workers pick different leftovers
+  # first; a per-batch existence re-check bounds duplicate work to ~one batch.
+  if steal:
+    import hashlib
+    hi = int(getattr(config, "v2v_eval_host_index", 0))
+    left = [r for r in rows_all if not tf.io.gfile.exists(f"{out_dir}/{r['sample_id']}_gen.mp4")]
+    left.sort(key=lambda r: hashlib.md5(f"{r['sample_id']}:{hi}".encode()).hexdigest())
+    max_logging.log(f"V2V-1f: steal pass sees {len(left)} missing clips")
+    for c0 in range(0, len(left), B):
+      batch_rows = [r for r in left[c0 : c0 + B] if not tf.io.gfile.exists(f"{out_dir}/{r['sample_id']}_gen.mp4")]
+      if not batch_rows:
+        continue
+      feats = _read_records_grouped(batch_rows)
+      _gen_batch([r["sample_id"] for r in batch_rows], feats, "steal")
   max_logging.log("V2V-1f: SWEEP SHARD COMPLETE")
 
 
