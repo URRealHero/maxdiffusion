@@ -36,7 +36,7 @@ INNER = HEADS * DIM_HEAD
 BATCH = 2
 # (label, seq_len): 16384 = 4 shards x 4096, block-alignable at 512/1024/2048.
 # 15600 = the real v2v shard size as a total (not alignable); 62400 = real v2v seq.
-PROBE_SEQS = [("alignable-16384", 16384), ("v2v-like-15600", 15600)]
+PROBE_SEQS = [("alignable-16384", 16384)]
 
 AXIS_Q = ("activation_batch", "activation_self_attn_heads", "activation_self_attn_q_length", "activation_kv")
 AXIS_KV = ("activation_batch", "activation_self_attn_heads", "activation_kv_length", "activation_kv")
@@ -81,6 +81,8 @@ def run_kernel(kernel, q, k, v, mesh, config):
         dtype=jnp.bfloat16,
         attention_kernel=kernel,
         mask_padding_tokens=bool(getattr(config, "mask_padding_tokens", True)),
+        use_base2_exp=bool(getattr(config, "use_base2_exp", False)),
+        use_experimental_scheduler=bool(getattr(config, "use_experimental_scheduler", False)),
     )
   return np.asarray(jax.device_get(out)).astype(np.float32)
 
@@ -100,9 +102,16 @@ def main(argv):
     k = jax.random.normal(kk, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
     v = jax.random.normal(kv, (BATCH, seq, INNER), dtype=jnp.bfloat16).astype(jnp.float32)
 
-    # Which softmax temperature does each kernel implement? Compare against BOTH.
-    ref_scaled = dense_reference(q, k, v, 1.0 / np.sqrt(DIM_HEAD)).astype(np.float32)
-    ref_unscaled = dense_reference(q, k, v, 1.0).astype(np.float32)
+    # Temperature grid: which softmax scale does each kernel implement?
+    LOG2E = float(np.log2(np.e))
+    refs = {
+        "1/sqrt(dh)": dense_reference(q, k, v, 1.0 / np.sqrt(DIM_HEAD)).astype(np.float32),
+        "unscaled": dense_reference(q, k, v, 1.0).astype(np.float32),
+        "log2e/sqrt(dh)": dense_reference(q, k, v, LOG2E / np.sqrt(DIM_HEAD)).astype(np.float32),
+        "1/dh": dense_reference(q, k, v, 1.0 / DIM_HEAD).astype(np.float32),
+        "1/sqrt(inner)": dense_reference(q, k, v, 1.0 / np.sqrt(INNER)).astype(np.float32),
+        "sqrt(dh)... none*log2e": dense_reference(q, k, v, LOG2E).astype(np.float32),
+    }
     results = {}
     for kernel in ("flash", "tokamax_ring"):
       try:
@@ -115,8 +124,8 @@ def main(argv):
       return f"max|d|={d.max():.4f} mean|d|={d.mean():.6f}"
 
     for kernel, out in results.items():
-      max_logging.log(f"[{label}] {kernel:13s} vs ref(1/sqrt(d)) : {stats(out, ref_scaled)}")
-      max_logging.log(f"[{label}] {kernel:13s} vs ref(unscaled)  : {stats(out, ref_unscaled)}")
+      for rname, ref in refs.items():
+        max_logging.log(f"[{label}] {kernel:13s} vs ref[{rname:18s}]: {stats(out, ref)}")
     if len(results) == 2:
       max_logging.log(f"[{label}] ring vs flash          : {stats(results['tokamax_ring'], results['flash'])}")
   max_logging.log("PROBE DONE")
