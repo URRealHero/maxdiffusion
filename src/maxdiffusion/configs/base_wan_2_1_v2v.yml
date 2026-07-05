@@ -356,7 +356,7 @@ save_optimizer: False
 adam_b1: 0.9 # Exponential decay rate to track the first moment of past gradients.
 adam_b2: 0.999 # Exponential decay rate to track the second moment of past gradients.
 adam_eps: 1.e-8 # A small constant applied to denominator outside of the square root.
-adam_weight_decay: 0.0 # AdamW Weight decay
+adam_weight_decay: 0.01 # AdamW Weight decay, hydra default 0.01
 opt_enable_grad_clipping: False
 max_grad_value: 1.0
 opt_enable_grad_global_norm_clipping: False

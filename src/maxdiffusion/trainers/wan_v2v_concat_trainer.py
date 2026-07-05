@@ -596,15 +596,33 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
       )
   )
 
+  new_state = state.apply_gradients(grads=grads)
+
+  # Weight-magnitude probes on the POST-update trainable params. The zero-init
+  # camera encoders' absmax IS the conditioning-learning signal: it must climb
+  # past 2^-8 (=0.0039) toward the official ~0.13. Flatlining at 0.0039 = the
+  # bf16 update-underflow stall (see cast_with_exclusion fp32 exclusion). Watch
+  # weights/cam_encoder_con_absmax in tensorboard from step 0.
+  def _family_absmax(params, keyword):
+    def _m(path, arr):
+      ps = jax.tree_util.keystr(path)
+      return jnp.max(jnp.abs(arr)).astype(jnp.float32) if keyword in ps else jnp.float32(0.0)
+    return jax.tree_util.tree_reduce(
+        jnp.maximum, jax.tree_util.tree_map_with_path(_m, params), jnp.float32(0.0)
+    )
+
   metrics = {
       "scalar": {
           "learning/loss": loss,
           "learning/max_grad_norm": max_grad_norm,
           "learning/max_abs_grad": max_abs_grad,
           "learning/v2v_grad_norm": v2v_grad_norm,
+          "weights/cam_encoder_con_absmax": _family_absmax(new_state.params, "cam_encoder_con"),
+          "weights/cam_encoder_tgt_absmax": _family_absmax(new_state.params, "cam_encoder_tgt"),
+          "weights/projector_absmax": _family_absmax(new_state.params, "projector"),
+          "weights/tokenizer_absmax": _family_absmax(new_state.params, "tokenizer"),
       },
       "scalars": {},
   }
 
-  new_state = state.apply_gradients(grads=grads)
   return new_state, scheduler_state, metrics, new_rng
