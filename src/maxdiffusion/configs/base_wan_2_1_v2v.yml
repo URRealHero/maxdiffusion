@@ -129,15 +129,21 @@ mask_padding_tokens: True
 attention_sharding_uniform: True
 dropout: 0.0
 
+# Flash splash-attention tile sizes. 2048 (not the 512 other configs use) is tuned for the v2v
+# 62,400-token concat sequence: bigger q/kv tiles => fewer grid steps + less HBM<->VMEM traffic
+# => -30% step time (21.6->15.1s on v6e-128), math unchanged. Validated 2026-07-04 (debug-8
+# battery: 512=22.1s, 1024=16.2s, 2048=15.3s; 4096 OOMs vmem). MUST keep mask_padding_tokens=True
+# at this tile: splash pads 62400->63488 and unmasked pad tokens NaN training within ~10 steps.
+# Do NOT copy 2048 to the 2.2 configs (shorter sequences; 512 is right there).
 flash_block_sizes: {
-  "block_q" : 512,
-  "block_kv_compute" : 512,
-  "block_kv" : 512,
-  "block_q_dkv" : 512,
-  "block_kv_dkv" : 512,
-  "block_kv_dkv_compute" : 512,
-  "block_q_dq" : 512,
-  "block_kv_dq" : 512,
+  "block_q" : 2048,
+  "block_kv_compute" : 2048,
+  "block_kv" : 2048,
+  "block_q_dkv" : 2048,
+  "block_kv_dkv" : 2048,
+  "block_kv_dkv_compute" : 2048,
+  "block_q_dq" : 2048,
+  "block_kv_dq" : 2048,
   "use_fused_bwd_kernel": False,
 }
 # GroupNorm groups
@@ -231,13 +237,19 @@ data_sharding: [['data', 'fsdp', 'context', 'tensor']]
 # value to auto-shard based on available slices and devices.
 # By default, product of the DCN axes should equal number of slices
 # and product of the ICI axes should equal number of devices per slice.
-dcn_data_parallelism: 1  # recommended DCN axis to be auto-sharded
+dcn_data_parallelism: -1  # auto-shard across slices on the data axis (single-slice: =1)
 dcn_fsdp_parallelism: 1
-dcn_context_parallelism: -1
+dcn_context_parallelism: 1  # NOT -1: never auto-shard sequence across slices for v2v (block-diagonal)
 dcn_tensor_parallelism: 1
+# v2v MUST NOT shard the sequence: attention=flash with ici_context>1 (or tensor>1) silently
+# computes BLOCK-DIAGONAL attention (each shard attends only itself — verified 2026-07-04) AND
+# can deadlock. So context/tensor are pinned to 1 and the whole slice is filled with FSDP
+# (ici_fsdp=-1 auto-sizes to the chip count) => correct + functional on any pod without a
+# launcher. For the tuned split use the launcher's ICI_DATA=16 ICI_FSDP=8 (data*fsdp still = the
+# batch axis; ~2% faster at 128-chip). NEVER set ici_context/ici_tensor >1 for v2v.
 ici_data_parallelism: 1
-ici_fsdp_parallelism: 1
-ici_context_parallelism: -1  # recommended ICI axis to be auto-sharded
+ici_fsdp_parallelism: -1
+ici_context_parallelism: 1
 ici_tensor_parallelism: 1
 
 allow_split_physical_axes: False
