@@ -273,7 +273,11 @@ class BaseWanTrainer(abc.ABC):
       if restore_args:
         step = restore_args.get("step", 0)
         max_logging.log(f"Restoring optimizer and resuming from step {step}")
-        state.replace(opt_state=restore_args.get("opt_state"), step=restore_args.get("step", 0))
+        # flax.struct.replace() is FUNCTIONAL — returns a new object, does NOT mutate
+        # in place. Without reassignment the restored opt_state (Adam m/v moments +
+        # internal step count) was silently discarded, zeroing optimizer momentum on
+        # every resume (weights + step still restored via other paths). Reassign.
+        state = state.replace(opt_state=restore_args.get("opt_state"), step=restore_args.get("step", 0))
         del restore_args["opt_state"]
         del optimizer
       state = jax.tree.map(_to_array, state)
