@@ -73,6 +73,15 @@ def cast_with_exclusion(path, x, dtype_to_cast):
       "condition_embedder",  # The entire time/text conditioning module
       "scale_shift_table",  # Catches both the final and the AdaLN tables
       "lora_",  # Keep trainable LoRA adapters in fp32 for TPU mixed-precision stability
+      # V2V/HyDRA trainable families — SAME reason as lora_ above (this was the bug:
+      # weights_dtype=bfloat16 + AdamW lr 1e-5 => each ~1e-5 update is below the bf16
+      # rounding step at the weight's magnitude, so weight+update rounds back to weight
+      # and the conditioning params freeze at the bf16 wall (~2^-8) instead of growing to
+      # the official ~0.13. Keeping ONLY these (the trainable set) in fp32 is frugal:
+      # the frozen base stays bf16. Matches v2v_trainable_param_substrings.
+      "cam_encoder",   # cam_encoder_con / cam_encoder_tgt (zero-init camera encoders)
+      "projector",     # per-block self-attn output projector (identity-init)
+      "attn1",         # trainable self-attention (q/k/v/o) incl. the MemoryTokenizer under it
   ]
 
   path_str = ".".join(str(k.key) if isinstance(k, jax.tree_util.DictKey) else str(k) for k in path)
