@@ -422,8 +422,19 @@ class BaseWanTrainer(abc.ABC):
       if writer:
         writer.flush()
       if self.config.save_final_checkpoint:
-        max_logging.log(f"Saving final checkpoint for step {step}")
-        self.checkpointer.save_checkpoint(self.config.max_train_steps - 1, pipeline, state.params)
+        final_step = self.config.max_train_steps - 1
+        max_logging.log(f"Saving final checkpoint for step {final_step}")
+        # Mirror the periodic-save branch (above) so the final checkpoint is
+        # structurally/dtype aligned with the prior checkpoints. With
+        # save_optimizer=True the periodic saves persist the FULL train state
+        # (incl. the fp32 master weights); saving only state.params here would
+        # emit an "independent" params-only checkpoint holding just the bf16
+        # working copy -> the final ckpt would be lower precision than every
+        # prior one. Save whatever the periodic path saves.
+        if self.config.save_optimizer:
+          self.checkpointer.save_checkpoint(final_step, pipeline, state)
+        else:
+          self.checkpointer.save_checkpoint(final_step, pipeline, state.params)
         self.checkpointer.checkpoint_manager.wait_until_finished()
       # load new state for trained transformer
       pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)
