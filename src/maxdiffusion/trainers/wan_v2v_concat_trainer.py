@@ -417,7 +417,15 @@ class WanV2VConcatTrainer(WanTrainer):
     return WanCheckpointerV2V(config=self.config)
 
   def get_data_shardings(self, mesh):
-    data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
+    # Shard the input batch over ('data','fsdp') ONLY (the activation batch axes).
+    # With per_device_batch_size<1 the loader delivers batch=num_devices and the
+    # train step slices to global_batch_size_to_train_on IN-JIT; slicing a batch
+    # dim sharded across the context axis silently corrupts the samples that must
+    # migrate between context shards (repro'd 2026-07-06: half the sliced batch
+    # comes back 100% NaN). ('data','fsdp') is divisible before AND after the
+    # slice, and matches the model's activation batch sharding. bs>=1 runs are
+    # unaffected (the slice is a no-op there).
+    data_sharding = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
     return {
         "cond_latents": data_sharding,
         "tgt_latents": data_sharding,
@@ -529,7 +537,7 @@ class WanV2VConcatTrainer(WanTrainer):
     # (inside _make_tfrecord_iterator). None when v2v_split_mode == 'all' -> no filter.
     split_filter_fn = _v2v_make_split_filter(config)
 
-    return make_data_iterator(
+    data_iterator = make_data_iterator(
         config,
         jax.process_index(),
         jax.process_count(),
@@ -540,6 +548,20 @@ class WanV2VConcatTrainer(WanTrainer):
         is_training=is_training,
         filter_fn=split_filter_fn,
     )
+    # Reshard each loaded batch to the activation batch sharding ('data','fsdp')
+    # OUTSIDE jit. The multihost loader hardcodes batch -> ALL mesh axes
+    # (multihost_dataloading.py:_build_global_shape_and_sharding); with
+    # per_device_batch_size<1 the in-step slice of that layout silently corrupts
+    # the samples that must migrate across the context axis (repro'd 2026-07-06:
+    # half the sliced batch returns 100% NaN). jax.device_put here is the
+    # guaranteed-correct reshard; must match get_data_shardings (jit in_shardings).
+    batch_sharding = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
+
+    def _reshard_batches(inner):
+      for batch in inner:
+        yield {k: jax.device_put(v, batch_sharding) for k, v in batch.items()}
+
+    return _reshard_batches(data_iterator)
 
   def get_train_step(self, pipeline, mesh, state_shardings, data_shardings):
     return jax.jit(
