@@ -1,0 +1,511 @@
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This sentinel is a reminder to choose a real run name.
+run_name: ''
+
+metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
+# If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
+write_metrics: True
+
+timing_metrics_file: "" # for testing, local file that stores function timing metrics such as state creation, compilation. If empty, no metrics are written.
+write_timing_metrics: True
+
+gcs_metrics: False
+# If true save config to GCS in {base_output_directory}/{run_name}/
+save_config_to_gcs: False
+log_period: 100
+
+pretrained_model_name_or_path: 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'
+model_name: wan2.1
+model_type: 'T2V'
+
+# V2V-1a (HyDRA baseline): enable per-block camera injection + projector scaffold
+# in WanModel. Zero/identity init => no-op at start of training. The V2V input is a
+# frame-concat of a conditioning clip and a target clip along the latent-frame axis.
+v2v_concat: True
+
+# V2V-2a HyDRA memory: when True, each self-attention adds a MemoryTokenizer
+# (Conv3d 2x2x2) + compressed k/v + frame similarity (retrieval attention = V2V-2b).
+# Default False -> pure baseline. NOTE: context parallelism (ici_context>1) hangs with
+# attention='flash' but works with attention='ulysses' (heads % ici_context == 0);
+# see CONTEXT_PARALLEL_DEADLOCK.md.
+hydra: False
+
+# V2V-1c partial fine-tune: only params whose path contains one of these
+# comma-separated substrings are trained; everything else is frozen via
+# optax.set_to_zero (HyDRA _freeze_and_mark_trainables). maxdiffusion names the
+# self-attention module `attn1` (HyDRA's `self_attn`). Empty => full fine-tune.
+v2v_trainable_param_substrings: "cam_encoder_con,cam_encoder_tgt,projector,attn1"
+# When True (with v2v_trainable_param_substrings set), checkpoints save ONLY the
+# trainable params; the frozen Wan2.1 base is restored + adapters overlaid on load.
+save_lora_only: False
+
+# Camera-in-the-batch policy. The re-encoded tv2v tfrecs carry cam_emb_con/cam_emb_tgt
+# [N_lat,12] directly (used as-is). For older camera-less encodes, when this is True the
+# loader computes them on the fly from each sample's camera.json (HyDRA convention).
+# NOTE: the fallback needs a per-record identifier to locate camera.json; the current
+# encoder writes NO `sample_id` tfrec feature, so the fallback only works if a future
+# encoder emits one. With the current --with-camera data the primary (tfrec) path is used.
+v2v_camera_from_json_fallback: True
+# Roots under which <sample_id>/camera.json is looked up by the fallback (local first,
+# then GCS). Only consulted when a record lacks cam_emb_* AND carries a sample_id.
+v2v_camera_json_local_root: '/data-2u-2/spu/HM-World'
+v2v_camera_json_gcs_root: 'gs://data_us_central1_a/hmworld_raw/HM-World/HM-World'
+
+# Overrides the transformer from pretrained_model_name_or_path
+wan_transformer_pretrained_model_name_or_path: ''
+
+unet_checkpoint: ''
+revision: ''
+# This will convert the weights to this dtype.
+# When running inference on TPUv5e, use weights_dtype: 'bfloat16'
+weights_dtype: 'bfloat16'
+# This sets the layer's dtype in the model. Ex: nn.Dense(dtype=activations_dtype)
+activations_dtype: 'bfloat16'
+# The dtype for text_encoder model during load/compile
+text_encoder_dtype: 'float32'
+
+# Whether to compile the text_encoder with torch.compile
+compile_text_encoder: False
+
+# Maximum sequence length for the text encoder
+max_sequence_length: 512
+
+vae_weights_dtype: 'float32'
+vae_dtype: 'float32'
+scheduler_dtype: 'float32'
+
+# Replicates vae across devices instead of using the model's sharding annotations for sharding.
+replicate_vae: False
+
+# Chunk size for VAE decode scan. Increase to improve decode time at the cost of memory.
+vae_decode_chunk: 1
+
+# Chunk size for VAE encode scan. (num_input_frames - 1) must be divisible by this value.
+# Increase to improve encode time at the cost of memory.
+vae_encode_chunk: 4
+vae_spatial: -1
+
+# matmul and conv precision from https://jax.readthedocs.io/en/latest/jax.lax.html#jax.lax.Precision
+# Options are "DEFAULT", "HIGH", "HIGHEST"
+# fp32 activations and fp32 weights with HIGHEST will provide the best precision
+# at the cost of time.
+precision: "DEFAULT"
+# Use jax.lax.scan for transformer layers
+scan_layers: True
+
+# if False state is not jitted and instead replicate is called. This is good for debugging on single host
+# It must be True for multi-host.
+jit_initializers: True
+
+# Set true to load weights from pytorch
+from_pt: True
+split_head_dim: True
+attention: 'flash' # Supported attention: dot_product, flash, cudnn_flash_te, ring, ulysses
+use_base2_exp: True
+use_experimental_scheduler: True
+flash_min_seq_length: 0
+
+# If mask_padding_tokens is True, we pass in segment ids to splash attention to avoid attending to padding tokens.
+# Else we do not pass in segment ids and on vpu bound hardware like trillium this is faster.
+# However, when padding tokens are significant, this will lead to worse quality and should be set to True.
+mask_padding_tokens: True
+# Maxdiffusion has 2 types of attention sharding strategies:
+# 1. attention_sharding_uniform = True : same sequence sharding rules applied for q in both (self and cross attention)
+# 2. attention_sharding_uniform = False : Heads are sharded uniformly across devices for self attention while sequence is sharded
+#    in cross attention q.
+attention_sharding_uniform: False  # ctxrep: do NOT inject seq-sharding rules
+dropout: 0.0
+
+# Flash splash-attention tile sizes. 2048 (not the 512 other configs use) is tuned for the v2v
+# 62,400-token concat sequence: bigger q/kv tiles => fewer grid steps + less HBM<->VMEM traffic
+# => -30% step time (21.6->15.1s on v6e-128), math unchanged. Validated 2026-07-04 (debug-8
+# battery: 512=22.1s, 1024=16.2s, 2048=15.3s; 4096 OOMs vmem). MUST keep mask_padding_tokens=True
+# at this tile: splash pads 62400->63488 and unmasked pad tokens NaN training within ~10 steps.
+# Do NOT copy 2048 to the 2.2 configs (shorter sequences; 512 is right there).
+flash_block_sizes: {
+  "block_q" : 2048,
+  "block_kv_compute" : 2048,
+  "block_kv" : 2048,
+  "block_q_dkv" : 2048,
+  "block_kv_dkv" : 2048,
+  "block_kv_dkv_compute" : 2048,
+  "block_q_dq" : 2048,
+  "block_kv_dq" : 2048,
+  "use_fused_bwd_kernel": False,
+}
+# GroupNorm groups
+norm_num_groups: 32
+
+# train text_encoder - Currently not supported for SDXL
+train_text_encoder: False
+text_encoder_learning_rate: 4.25e-6
+
+# https://arxiv.org/pdf/2305.08891.pdf
+snr_gamma: -1.0
+
+timestep_bias: {
+  # a value of later will increase the frequence of the model's final training steps.
+  # none, earlier, later, range
+  strategy: "none",
+  # multiplier for bias, a value of 2.0 will double the weight of the bias, 0.5 will halve it.
+  multiplier: 1.0,
+  # when using strategy=range, the beginning (inclusive) timestep to bias.
+  begin: 0,
+  # when using strategy=range, the final step (inclusive) to bias.
+  end: 1000,
+  # portion of timesteps to bias.
+  # 0.5 will bias one half of the timesteps. Value of strategy determines
+  # whether the biased portions are in the earlier or later timesteps.
+  portion: 0.25
+}
+
+# Override parameters from checkpoints's scheduler.
+diffusion_scheduler_config: {
+  _class_name: 'FlaxEulerDiscreteScheduler',
+  prediction_type: 'epsilon',
+  rescale_zero_terminal_snr: False,
+  timestep_spacing: 'trailing'
+}
+
+# Output directory
+# Create a GCS bucket, e.g. my-maxtext-outputs and set this to "gs://my-maxtext-outputs/"
+base_output_directory: ""
+
+# Hardware
+hardware: 'tpu' # Supported hardware types are 'tpu', 'gpu'
+skip_jax_distributed_system: False
+
+# Parallelism
+mesh_axes: ['data', 'fsdp', 'context', 'tensor']
+
+# batch : batch dimension of data and activations
+# hidden :
+# embed : attention qkv dense layer hidden dim named as embed
+# heads : attention head dim = num_heads * head_dim
+# length : attention sequence length
+# temb_in : dense.shape[0] of resnet dense before conv
+# out_c : dense.shape[1] of resnet dense before conv
+# out_channels : conv.shape[-1] activation
+# keep_1 : conv.shape[0] weight
+# keep_2 : conv.shape[1] weight
+# conv_in : conv.shape[2] weight
+# conv_out : conv.shape[-1] weight
+# CTX-REPLICATED variant (b32 recipe on 128 chips with hydra=True): the 'context'
+# mesh axis exists ONLY for batch arithmetic (32 samples / 128 chips = 4 chips per
+# sample) and is mapped to NOTHING below — activations, params and sequence are
+# fully REPLICATED across it. Every chip sees the full 62,400-token sequence =
+# exactly the fsdp-only regime hydra is validated in. No seq sharding -> none of
+# the ctx>1 failure modes (flash-bwd deadlock, hydra reshape corruption). Cost:
+# ctx-fold redundant compute. Zero model-code / zero math changes vs base config.
+logical_axis_rules: [
+                      ['batch', ['data', 'fsdp']],
+                      ['activation_batch', ['data', 'fsdp']],
+                      ['activation_self_attn_heads', 'tensor'],
+                      ['activation_cross_attn_q_length', 'tensor'],
+                      ['activation_length', null],
+                      ['activation_heads', 'tensor'],
+                      ['mlp','tensor'],
+                      ['embed', 'fsdp'],
+                      ['heads', 'tensor'],
+                      ['norm', 'tensor'],
+                      ['conv_batch', ['data', 'fsdp']],
+                      ['out_channels', 'tensor'],
+                      ['conv_out', null],
+                    ]
+vae_logical_axis_rules: [
+                          ['activation_batch', 'redundant'],
+                          ['activation_length', 'vae_spatial'],
+                          ['activation_heads', null],
+                          ['activation_kv_length', null],
+                          ['embed', null],
+                          ['heads', null],
+                          ['norm', null],
+                          ['conv_batch', 'redundant'],
+                          ['out_channels', 'vae_spatial'],
+                          ['conv_out', 'vae_spatial'],
+                          ['conv_in', 'vae_spatial'],
+                        ]
+data_sharding: [['data', 'fsdp', 'context', 'tensor']]
+
+# One axis for each parallelism type may hold a placeholder (-1)
+# value to auto-shard based on available slices and devices.
+# By default, product of the DCN axes should equal number of slices
+# and product of the ICI axes should equal number of devices per slice.
+dcn_data_parallelism: -1  # auto-shard across slices on the data axis (single-slice: =1)
+dcn_fsdp_parallelism: 1
+dcn_context_parallelism: 1  # NOT -1: never auto-shard sequence across slices for v2v (block-diagonal)
+dcn_tensor_parallelism: 1
+# v2v MUST NOT shard the sequence: attention=flash with ici_context>1 (or tensor>1) silently
+# computes BLOCK-DIAGONAL attention (each shard attends only itself — verified 2026-07-04) AND
+# can deadlock. So context/tensor are pinned to 1 and the whole slice is filled with FSDP
+# (ici_fsdp=-1 auto-sizes to the chip count) => correct + functional on any pod without a
+# launcher. For the tuned split use the launcher's ICI_DATA=16 ICI_FSDP=8 (data*fsdp still = the
+# batch axis; ~2% faster at 128-chip). NEVER set ici_context/ici_tensor >1 for v2v.
+ici_data_parallelism: 1
+ici_fsdp_parallelism: -1
+ici_context_parallelism: 1
+ici_tensor_parallelism: 1
+
+allow_split_physical_axes: False
+
+# Dataset
+# Replace with dataset path or train_data_dir. One has to be set.
+dataset_name: 'diffusers/pokemon-gpt4-captions'
+train_split: 'train'
+dataset_type: 'tfrecord'
+cache_latents_text_encoder_outputs: True
+# cache_latents_text_encoder_outputs only apply to dataset_type="tf",
+# only apply to small dataset that fits in memory
+# prepare image latents and text encoder outputs
+# Reduce memory consumption and reduce step time during training
+# transformed dataset is saved at dataset_save_location
+dataset_save_location: ''
+load_tfrecord_cached: True
+# Re-encoded WAN2.1 tv2v tfrecords (77 raw -> 20 latent frames, WITH camera):
+#   latents/cond_latents [16,20,60,104], encoder_hidden_states [512,4096],
+#   cam_emb_con/cam_emb_tgt [20,12].
+train_data_dir: 'gs://data_us_central1_a/hmworld_data/wan_2_1/tv2v_encoded_full-hydra-style-camera'
+
+# Train/eval split by sample_id (held-out set). The re-encoded tv2v tfrecs carry a
+# `sample_id` bytes feature; the loader filters records via an in-graph
+# tf.lookup.StaticHashTable (multi-host safe) BEFORE batching.
+#   v2v_heldout_sids_file: GCS/local path to the held-out sids .txt (one sid per line).
+#                          Empty (default) => no split filtering (current behavior).
+#   v2v_split_mode: 'all'  -> no filter (default, strict no-op).
+#                   'train' -> EXCLUDE the held-out sids (train on full - held-out).
+#                   'eval'  -> INCLUDE ONLY the held-out sids (eval on held-out).
+# When v2v_split_mode is 'train'/'eval', v2v_heldout_sids_file must be set.
+v2v_heldout_sids_file: ''
+v2v_split_mode: 'all'
+dataset_config_name: ''
+jax_cache_dir: ''
+hf_data_dir: ''
+hf_train_files: ''
+hf_access_token: ''
+image_column: 'image'
+caption_column: 'text'
+resolution: 1024
+center_crop: False
+random_flip: False
+# If cache_latents_text_encoder_outputs is True
+# the num_proc is set to 1
+tokenize_captions_num_proc: 4
+transform_images_num_proc: 4
+reuse_example_batch: False
+enable_data_shuffling: True
+
+# Defines the type of gradient checkpoint to enable.
+# NONE - means no gradient checkpoint
+# FULL - means full gradient checkpoint, whenever possible (minimum memory usage)
+# MATMUL_WITHOUT_BATCH - means gradient checkpoint for every linear/matmul operation,
+# except for ones that involve batch dimension - that means that all attention and projection
+# layers will have gradient checkpoint, but not the backward with respect to the parameters.
+# OFFLOAD_MATMUL_WITHOUT_BATCH - same as MATMUL_WITHOUT_BATCH but offload instead of recomputing.
+# CUSTOM - set names to offload and save.
+remat_policy: "NONE"
+# For CUSTOM policy set below, current annotations are for: attn_output, query_proj, key_proj, value_proj
+# xq_out, xk_out, ffn_activation
+names_which_can_be_saved: []
+names_which_can_be_offloaded: []
+
+# checkpoint every number of samples, -1 means don't checkpoint.
+checkpoint_every: -1
+checkpoint_dir: ""
+# Directory to cache pretrained weights as an orbax checkpoint for fast inference loads.
+# On first run (slow, diffusers load), weights are saved here automatically.
+# On subsequent runs, weights are loaded from here instead (~10x faster).
+pretrained_orbax_dir: ""
+# enables one replica to read the ckpt then broadcast to the rest
+enable_single_replica_ckpt_restoring: False
+
+# Training loop
+learning_rate: 1.e-5
+scale_lr: False
+max_train_samples: -1
+# max_train_steps takes priority over num_train_epochs.
+max_train_steps: 1500
+num_train_epochs: 1
+seed: 0
+output_dir: 'sdxl-model-finetuned'
+per_device_batch_size: 1.0
+# If global_batch_size % jax.device_count is not 0, use FSDP sharding.
+global_batch_size: 0
+disable_training_weights: False # if True, disables the use of mid-point loss weighting
+
+# For creating tfrecords from dataset
+tfrecords_dir: ''
+no_records_per_shard: 0
+enable_eval_timesteps: False
+timesteps_list: [125, 250, 375, 500, 625, 750, 875]
+num_eval_samples: 420
+
+warmup_steps_fraction: 0.1
+learning_rate_schedule_steps: -1 # By default the length of the schedule is set to the number of steps.
+save_optimizer: False
+
+# However you may choose a longer schedule (learning_rate_schedule_steps > steps), in which case the training will end before
+# dropping fully down. Or you may choose a shorter schedule, where the unspecified steps will have a learning rate of 0.
+
+# AdamW optimizer parameters
+adam_b1: 0.9 # Exponential decay rate to track the first moment of past gradients.
+adam_b2: 0.999 # Exponential decay rate to track the second moment of past gradients.
+adam_eps: 1.e-8 # A small constant applied to denominator outside of the square root.
+adam_weight_decay: 0.01 # AdamW Weight decay, hydra default 0.01
+opt_enable_grad_clipping: False
+max_grad_value: 1.0
+opt_enable_grad_global_norm_clipping: False
+max_grad_norm: 1.0
+
+enable_profiler: False
+# Skip first n steps for profiling, to omit things like compilation and to give
+# the iteration time a chance to stabilize.
+skip_first_n_steps_for_profiler: 5
+profiler_steps: 10
+
+# Enable JAX named scopes for detailed profiling and debugging
+# When enabled, adds named scopes around key operations in transformer and attention layers
+enable_jax_named_scopes: False
+
+# Generation parameters
+prompt: "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+prompt_2: "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+negative_prompt: "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+do_classifier_free_guidance: True
+height: 480
+width: 832
+# Per-clip video frame count. (77-1)/4 + 1 = 20 latent frames per clip; the V2V
+# concat stacks a conditioning clip and a target clip -> 40 latent frames total.
+num_frames: 77
+guidance_scale: 5.0
+flow_shift: 3.0
+# TRAINING noise-schedule shift (official HyDRA trains AND infers at shift=5:
+# HyDRAPipeline FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)).
+# Our first retrains used the scheduler default 3.0 — a recipe deviation. -1 =
+# keep default (other model families unchanged); 5.0 = HyDRA-faithful.
+train_flow_shift: 5.0
+
+# Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
+use_cfg_cache: False
+use_kv_cache: False
+
+# Batch positive and negative prompts in text encoder to save compute.
+use_batched_text_encoder: False
+
+# Use jax.lax.scan for the diffusion loop (non-cache path only).
+# Note: Enabling this will disable per-step profiling.
+scan_diffusion_loop: False
+
+# Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+guidance_rescale: 0.0
+num_inference_steps: 30
+fps: 16
+save_final_checkpoint: False
+
+# ---------------------------------------------------------------------------
+# V2V-1e generation (src/maxdiffusion/generate_wan_v2v.py).
+# JAX port of HyDRA inference: given a conditioning clip (latents) + camera
+# (cam_emb_con/tgt) + text, seed the cond half CLEAN and iteratively denoise the
+# tgt half (FlowMatch scheduler), then VAE-decode the tgt clip. Inverse of the
+# training loss (wan_v2v_concat_trainer.v2v_concat_loss). Works for BOTH the
+# baseline (hydra=False) and hydra (hydra=True) models via the `hydra` flag; the
+# trained checkpoint is loaded via the training checkpoint path (checkpoint_dir).
+#
+# For the plumbing smoke, inputs come from ONE record of a -hydra-style-camera
+# tfrecord (cond_latents + cam_emb_con/tgt + encoder_hidden_states already
+# encoded), so the VAE encoder is not needed -- only the VAE DECODE at the end.
+# If v2v_record_tfrecord is empty, the first .tfrec under train_data_dir is used.
+v2v_record_tfrecord: ''
+v2v_record_index: 0
+v2v_output_video_name: 'v2v_output.mp4'
+# Official HyDRA checkpoint overlay (safetensors export of hydra.ckpt). When set,
+# the 540 TRAINED tensors (self_attn incl. tokenizer + cam encoders + projector,
+# 18/block) are loaded over the base + fresh-init params at pipeline load time.
+# Frozen families verified bit-equal to the Wan2.1-1.3B base. Requires
+# v2v_concat=True hydra=True. Used to certify our mechanism vs official HyDRA.
+wan_hydra_ckpt_path: ''
+# Optional negative text embedding (.npy, [512,4096]) for CFG in v2v generation
+# (the tfrecords carry only the positive embedding). Official HyDRA inference
+# uses cfg 5.0 with a long Chinese negative prompt; dump its T5 embedding and
+# point this at it. Empty => no CFG (guidance_scale must then be 1.0 to matter).
+v2v_neg_embedding_path: ''
+# V2V-1f held-out eval sweep: jsonl manifest rows {sample_id, tfrec, index}.
+# When set, generate_wan_v2v runs the manifest sweep instead of the single-record
+# path: rows are strided across hosts (host_index::host_count), each denoise
+# batch packs data*fsdp DISTINCT records, done sids are skipped (resume), and
+# outputs land at v2v_eval_output_dir/{sample_id}_gen.mp4.
+v2v_eval_manifest: ''
+v2v_eval_output_dir: ''
+v2v_eval_host_index: 0
+v2v_eval_host_count: 1
+v2v_eval_limit: 0  # >0 = cap this host's shard (smoke)
+# After finishing its own shard, a worker sweeps the FULL manifest for clips still
+# missing on GCS (a dead worker's shard) — kills the straggler tail. Hashed per-host
+# ordering + per-batch existence re-checks bound duplicate work. Auto-off when
+# host_count==1 or a limit is set.
+v2v_eval_steal: True
+# When True, run + print the V2V-1e plumbing gate checks (checkpoint load /
+# denoise-half finite / decode shape+range / cond-half-clean).
+v2v_gen_gate_checks: True
+
+# SDXL Lightning parameters
+lightning_from_pt: True
+# Empty or "ByteDance/SDXL-Lightning" to enable lightning.
+lightning_repo: ""
+# Empty or "sdxl_lightning_4step_unet.safetensors" to enable lightning.
+lightning_ckpt: ""
+
+# LoRA parameters
+enable_lora: False
+# Values are lists to support multiple LoRA loading during inference in the future.
+lora_config: {
+  rank: [64],
+  lora_model_name_or_path: [""],
+  weight_name: [""],
+  adapter_name: [""],
+  scale: [1.0],
+  from_pt: []
+}
+
+enable_mllog: False
+
+#controlnet
+controlnet_model_name_or_path: 'diffusers/controlnet-canny-sdxl-1.0'
+controlnet_from_pt: True
+controlnet_conditioning_scale: 0.5
+controlnet_image: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/1024px-Google_%22G%22_logo.svg.png'
+quantization: ''
+# Shard the range finding operation for quantization. By default this is set to number of slices.
+quantization_local_shard_count: -1
+compile_topology_num_slices: -1 # Number of target slices, set to a positive integer.
+use_qwix_quantization: False # Whether to use qwix for quantization. If set to True, the transformer of WAN will be quantized using qwix.
+# Quantization calibration method used for weights, activations and bwd. Supported methods can be found in https://github.com/google/qwix/blob/dc2a0770351c740e5ab3cce7c0efe9f7beacce9e/qwix/qconfig.py#L70-L80
+weight_quantization_calibration_method: "absmax"
+act_quantization_calibration_method: "absmax"
+bwd_quantization_calibration_method: "absmax"
+qwix_module_path: ".*"
+
+# Eval model on per eval_every steps. -1 means don't eval.
+eval_every: -1
+eval_data_dir: ""
+enable_generate_video_for_eval: False # This will increase the used TPU memory.
+eval_max_number_of_samples_in_bucket: 60 # The number of samples per bucket for evaluation. This is calculated by num_eval_samples / len(timesteps_list).
+
+enable_ssim: False
+
+# ML Diagnostics settings
+enable_ml_diagnostics: False
+profiler_gcs_path: ""
+enable_ondemand_xprof: False
