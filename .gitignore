@@ -144,6 +144,7 @@ runs
 /examples/runs
 /examples/**/*.args
 /examples/rag/sweep
+/examples/train_fun_camera_lora.sh
 
 # data
 /data
