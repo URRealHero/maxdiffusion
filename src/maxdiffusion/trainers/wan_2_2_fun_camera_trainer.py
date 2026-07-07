@@ -60,7 +60,14 @@ class Wan2_2FunCameraTrainer(WanTrainer):
     return WanCheckpointer2_2_FunCamera(config=self.config)
 
   def get_data_shardings(self, mesh):
-    data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
+    # Shard the input batch over ('data','fsdp') ONLY (the activation batch axes).
+    # With per_device_batch_size<1 the loader delivers batch=num_devices and the
+    # train step slices to global_batch_size_to_train_on IN-JIT; slicing a batch
+    # dim sharded across the context axis silently corrupts the samples that must
+    # migrate between context shards (root-caused + bitwise-validated on the v2v
+    # trainer 2026-07-06; same loader + same slice pattern here). bs>=1 unaffected
+    # (the slice is a no-op there).
+    data_sharding = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
     return {
         "latents": data_sharding,
         "latent_condition": data_sharding,
@@ -71,7 +78,7 @@ class Wan2_2FunCameraTrainer(WanTrainer):
 
   def get_eval_data_shardings(self, mesh):
     shardings = self.get_data_shardings(mesh)
-    shardings["timesteps"] = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
+    shardings["timesteps"] = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
     return shardings
 
   def load_dataset(self, mesh, pipeline=None, is_training=True):
@@ -107,7 +114,7 @@ class Wan2_2FunCameraTrainer(WanTrainer):
         out["timesteps"] = features["timesteps"]
       return out
 
-    return make_data_iterator(
+    data_iterator = make_data_iterator(
         config,
         jax.process_index(),
         jax.process_count(),
@@ -117,6 +124,19 @@ class Wan2_2FunCameraTrainer(WanTrainer):
         prepare_sample_fn=prepare_sample,
         is_training=is_training,
     )
+    # Reshard each loaded batch to the activation batch sharding ('data','fsdp')
+    # OUTSIDE jit. The multihost loader hardcodes batch -> ALL mesh axes
+    # (multihost_dataloading._build_global_shape_and_sharding); with bs<1 the
+    # in-step slice of that layout silently corrupts samples crossing the context
+    # axis (v2v repro 2026-07-06: half the sliced batch = 100% NaN). device_put
+    # here is the guaranteed-correct reshard; must match get_data_shardings.
+    batch_sharding = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
+
+    def _reshard_batches(inner):
+      for batch in inner:
+        yield {k: jax.device_put(v, batch_sharding) for k, v in batch.items()}
+
+    return _reshard_batches(data_iterator)
 
   def get_train_step(self, pipeline, mesh, state_shardings, data_shardings):
     p_t, p_h, p_w = pipeline.transformer.config.patch_size
