@@ -35,6 +35,9 @@ ZONE="${ZONE:-us-central1-a}"
 BRANCH="${BRANCH:-v2v-baseline}"
 
 LR="${LR:-1e-5}"
+# Opt-in official HyDRA recipe parity knobs. Historical runs used False/flax_lecun_normal.
+HYDRA_OFFICIAL_SCHEDULER="${HYDRA_OFFICIAL_SCHEDULER:-False}"
+HYDRA_TOKENIZER_INIT="${HYDRA_TOKENIZER_INIT:-flax_lecun_normal}"
 # HyDRA schedule (paper 5.1): 10K iterations, global batch 32, lr=1e-5 AdamW constant.
 # NOTE on batch: exact global-batch-32 on 128 chips needs tensor/context parallelism
 # (ctx hangs; tensor untested). Fallback = global batch 128 (fsdp=128) x 2500 steps
@@ -75,6 +78,7 @@ DEBUG="${DEBUG:-0}"
 # ------------------------------------------------------------------------------
 
 echo "V2V-baseline (HyDRA) '${RUN_NAME}'  lr=${LR}  steps=${MAX_STEPS}  ckpt_every=${CHECKPOINT_EVERY}"
+echo "  official_sched=${HYDRA_OFFICIAL_SCHEDULER}  tokenizer_init=${HYDRA_TOKENIZER_INIT}"
 echo "  ${TPU_NAME} (${ZONE})  mesh: d${ICI_DATA}/f${ICI_FSDP}/c${ICI_CONTEXT}/t${ICI_TENSOR}  bs=${PER_DEVICE_BS}  remat=${REMAT}"
 echo "  data=${TRAIN_DATA_DIR}  ->  ${OUTPUT_DIR}/${RUN_NAME}"
 
@@ -123,6 +127,8 @@ LOG=\$HOME/train_logs/${RUN_NAME}_w\${WID}.log
 setsid nohup python src/maxdiffusion/train_wan_v2v.py \
   ${CONFIG_YML:-src/maxdiffusion/configs/base_wan_2_1_v2v.yml} \
   hydra=${HYDRA:-False} \
+  hydra_official_training_scheduler=${HYDRA_OFFICIAL_SCHEDULER} \
+  wan_hydra_tokenizer_init=${HYDRA_TOKENIZER_INIT} \
   attention=${ATTENTION:-flash} flash_min_seq_length=0 \
   "flash_block_sizes={\"block_q\":${FLASH_BLOCK},\"block_kv_compute\":${FLASH_BLOCK},\"block_kv\":${FLASH_BLOCK},\"block_q_dkv\":${FLASH_BLOCK},\"block_kv_dkv\":${FLASH_BLOCK},\"block_kv_dkv_compute\":${FLASH_BLOCK},\"block_q_dq\":${FLASH_BLOCK},\"block_kv_dq\":${FLASH_BLOCK},\"use_fused_bwd_kernel\":false}" \
   mask_padding_tokens=${MASK_PAD} \

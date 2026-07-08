@@ -307,7 +307,13 @@ def create_sharded_logical_transformer(
     if bool(wan_config.get("hydra", False)):
       from ...models.wan.wan_utils import init_wan_hydra_params
       flat_params = flax.traverse_util.flatten_dict(params)
-      flat_params.update(init_wan_hydra_params(eval_lora_shapes, seed=int(getattr(config, "seed", 0))))
+      flat_params.update(
+          init_wan_hydra_params(
+              eval_lora_shapes,
+              seed=int(getattr(config, "seed", 0)),
+              init_mode=str(getattr(config, "wan_hydra_tokenizer_init", "flax_lecun_normal")),
+          )
+      )
       params = flax.traverse_util.unflatten_dict(flat_params)
 
     # Official HyDRA checkpoint overlay (mechanism-verification path): replaces the

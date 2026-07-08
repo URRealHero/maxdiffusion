@@ -109,7 +109,23 @@ class BaseWanTrainer(abc.ABC):
     inference schedule visits and mismatches the loss weighting bell.
     """
     train_shift = float(getattr(self.config, "train_flow_shift", -1.0) or -1.0)
-    if train_shift > 0:
+    official_hydra_scheduler = str(getattr(self.config, "hydra_official_training_scheduler", False)).lower() == "true"
+    if official_hydra_scheduler:
+      train_shift = train_shift if train_shift > 0 else 5.0
+      noise_scheduler = FlaxFlowMatchScheduler(
+          shift=train_shift,
+          sigma_min=0.0,
+          extra_one_step=True,
+          timestep_sampling="batch_discrete",
+          training_weight_grid="scheduler",
+          dtype=jnp.float32,
+      )
+      max_logging.log(
+          "Training FlowMatch scheduler: official_hydra=True "
+          f"shift={train_shift} sigma_min=0.0 extra_one_step=True "
+          "timesteps=one_discrete_timestep_per_batch weights=scheduler_grid"
+      )
+    elif train_shift > 0:
       noise_scheduler = FlaxFlowMatchScheduler(shift=train_shift, dtype=jnp.float32)
       max_logging.log(f"Training FlowMatch scheduler: shift={train_shift} (train_flow_shift)")
     else:

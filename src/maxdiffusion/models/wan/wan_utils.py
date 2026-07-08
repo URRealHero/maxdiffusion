@@ -677,14 +677,21 @@ def init_wan_v2v_params(eval_shapes: dict):
   return out
 
 
-def init_wan_hydra_params(eval_shapes: dict, seed: int = 0):
-  """Fresh init for V2V-2a HyDRA MemoryTokenizer conv params, which are NOT in the
-  base checkpoint (so eval_shape leaves them abstract). Mirrors flax nnx.Conv defaults:
-  kernel lecun-normal (fan_in = prod(kernel_spatial) * in_features on the last-but-one
-  axis), bias zeros. Handles scan-stacked ([num_layers, ...]) and per-layer shapes.
-  Returns {flat_path_tuple: jnp.array} matching the model param dict.
+def init_wan_hydra_params(eval_shapes: dict, seed: int = 0, init_mode: str = "flax_lecun_normal"):
+  """Fresh init for V2V-2a HyDRA MemoryTokenizer conv params.
+
+  ``flax_lecun_normal`` preserves the original MaxDiffusion behavior.
+  ``torch_conv3d`` matches official HyDRA/PyTorch ``nn.Conv3d`` defaults for
+  MemoryTokenizer(dim): kernel and bias uniform in +/- 1/sqrt(fan_in), where
+  fan_in = 2*2*2*dim for the official (2,2,2) Conv3d.
   """
   out = {}
+  init_mode = (init_mode or "flax_lecun_normal").lower()
+  valid_modes = {"flax_lecun_normal", "torch_conv3d", "pytorch_conv3d", "official_hydra"}
+  if init_mode not in valid_modes:
+    raise ValueError(f"Unsupported wan_hydra_tokenizer_init={init_mode!r}; expected one of {sorted(valid_modes)}")
+  use_torch_conv3d_init = init_mode in {"torch_conv3d", "pytorch_conv3d", "official_hydra"}
+
   key = jax.random.key(seed)
   for orig_path, shaped in flatten_dict(eval_shapes).items():
     sp = tuple(str(p) for p in orig_path)
@@ -692,17 +699,27 @@ def init_wan_hydra_params(eval_shapes: dict, seed: int = 0):
       continue
     shape = shaped.shape
     if sp[-1] == "kernel":
-      # nnx.Conv 3D kernel: [(L,) kf, kh, kw, in, out]. lecun_normal => N(0, 1/fan_in)
-      # with fan_in = kf*kh*kw*in (the 4 dims before the trailing out-channels; a
-      # leading scan/layers axis, if present, is excluded by the -5:-1 slice).
+      # nnx.Conv 3D kernel: [(L,) kf, kh, kw, in, out]. A leading scan/layers
+      # axis, if present, is excluded by the -5:-1 slice.
       key, sub = jax.random.split(key)
       fan_in = 1
       for d in shape[-5:-1]:
         fan_in *= d
-      std = (1.0 / fan_in) ** 0.5
-      out[orig_path] = jax.random.normal(sub, shape, dtype=jnp.float32) * std
-    else:  # bias -> zeros
-      out[orig_path] = jnp.zeros(shape, dtype=jnp.float32)
+      if use_torch_conv3d_init:
+        bound = (1.0 / fan_in) ** 0.5
+        out[orig_path] = jax.random.uniform(sub, shape, dtype=jnp.float32, minval=-bound, maxval=bound)
+      else:
+        std = (1.0 / fan_in) ** 0.5
+        out[orig_path] = jax.random.normal(sub, shape, dtype=jnp.float32) * std
+    else:
+      if use_torch_conv3d_init:
+        # Official MemoryTokenizer uses dim->dim Conv3d, so fan_in is 8*dim.
+        key, sub = jax.random.split(key)
+        fan_in = 8 * shape[-1]
+        bound = (1.0 / fan_in) ** 0.5
+        out[orig_path] = jax.random.uniform(sub, shape, dtype=jnp.float32, minval=-bound, maxval=bound)
+      else:
+        out[orig_path] = jnp.zeros(shape, dtype=jnp.float32)
   return out
 
 

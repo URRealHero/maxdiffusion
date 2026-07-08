@@ -93,6 +93,8 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
       inverse_timesteps: bool = False,
       extra_one_step: bool = False,
       reverse_sigmas: bool = False,
+      timestep_sampling: str = "continuous_per_example",
+      training_weight_grid: str = "linear",
       dtype: jnp.dtype = jnp.float32,
   ):
     self.dtype = dtype
@@ -237,7 +239,10 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     1/batch_size, so runs with different batch sizes were not comparable.
     """
     n = num_inference_steps
-    grid = jnp.arange(n, dtype=jnp.float32)
+    if self.config.training_weight_grid == "scheduler":
+      grid = self._discrete_training_timesteps(n).astype(jnp.float32)
+    else:
+      grid = jnp.arange(n, dtype=jnp.float32)
     y_grid = jnp.exp(-2 * ((grid - n / 2) / n) ** 2)
     y_grid_min = jnp.min(y_grid)
     grid_norm = jnp.sum(y_grid - y_grid_min)
@@ -247,6 +252,16 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     return (y - y_grid_min) * (n / grid_norm)
 
   def sample_timesteps(self, timestep_rng, batch_size):
+    if self.config.timestep_sampling == "batch_discrete":
+      # Official HyDRA samples ONE scheduler index for the whole batch:
+      #   timestep_id = torch.randint(0, num_train_timesteps, (1,))
+      #   timestep = scheduler.timesteps[timestep_id]
+      # We return [B] filled with that scalar so the existing JAX loss path keeps
+      # its per-example broadcasting contract.
+      timestep_id = jax.random.randint(timestep_rng, (), 0, self.config.num_train_timesteps)
+      timestep = self._discrete_training_timesteps(self.config.num_train_timesteps)[timestep_id]
+      return jnp.full((batch_size,), timestep, dtype=self.dtype)
+
     # 1. Sample continuous timesteps t in [0, 1]
     t = jax.random.uniform(timestep_rng, (batch_size,))
 
@@ -257,6 +272,24 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     timesteps = t_shifted.squeeze() * self.config.num_train_timesteps
 
     return timesteps
+
+  def _discrete_training_timesteps(self, num_inference_steps: int) -> jnp.ndarray:
+    """Returns the scheduler timestep grid used by DiffSynth/HyDRA.
+
+    With shift=5, sigma_min=0, extra_one_step=True this matches official
+    HyDRA's FlowMatchScheduler.set_timesteps(1000, training=True).
+    """
+    sigma_start = self.config.sigma_min + (self.config.sigma_max - self.config.sigma_min)
+    if self.config.extra_one_step:
+      sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps + 1, dtype=self.dtype)[:-1]
+    else:
+      sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps, dtype=self.dtype)
+    if self.config.inverse_timesteps:
+      sigmas = jnp.flip(sigmas, dims=[0])
+    sigmas = self.config.shift * sigmas / (1 + (self.config.shift - 1) * sigmas)
+    if self.config.reverse_sigmas:
+      sigmas = 1 - sigmas
+    return sigmas * self.config.num_train_timesteps
 
   def apply_flow_match(
       self,
