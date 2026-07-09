@@ -142,6 +142,17 @@ def _rename_common_wan_transformer_key(renamed_pt_key: str) -> str:
   renamed_pt_key = renamed_pt_key.replace(".modulation", ".adaln_scale_shift_table")
   renamed_pt_key = renamed_pt_key.replace("norm3", "norm2.layer_norm")
 
+  # PAI Wan2.1-Fun I2V aliases (original naming): per-block image-KV in cross
+  # attention and the img_emb CLIP MLP (proj = LN, Linear, GELU, Linear, LN;
+  # indices 0,1,3,4 carry params). norm_k_img must be renamed before k_img.
+  renamed_pt_key = renamed_pt_key.replace("norm_k_img", "norm_added_k")
+  renamed_pt_key = renamed_pt_key.replace("k_img", "add_k_proj")
+  renamed_pt_key = renamed_pt_key.replace("v_img", "add_v_proj")
+  renamed_pt_key = renamed_pt_key.replace("img_emb.proj_0", "condition_embedder.image_embedder.norm1")
+  renamed_pt_key = renamed_pt_key.replace("img_emb.proj_1", "condition_embedder.image_embedder.ff.net_0")
+  renamed_pt_key = renamed_pt_key.replace("img_emb.proj_3", "condition_embedder.image_embedder.ff.net_2")
+  renamed_pt_key = renamed_pt_key.replace("img_emb.proj_4", "condition_embedder.image_embedder.norm2")
+
   if "condition_embedder" in renamed_pt_key:
     renamed_pt_key = renamed_pt_key.replace("time_embedding_0", "time_embedder.linear_1")
     renamed_pt_key = renamed_pt_key.replace("time_embedding_2", "time_embedder.linear_2")

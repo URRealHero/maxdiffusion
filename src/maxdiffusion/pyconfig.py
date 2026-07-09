@@ -171,7 +171,10 @@ class _HyperParameters:
           max_logging.log(
               f"Warning: Try setting num_inference_steps to less than 10 steps when using CausVid, currently you are setting {num_inference_steps} steps."
           )
-      elif raw_keys.get("model_name") == "wan2.1":
+      elif raw_keys.get("model_name") == "wan2.1" and raw_keys.get("model_type") != "I2V-CC":
+        # I2V-CC (PAI Wan2.1-Fun-Control-Camera) legitimately overrides the
+        # transformer (weights + config.json from the PAI repo) while sharing
+        # VAE/T5/scheduler with the standard Diffusers repo.
         raise ValueError(f"{transformer_pretrained_model_name_or_path} transformer model is not supported for Wan 2.1")
     if "use_qwix_quantization" not in raw_keys:
       raise ValueError("use_qwix_quantization is not set.")

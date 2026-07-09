@@ -166,18 +166,24 @@ def create_sharded_logical_transformer(
     wan_transformer = WanModel(**wan_config, rngs=rngs)
     return wan_transformer
 
-  # 1. Load config.
+  # 1. Load config. Prefer the transformer-override repo when set (e.g. PAI Fun
+  # checkpoints whose DiT config.json lives at the repo root while the shared
+  # components come from a standard Diffusers repo); pyconfig defaults the
+  # override to pretrained_model_name_or_path, so this is a no-op elsewhere.
+  transformer_config_path = (
+      getattr(config, "wan_transformer_pretrained_model_name_or_path", "") or config.pretrained_model_name_or_path
+  )
   if restored_checkpoint:
     wan_config = restored_checkpoint["wan_config"]
   else:
     try:
-      wan_config = WanModel.load_config(config.pretrained_model_name_or_path, subfolder=subfolder)
+      wan_config = WanModel.load_config(transformer_config_path, subfolder=subfolder)
     except (OSError, EnvironmentError) as exc:
       if subfolder:
         max_logging.log(
             f"Could not load WAN config from subfolder '{subfolder}' ({exc}); falling back to checkpoint root."
         )
-        wan_config = WanModel.load_config(config.pretrained_model_name_or_path)
+        wan_config = WanModel.load_config(transformer_config_path)
       else:
         raise
   wan_config = _normalize_wan_fun_config_aliases(wan_config)
@@ -235,6 +241,14 @@ def create_sharded_logical_transformer(
     wan_config["in_channels"] = in_channels_override
   if out_channels_override > 0:
     wan_config["out_channels"] = out_channels_override
+  # Wan2.1 Fun I2V CLIP branch (img_emb + per-block image KV). PAI config.json
+  # omits these dims, so the yml supplies image_dim explicitly; 0/absent keeps
+  # the branch off (all existing non-CLIP configs unchanged).
+  image_dim_override = int(getattr(config, "wan_transformer_image_dim_override", -1))
+  if image_dim_override > 0:
+    wan_config["image_dim"] = image_dim_override
+    wan_config.setdefault("added_kv_proj_dim", int(wan_config["num_attention_heads"]) * int(wan_config["attention_head_dim"]))
+    wan_config.setdefault("image_seq_len", 257)
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
