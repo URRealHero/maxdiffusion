@@ -390,12 +390,19 @@ width: 832
 # concat stacks a conditioning clip and a target clip -> 40 latent frames total.
 num_frames: 77
 guidance_scale: 5.0
-flow_shift: 3.0
+flow_shift: 5.0
 # TRAINING noise-schedule shift (official HyDRA trains AND infers at shift=5:
 # HyDRAPipeline FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)).
 # Our first retrains used the scheduler default 3.0 — a recipe deviation. -1 =
 # keep default (other model families unchanged); 5.0 = HyDRA-faithful.
 train_flow_shift: 5.0
+# Official HyDRA training scheduler parity. When True, training uses
+# FlowMatchScheduler(shift=train_flow_shift or 5, sigma_min=0, extra_one_step=True),
+# one discrete scheduler timestep per batch, and scheduler-grid loss weighting.
+hydra_official_training_scheduler: True
+# MemoryTokenizer fresh init. flax_lecun_normal preserves old MaxDiffusion behavior;
+# torch_conv3d matches PyTorch nn.Conv3d default init used by official HyDRA.
+wan_hydra_tokenizer_init: 'torch_conv3d'
 
 # Diffusion CFG cache (FasterCache-style, WAN 2.1 T2V only)
 use_cfg_cache: False
