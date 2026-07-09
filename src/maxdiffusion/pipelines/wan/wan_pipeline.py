@@ -166,13 +166,16 @@ def create_sharded_logical_transformer(
     wan_transformer = WanModel(**wan_config, rngs=rngs)
     return wan_transformer
 
-  # 1. Load config. Prefer the transformer-override repo when set (e.g. PAI Fun
-  # checkpoints whose DiT config.json lives at the repo root while the shared
-  # components come from a standard Diffusers repo); pyconfig defaults the
-  # override to pretrained_model_name_or_path, so this is a no-op elsewhere.
-  transformer_config_path = (
-      getattr(config, "wan_transformer_pretrained_model_name_or_path", "") or config.pretrained_model_name_or_path
-  )
+  # 1. Load config. For I2V-CC (PAI Wan2.1-Fun-Control-Camera) the DiT config
+  # lives in the transformer-override repo while the shared components come from
+  # a standard Diffusers repo. Every other model keeps reading the config from
+  # `pretrained_model_name_or_path` — CausVid/FusionX point the override at a
+  # weights-only repo whose config must NOT be used.
+  transformer_config_path = config.pretrained_model_name_or_path
+  if getattr(config, "model_type", "") == "I2V-CC":
+    transformer_config_path = (
+        getattr(config, "wan_transformer_pretrained_model_name_or_path", "") or transformer_config_path
+    )
   if restored_checkpoint:
     wan_config = restored_checkpoint["wan_config"]
   else:
