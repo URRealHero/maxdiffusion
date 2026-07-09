@@ -716,6 +716,7 @@ def _apply_attention_dot(
     split_head_dim: bool,
     float32_qk_product: bool,
     use_memory_efficient_attention: bool,
+    attention_mask: Array = None,
 ):
   """Apply Attention."""
   if split_head_dim:
@@ -766,6 +767,16 @@ def _apply_attention_dot(
       attention_scores = jnp.einsum("b i d, b j d->b i j", query_states, key_states)
 
     attention_scores = attention_scores * scale
+    # Key-padding mask ([B, kv_len], 1=valid): the flash/ulysses kernels honor
+    # it; without this, dot_product attends to padded tokens (e.g. the I2V
+    # image tokens padded 257->alignment) whose projected K/V are bias-valued.
+    if attention_mask is not None:
+      mask_bias = (1.0 - attention_mask.astype(attention_scores.dtype)) * -1e9
+      if split_head_dim:
+        attention_scores = attention_scores + mask_bias[:, None, None, :]
+      else:
+        # heads are folded batch-major into dim 0 by _reshape_heads_to_batch_dim.
+        attention_scores = attention_scores + jnp.repeat(mask_bias, heads, axis=0)[:, None, :]
     attention_probs = nn.softmax(attention_scores, axis=-1 if split_head_dim else 2)
 
     attention_probs = attention_probs.astype(dtype)
@@ -827,6 +838,7 @@ def dot_product_kernel(q, k, v, context):
       context["split_head_dim"],
       context["float32_qk_product"],
       context["use_memory_efficient_attention"],
+      attention_mask=context["attention_mask"],
   )
 
 
@@ -1732,8 +1744,11 @@ class FlaxWanAttention(nnx.Module):
             key_proj_img = self.norm_added_k(key_proj_img)
           with self.conditional_named_scope("add_proj_v"):
             value_proj_img = self.add_v_proj(encoder_hidden_states_img)
-        query_proj_img = query_proj_raw
-        # Check norm_added_k too
+        # The official I2V cross-attention norms the query ONCE and reuses it
+        # for BOTH the text and image attention (Wan/DiffSynth: q = norm_q(q(x));
+        # attn(q, k, v) + attn(q, k_img, v_img)). Using the raw query here
+        # diverges ~30% per block (caught by the 2.1-Fun parity gate).
+        query_proj_img = query_proj_text
         # Checkpointing
         query_proj_text = checkpoint_name(query_proj_text, "query_proj")
         key_proj_text = checkpoint_name(key_proj_text, "key_proj_text")
