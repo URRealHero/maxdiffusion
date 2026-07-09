@@ -129,6 +129,7 @@ def load_clip_assets(sid, gen_dir, raw_root, height, width):
         "sid": sid, "boundary": 0,
         "gen_cond": gen[:0], "gen_tgt": _resize(gen[:n], height, width),
         "gt_cond": _resize(cond_raw, height, width), "gt_tgt": _resize(tgt_raw[:n], height, width),
+        "gen_full": _resize(gen[:n], height, width), "gt_full": _resize(tgt_raw[:n], height, width),
         "cond_mask": None if cm is None else (_resize(cm, height, width)[..., 0] > 127),
         "tgt_mask": None if tm is None else (_resize(tm[:n], height, width)[..., 0] > 127),
         "event": event,
@@ -155,6 +156,7 @@ def load_clip_assets(sid, gen_dir, raw_root, height, width):
       "sid": sid, "boundary": boundary,
       "gen_cond": gen[:boundary], "gen_tgt": gen[boundary:],
       "gt_cond": gt[:boundary], "gt_tgt": gt[boundary:],
+      "gen_full": gen, "gt_full": gt,   # full concat (cond+tgt), for --eval_region full (ti2v)
       "cond_mask": None if full_mask is None else full_mask[:boundary],
       "tgt_mask": None if full_mask is None else full_mask[boundary:],
       "event": _target_reentry_window(os.path.join(sdir, "check.json"), idx, cond_len, boundary),
@@ -200,11 +202,16 @@ def _reentry_raw_frame(check_path):
 
 # ======================= metrics =======================
 
+EVAL_REGION = "target"   # "target" = target-window (v2v/default); "full" = full concat (ti2v/lora)
+def _reg(a, which):      # which in ("gen","gt") -> full-concat array when EVAL_REGION=="full"
+  k = f"{which}_full" if EVAL_REGION == "full" and f"{which}_full" in a else f"{which}_tgt"
+  return a[k]
+
 def m_psnr_ssim_lpips(a):
-  """PSNR/SSIM/LPIPS on the TARGET window: gen_tgt vs gt_tgt, per-frame mean."""
+  """PSNR/SSIM/LPIPS per-frame mean; region = target window (default) or full concat (--eval_region full)."""
   from skimage.metrics import peak_signal_noise_ratio as psnr
   from skimage.metrics import structural_similarity as ssim
-  g, t = a["gen_tgt"], a["gt_tgt"]
+  g, t = _reg(a, "gen"), _reg(a, "gt")
   n = min(len(g), len(t))
   g, t = g[:n], t[:n]
   ps = float(np.mean([psnr(t[i], g[i], data_range=255) for i in range(n)]))
@@ -231,7 +238,7 @@ def m_consistency(a):
   mean cosine similarity of consecutive-frame features (and vs the first frame), per VBench.
   Requires the `vbench` package OR torch+dino+clip; lazily imported."""
   try:
-    return _consistency_vbench(a["gen_tgt"])
+    return _consistency_vbench(_reg(a, "gen"))
   except Exception as e:
     return {"Subj.Cons": float("nan"), "Bg.Cons": float("nan"), "_cons_err": str(e)[:80]}
 
@@ -357,9 +364,12 @@ def main():
   ap.add_argument("--shard", default="0/1", help="i/N — process sids[i::N] for CPU-parallel sharding")
   ap.add_argument("--out_csv", required=True)
   ap.add_argument("--device", default="cuda")
+  ap.add_argument("--eval_region", default="target", choices=["target", "full"],
+                  help="target=target window (v2v); full=full cond+tgt concat (ti2v/lora)")
   args = ap.parse_args()
-  global _DEVICE
+  global _DEVICE, EVAL_REGION
   _DEVICE = args.device
+  EVAL_REGION = args.eval_region
 
   want = [m.strip() for m in args.metrics.split(",") if m.strip()]
   run_recon = any(m in want for m in ("psnr", "ssim", "lpips"))
