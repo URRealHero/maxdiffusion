@@ -77,6 +77,8 @@ def main():
   sys.path.insert(0, args.diffsynth_path)
   import torch
   import tensorflow as tf
+
+  tf.config.set_visible_devices([], "GPU")  # tf is only the tfrecord writer here
   from diffsynth.models.wan_video_image_encoder import WanImageEncoder
   from PIL import Image
 

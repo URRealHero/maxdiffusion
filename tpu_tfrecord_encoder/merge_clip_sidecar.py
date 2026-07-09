@@ -2,43 +2,76 @@
 # concat+camera records, producing the *_full_clip dataset the
 # Wan2.1-Fun-camera trainer reads.
 #
-# For every record in every main shard: look up its sample_id in the sidecar
-# set, append `clip_feature` (fp32 serialized tensor, cast from the sidecar's
-# fp16), and write the record to an identically-named shard in --output-dir.
-# Shard-level resume: an output shard whose record count matches its input is
-# skipped. Any record whose sample_id has no sidecar entry aborts the merge
-# (unless --allow-missing, which drops the record and logs it).
+# ⚠ The June-2026 `concat_camera_encoded_full` records carry ONLY
+# {latents, encoder_hidden_states, camera_extrinsic, camera_intrinsic} — no
+# sample_id (that encoder predates the sample_id field). So this merge does TWO
+# things per record:
+#   1. recover `sample_id` POSITIONALLY from the per-host metadata jsonl:
+#      line i of metadata_host_HHH_run_RRR.jsonl == record i%128 of shard
+#      host_HHH_run_RRR_file_{i//128}.tfrec  (verified: every non-null
+#      `tfrec_path` in the metadata agrees with i//128, 0 mismatches)
+#   2. attach `clip_feature` (fp32) looked up by that sample_id.
+# `latent_condition` is NOT needed: y = VAE(first frame) == latents[:, 0]
+# because the Wan VAE is temporally causal (gated by check_vae_causality.py).
 #
-# IO: paths may be local or gs:// (tf.io.gfile). Run where GCS bandwidth is
-# good (a TPU pod host CPU is ideal: read+write stay inside GCP; needs only
-# the standard maxdiffusion venv, no TPU devices touched).
+# The output records therefore gain `sample_id` too, which is what makes the
+# held-out exclusion (`exclude_sample_ids_path`) possible for this dataset.
 #
-# Example:
+# IO: local or gs:// (tf.io.gfile). Run where GCS bandwidth is good (a TPU host
+# CPU is ideal — no TPU devices are touched). Memory: the sidecar table is
+# ~37 GB resident (55,961 x 257 x 1280 fp16); a v6e host has ~1.4 TiB.
+#
+# Example (one of N parallel shard ranges):
 #   python merge_clip_sidecar.py \
 #     --main-dir gs://data_us_central1_a/hmworld_data/wan_2_1/concat_camera_encoded_full \
-#     --sidecar-dir /data2/spu9/wan21_fun_camera/clip_sidecar \
-#     --output-dir gs://data_us_central1_a/hmworld_data/wan_2_1/concat_camera_encoded_full_clip
+#     --sidecar-dir gs://data_us_central1_a/hmworld_data/wan_2_1/clip_sidecar \
+#     --metadata-dir gs://data_us_central1_a/hmworld_data/wan_2_1/concat_camera_encoded_full \
+#     --output-dir gs://data_us_central1_a/hmworld_data/wan_2_1/concat_camera_encoded_full_clip \
+#     --shard-start 0 --shard-end 56
 
 import argparse
+import json
 import os
+import re
 
 import numpy as np
 import tensorflow as tf
+
+SHARD_RE = re.compile(r"host_(\d+)_run_(\d+)_file_(\d+)\.tfrec$")
+META_RE = re.compile(r"metadata_host_(\d+)_run_(\d+)\.jsonl$")
 
 
 def parse_args():
   p = argparse.ArgumentParser()
   p.add_argument("--main-dir", required=True)
   p.add_argument("--sidecar-dir", required=True)
+  p.add_argument("--metadata-dir", required=True, help="dir holding metadata_host_*_run_*.jsonl")
   p.add_argument("--output-dir", required=True)
-  p.add_argument("--allow-missing", action="store_true")
+  p.add_argument("--records-per-shard", type=int, default=128)
   p.add_argument("--shard-start", type=int, default=0)
-  p.add_argument("--shard-end", type=int, default=0, help="0 = all")
+  p.add_argument("--shard-end", type=int, default=0, help="0 = through the end")
   return p.parse_args()
 
 
+def load_metadata_sids(metadata_dir):
+  """(host, run) -> [sample_id] in write order."""
+  files = sorted(tf.io.gfile.glob(os.path.join(metadata_dir, "metadata_host_*_run_*.jsonl")))
+  assert files, f"no metadata jsonl under {metadata_dir}"
+  table = {}
+  for path in files:
+    m = META_RE.search(os.path.basename(path))
+    assert m, path
+    key = (m.group(1), m.group(2))
+    with tf.io.gfile.GFile(path, "r") as f:
+      sids = [json.loads(line)["sample_id"] for line in f if line.strip()]
+    table[key] = sids
+  total = sum(len(v) for v in table.values())
+  print(f"metadata: {len(table)} hosts, {total} sample_ids", flush=True)
+  return table
+
+
 def load_sidecars(sidecar_dir):
-  """sample_id -> raw fp16 serialized tensor bytes (decoded lazily at write)."""
+  """sample_id -> raw serialized fp16 tensor bytes."""
   shards = sorted(tf.io.gfile.glob(os.path.join(sidecar_dir, "clip_*_file_*.tfrec")))
   assert shards, f"no sidecar shards under {sidecar_dir}"
   table = {}
@@ -47,72 +80,66 @@ def load_sidecars(sidecar_dir):
       ex = tf.train.Example.FromString(raw.numpy())
       sid = ex.features.feature["sample_id"].bytes_list.value[0].decode()
       table[sid] = ex.features.feature["clip_feature_fp16"].bytes_list.value[0]
-    if (i + 1) % 20 == 0:
+    if (i + 1) % 25 == 0:
       print(f"sidecars: {i + 1}/{len(shards)} shards, {len(table)} features", flush=True)
-  print(f"sidecars loaded: {len(table)} features from {len(shards)} shards")
+  print(f"sidecars loaded: {len(table)} features", flush=True)
   return table
 
 
 def count_records(path):
-  n = 0
-  for _ in tf.data.TFRecordDataset(path):
-    n += 1
-  return n
+  return sum(1 for _ in tf.data.TFRecordDataset(path))
 
 
 def main():
   args = parse_args()
-  table = load_sidecars(args.sidecar_dir)
+  meta = load_metadata_sids(args.metadata_dir)
+  clip = load_sidecars(args.sidecar_dir)
 
-  main_shards = sorted(
-      s for s in tf.io.gfile.glob(os.path.join(args.main_dir, "*.tfrec"))
-  )
-  assert main_shards, f"no main shards under {args.main_dir}"
-  if args.shard_end:
-    main_shards = main_shards[args.shard_start:args.shard_end]
-  else:
-    main_shards = main_shards[args.shard_start:]
-  print(f"{len(main_shards)} main shards to merge")
+  shards = sorted(tf.io.gfile.glob(os.path.join(args.main_dir, "*.tfrec")))
+  assert shards, f"no main shards under {args.main_dir}"
+  end = args.shard_end or len(shards)
+  shards = shards[args.shard_start:end]
+  print(f"{len(shards)} main shards in range [{args.shard_start}, {end})", flush=True)
   tf.io.gfile.makedirs(args.output_dir)
 
-  missing_total = []
-  for si, shard in enumerate(main_shards):
+  for si, shard in enumerate(shards):
     name = os.path.basename(shard)
+    m = SHARD_RE.search(name)
+    assert m, f"unexpected shard name {name}"
+    host, run, fileno = m.group(1), m.group(2), int(m.group(3))
+    sids_all = meta.get((host, run))
+    assert sids_all is not None, f"no metadata for host {host} run {run}"
+    base = fileno * args.records_per_shard
+    expected = sids_all[base: base + args.records_per_shard]
+
     out_path = os.path.join(args.output_dir, name)
     if tf.io.gfile.exists(out_path):
-      n_in, n_out = count_records(shard), count_records(out_path)
-      if n_in == n_out:
-        print(f"[{si + 1}/{len(main_shards)}] {name}: exists with {n_out} records, skip")
+      if count_records(out_path) == len(expected):
+        print(f"[{si + 1}/{len(shards)}] {name}: complete, skip", flush=True)
         continue
-      print(f"[{si + 1}/{len(main_shards)}] {name}: exists but {n_out}!={n_in}, rewriting")
+      print(f"[{si + 1}/{len(shards)}] {name}: incomplete, rewriting", flush=True)
 
     tmp_path = out_path + ".tmp"
-    n, missing = 0, []
+    n = 0
     with tf.io.TFRecordWriter(tmp_path) as writer:
       for raw in tf.data.TFRecordDataset(shard):
+        assert n < len(expected), f"{name}: more records than metadata sids ({len(expected)})"
+        sid = expected[n]
         ex = tf.train.Example.FromString(raw.numpy())
-        sid = ex.features.feature["sample_id"].bytes_list.value[0].decode()
-        blob = table.get(sid)
-        if blob is None:
-          missing.append(sid)
-          if not args.allow_missing:
-            raise KeyError(f"{name}: sample_id {sid} has no CLIP sidecar entry")
-          continue
+        assert "sample_id" not in ex.features.feature, f"{name}: record already has sample_id"
+        blob = clip.get(sid)
+        assert blob is not None, f"{name}#{n}: no CLIP feature for sample_id {sid}"
         feat = tf.io.parse_tensor(blob, out_type=tf.float16).numpy().astype(np.float32)
         assert feat.shape == (257, 1280), (sid, feat.shape)
-        ex.features.feature["clip_feature"].bytes_list.value.append(
-            tf.io.serialize_tensor(feat).numpy()
-        )
+        ex.features.feature["sample_id"].bytes_list.value.append(sid.encode())
+        ex.features.feature["clip_feature"].bytes_list.value.append(tf.io.serialize_tensor(feat).numpy())
         writer.write(ex.SerializeToString())
         n += 1
+    assert n == len(expected), f"{name}: {n} records but {len(expected)} metadata sids"
     tf.io.gfile.rename(tmp_path, out_path, overwrite=True)
-    missing_total.extend(missing)
-    print(f"[{si + 1}/{len(main_shards)}] {name}: {n} records merged"
-          + (f", {len(missing)} MISSING dropped" if missing else ""), flush=True)
+    print(f"[{si + 1}/{len(shards)}] {name}: {n} records merged", flush=True)
 
-  print(f"MERGE DONE. total missing: {len(missing_total)}")
-  if missing_total:
-    print("first missing:", missing_total[:10])
+  print("MERGE RANGE DONE")
 
 
 if __name__ == "__main__":

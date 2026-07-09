@@ -41,17 +41,18 @@ class WanPipeline2_1_FunCamera(WanPipeline2_1):
     # Noise latents are out_channels (16); in_channels (32) includes the y half.
     return getattr(self.transformer.config, "out_channels", None) or self.transformer.config.in_channels
 
-  def prepare_fun_camera_y_latents(self, latent_condition: jax.Array, dtype) -> jax.Array:
-    """DiffSynth in_dim=32 y: keep latent frame 0, zero the rest.
+  def prepare_fun_camera_y_latents(self, latents: jax.Array, dtype) -> jax.Array:
+    """DiffSynth in_dim=32 y: latent frame 0 = VAE(first frame), rest zero.
 
-    latent_condition is the VAE encode of the first-frame-masked video
-    [B, 16, F_lat, h, w] (the encode_concat_camera.py record field). The 2.1
-    VAE is causal, so its latent frame 0 equals vae.encode(first frame) — the
-    exact official y — while frames 1.. are VAE(black), which the official y
-    zeroes. Zero them here rather than trusting VAE(black)==0.
+    `latents` are the CLEAN VAE latents of the video [B, 16, F_lat, h, w]. The
+    Wan2.1 VAE is temporally causal, so latents[:, :, 0] IS vae.encode(first
+    frame) — the exact official y — verified on real HM-World frames at
+    480x832: rel 2.2e-4 vs a separate first-frame encode, while latent frame 1
+    differs by 98% (check_vae_causality.py). So no separate `latent_condition`
+    encode is needed.
     """
-    y = jnp.zeros_like(latent_condition)
-    y = y.at[:, :, 0:1].set(latent_condition[:, :, 0:1])
+    y = jnp.zeros_like(latents)
+    y = y.at[:, :, 0:1].set(latents[:, :, 0:1])
     return y.astype(dtype)
 
   def __call__(

@@ -496,7 +496,7 @@ enable_ondemand_xprof: False
 # Wan2.2-Fun-5B-Control-Camera official/Captain-Safari path.
 # PAI publishes the transformer, T5, VAE, and tokenizer in one repo root.
 # Leave wan_transformer_pretrained_model_name_or_path empty to use pretrained_model_name_or_path.
-wan_tokenizer_subfolder: 'google/umt5-xxl'
+wan_tokenizer_subfolder: 'tokenizer'  # Wan-AI Diffusers layout (2.2-Fun bundles umt5 at repo root instead)
 wan_text_encoder_filename: ''
 wan_vae_subfolder: ''
 wan_vae_filename: ''

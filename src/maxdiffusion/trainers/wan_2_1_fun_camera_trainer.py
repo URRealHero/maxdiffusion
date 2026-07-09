@@ -58,9 +58,16 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
     return WanCheckpointer2_1_FunCamera(config=self.config)
 
   def get_data_shardings(self, mesh):
-    shardings = super().get_data_shardings(mesh)
-    shardings["clip_feature"] = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
-    return shardings
+    # The 2.1 concat records have no `latent_condition` (y comes from
+    # latents[:, :, 0], the VAE being causal) but do carry `clip_feature`.
+    data_sharding = jax.sharding.NamedSharding(mesh, P(("data", "fsdp")))
+    return {
+        "latents": data_sharding,
+        "encoder_hidden_states": data_sharding,
+        "clip_feature": data_sharding,
+        "camera_extrinsic": data_sharding,
+        "camera_intrinsic": data_sharding,
+    }
 
   def load_dataset(self, mesh, pipeline=None, is_training=True):
     config = self.config
@@ -71,7 +78,6 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
 
     feature_description = {
         "latents": tf.io.FixedLenFeature([], tf.string),
-        "latent_condition": tf.io.FixedLenFeature([], tf.string),
         "encoder_hidden_states": tf.io.FixedLenFeature([], tf.string),
         "camera_extrinsic": tf.io.FixedLenFeature([], tf.string),
         "camera_intrinsic": tf.io.FixedLenFeature([], tf.string),
@@ -85,7 +91,6 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
     def prepare_sample(features):
       out = {
           "latents": tf.io.parse_tensor(features["latents"], out_type=tf.float32),
-          "latent_condition": tf.io.parse_tensor(features["latent_condition"], out_type=tf.float32),
           "encoder_hidden_states": tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32),
           "camera_extrinsic": tf.io.parse_tensor(features["camera_extrinsic"], out_type=tf.float32),
           "camera_intrinsic": tf.io.parse_tensor(features["camera_intrinsic"], out_type=tf.float32),
@@ -138,13 +143,13 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
     eval_steps = int(getattr(config, "eval_num_inference_steps", 0)) or int(config.num_inference_steps)
     eval_gs = float(getattr(config, "eval_guidance_scale", 1.0))
 
-    latent_condition = example_batch["latent_condition"][:gbs].astype(dtype)
+    latents = example_batch["latents"][:gbs].astype(dtype)
     encoder_hidden_states = example_batch["encoder_hidden_states"][:gbs].astype(dtype)
     clip_feature = example_batch["clip_feature"][:gbs].astype(dtype)
     camera_extrinsic = example_batch["camera_extrinsic"][:gbs]
     camera_intrinsic = example_batch["camera_intrinsic"][:gbs]
 
-    y_latents = pipeline.prepare_fun_camera_y_latents(latent_condition, dtype)
+    y_latents = pipeline.prepare_fun_camera_y_latents(latents, dtype)
     control_camera_latents = build_control_camera_latents(
         camera_extrinsic,
         camera_intrinsic,
@@ -194,7 +199,6 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
   def loss_fn(params):
     model = nnx.merge(state.graphdef, params, state.rest_of_state)
     latents = data["latents"].astype(config.weights_dtype)                  # [B, 16, F_lat, h, w]
-    latent_condition = data["latent_condition"].astype(config.weights_dtype)
     encoder_hidden_states = data["encoder_hidden_states"].astype(config.weights_dtype)
     clip_feature = data["clip_feature"].astype(config.weights_dtype)        # [B, 257, 1280]
 
@@ -216,11 +220,11 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
 
     # Official in_dim=32 y: latent frame 0 = VAE(first frame), all later frames
     # ZERO (DiffSynth WanVideoUnit_FunCameraControl primary branch — NOT the
-    # VAE(masked video) tail, and NO 4ch mask). The record's latent_condition is
-    # VAE(first-frame-masked video); with the causal 2.1 VAE its frame 0 equals
-    # vae.encode(first frame) exactly, so slice frame 0 and zero the rest.
-    y = jnp.zeros_like(latent_condition)
-    y = y.at[:, :, 0:1].set(latent_condition[:, :, 0:1])
+    # VAE(masked video) tail, and NO 4ch mask). The Wan2.1 VAE is temporally
+    # causal, so the CLEAN latents' frame 0 already IS vae.encode(first frame)
+    # (rel 2.2e-4, check_vae_causality.py) — no latent_condition field needed.
+    y = jnp.zeros_like(latents)
+    y = y.at[:, :, 0:1].set(latents[:, :, 0:1])
     hidden_states = jnp.concatenate([noisy_latents, y], axis=1)
 
     with jax.named_scope("forward_pass"):
