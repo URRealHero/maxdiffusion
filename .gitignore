@@ -187,4 +187,4 @@ gha-creds-*.json
 .jax_cache/
 
 # markdown note
-*.md
+*.mdexamples/
