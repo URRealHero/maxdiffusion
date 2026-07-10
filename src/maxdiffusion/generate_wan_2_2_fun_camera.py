@@ -11,11 +11,10 @@ _REPO_SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_SRC not in sys.path:
   sys.path.insert(0, _REPO_SRC)
 
-import jax
 import jax.numpy as jnp
 
 from absl import app
-from maxdiffusion import max_logging, max_utils, pyconfig
+from maxdiffusion import max_logging, pyconfig
 from maxdiffusion.checkpointing.wan_checkpointer_2_2_fun_camera import WanCheckpointer2_2_FunCamera
 from maxdiffusion.common_types import WAN2_2
 from maxdiffusion.train_utils import transformer_engine_context
@@ -65,11 +64,24 @@ def build_memory_inputs_from_config(config, dtype):
     return None, None, None
   from maxdiffusion.models.wan.memory_pose import build_memory_pose_tokens
 
-  mem_raw = np.load(config.memory_path, allow_pickle=True).astype(np.float32)  # [K,4,782,1024]
+  memory_path = str(getattr(config, "memory_path", "") or "")
+  if not memory_path:
+    raise ValueError("use_memory=True requires memory_path with StreamVGGT features")
+  mem_raw = np.load(memory_path, allow_pickle=False).astype(np.float32)  # [K,4,782,1024]
+  if mem_raw.ndim != 4 or tuple(mem_raw.shape[1:]) != (4, 782, 1024):
+    raise ValueError(f"memory must have shape [K,4,782,1024], got {mem_raw.shape}")
+  if mem_raw.shape[0] == 0:
+    raise ValueError("memory must contain at least one keyframe")
+  if not np.isfinite(mem_raw).all():
+    raise ValueError(f"memory contains non-finite values: {memory_path}")
   # CS uses ALL keyframes the data provides (T = key_pose_token.shape[1]); the retriever's
-  # "previous 4 frames" comments are stale. memory_n_key<=0 -> use all K (default); >0 -> first N.
+  # "previous 4 frames" comments are stale. memory_n_key=0 -> use all K (default); >0 -> first N.
   n_key_cfg = int(getattr(config, "memory_n_key", 0))
-  n_key = mem_raw.shape[0] if n_key_cfg <= 0 else min(n_key_cfg, mem_raw.shape[0])
+  if n_key_cfg < 0:
+    raise ValueError(f"memory_n_key must be 0 (all) or positive, got {n_key_cfg}")
+  if n_key_cfg > mem_raw.shape[0]:
+    raise ValueError(f"memory_n_key={n_key_cfg} exceeds available keyframes K={mem_raw.shape[0]}")
+  n_key = mem_raw.shape[0] if n_key_cfg == 0 else n_key_cfg
   memory = jnp.asarray(mem_raw[:n_key].reshape(1, -1, 1024), dtype=dtype)
   max_logging.log(f"Loaded memory: raw {mem_raw.shape} -> {memory.shape} ({n_key} keyframes)")
 

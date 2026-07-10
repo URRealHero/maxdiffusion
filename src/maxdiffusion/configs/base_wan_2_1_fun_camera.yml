@@ -325,6 +325,9 @@ width: 832
 num_frames: 153
 guidance_scale: 5.0
 flow_shift: 5.0
+# Training override. <=0 uses flow_shift above. Set 3.0 only when resuming a
+# legacy run created before training honoured flow_shift.
+train_flow_shift: -1.0
 
 # TI2V conditioning video (frame-concat inference).
 # Path to a local or GCS video file (.mp4) used as the conditioning sequence.

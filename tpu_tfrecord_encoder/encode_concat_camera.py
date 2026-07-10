@@ -57,9 +57,6 @@ def parse_args() -> argparse.Namespace:
   # cond+tgt are read from GCS and concatenated in-memory (cond frames then tgt frames).
   p.add_argument("--cond-video-field", default="cond_video")
   p.add_argument("--tgt-video-field", default="tgt_video")
-  p.add_argument("--target-only", action="store_true",
-                 help="Memory-AR target pathway: encode ONLY tgt.mp4 -> latents + y-ref (tgt frame 0) "
-                      "+ camera (tgt_cam re-based to tgt frame 0). cond is handled separately as memory.")
   p.add_argument("--camera-field", default="camera", help="Manifest field holding the camera.json path.")
   p.add_argument("--camera-fov-deg", type=float, default=90.0, help="Horizontal FOV (UE default 90).")
   p.add_argument("--height", type=int, default=480)
@@ -114,19 +111,14 @@ def _read_frames_from_uri(uri, decoder, temp_dir):
         pass
 
 
-def preprocess_concat(cond_uri, tgt_uri, height, width, num_frames, sample_mode, temp_dir, decoder, target_only=False):
+def preprocess_concat(cond_uri, tgt_uri, height, width, num_frames, sample_mode, temp_dir, decoder):
   """Read cond + tgt, concatenate frames (cond then tgt), sample to num_frames.
 
   Returns ([1, C, F, H, W] float32, indices, total_frames). Avoids needing a
   physical concat.mp4 on GCS; the result is identical to encoding concat.mp4.
-  When target_only=True, reads ONLY tgt.mp4 (memory-AR target pathway): the
-  first frame is then tgt frame 0, so latent_condition's y-ref is tgt frame 0.
   """
   np = load_numpy()
-  if target_only:
-    frames = _read_frames_from_uri(tgt_uri, decoder, temp_dir)
-  else:
-    frames = _read_frames_from_uri(cond_uri, decoder, temp_dir) + _read_frames_from_uri(tgt_uri, decoder, temp_dir)
+  frames = _read_frames_from_uri(cond_uri, decoder, temp_dir) + _read_frames_from_uri(tgt_uri, decoder, temp_dir)
   total = len(frames)
   idx = compute_indices(total, num_frames, sample_mode)
   arrays = [np.asarray(frames[int(i)].resize((width, height)), dtype=np.float32) / 127.5 - 1.0 for i in idx]
@@ -145,28 +137,20 @@ def load_caption_map(caption_manifest, caption_field):
 
 def _coordinate_transform(c2w):
   """HyDRA HM-World transform: Unreal world c2w (cm) -> camera-convention c2w (m)."""
-  np = load_numpy()
   t = c2w[:, [1, 2, 0, 3]].copy()
   t[:3, 1] *= -1.0
   t[:3, 3] /= 100.0
   return t
 
 
-def convert_camera(camera_json, fov_deg, width, height, target_only=False):
-  """camera.json (cond_cam+tgt_cam c2w) -> (extrinsic[N,3,4] w2c local, intrinsic[N,3,3] px).
-
-  target_only=True: use ONLY tgt_cam and re-base to tgt frame 0 (the generated
-  clip's first frame), so the Plucker control is local to tgt frame 0.
-  """
+def convert_camera(camera_json, fov_deg, width, height):
+  """camera.json (cond_cam+tgt_cam c2w) -> (extrinsic[N,3,4] w2c local, intrinsic[N,3,3] px)."""
   np = load_numpy()
   cc, tc = camera_json["cond_cam"], camera_json["tgt_cam"]
-  if target_only:
-    mats = [np.asarray(tc[str(i)], dtype=np.float64) for i in range(len(tc))]
-  else:
-    mats = [np.asarray(cc[str(i)], dtype=np.float64) for i in range(len(cc))]
-    mats += [np.asarray(tc[str(i)], dtype=np.float64) for i in range(len(tc))]
+  mats = [np.asarray(cc[str(i)], dtype=np.float64) for i in range(len(cc))]
+  mats += [np.asarray(tc[str(i)], dtype=np.float64) for i in range(len(tc))]
   c2w = np.stack([_coordinate_transform(m) for m in mats], axis=0)  # [N,4,4]
-  ref_w2c = np.linalg.inv(c2w[0])    # frame 0 = (tgt frame 0 when target_only)
+  ref_w2c = np.linalg.inv(c2w[0])
   rel = ref_w2c[None] @ c2w          # relative c2w, frame 0 = identity
   w2c = np.linalg.inv(rel)           # local w2c
   extrinsic = w2c[:, :3, :4].astype(np.float32)
@@ -176,13 +160,13 @@ def convert_camera(camera_json, fov_deg, width, height, target_only=False):
   return extrinsic, intrinsic
 
 
-def load_camera(camera_uri, fov_deg, width, height, indices, expected_total, target_only=False):
+def load_camera(camera_uri, fov_deg, width, height, indices, expected_total):
   np = load_numpy()
   import tensorflow as tf
 
   with tf.io.gfile.GFile(camera_uri, "r") as f:
     cam = json.load(f)
-  ext_full, intr_full = convert_camera(cam, fov_deg, width, height, target_only=target_only)
+  ext_full, intr_full = convert_camera(cam, fov_deg, width, height)
   if ext_full.shape[0] != expected_total:
     raise ValueError(
         f"camera frames {ext_full.shape[0]} != video frames {expected_total} for {camera_uri}"
@@ -295,15 +279,17 @@ def main() -> int:
         tgt_uri = record.get(args.tgt_video_field)
         camera_uri = record.get(args.camera_field)
         caption = caption_map.get(sample_id)
-        if not tgt_uri or (not args.target_only and not cond_uri):
+        if not cond_uri or not tgt_uri:
           raise ValueError(f"missing {args.cond_video_field}/{args.tgt_video_field}")
         if not camera_uri:
           raise ValueError(f"missing camera field {args.camera_field}")
         if not prompt_clean(str(caption or "")):
           raise ValueError(f"no caption for sample_id={sample_id} in caption manifest")
-        video, idx, total = preprocess_concat(cond_uri, tgt_uri, height, width, num_frames, args.sample_mode, temp_dir, args.video_decoder, target_only=args.target_only)
+        video, idx, total = preprocess_concat(
+            cond_uri, tgt_uri, height, width, num_frames, args.sample_mode, temp_dir, args.video_decoder
+        )
         videos.append(video)
-        cams.append(load_camera(camera_uri, args.camera_fov_deg, width, height, idx, total, target_only=args.target_only))
+        cams.append(load_camera(camera_uri, args.camera_fov_deg, width, height, idx, total))
         prompts.append(str(caption))
 
       video_batch = np.concatenate(videos, axis=0)
@@ -320,8 +306,17 @@ def main() -> int:
         assert_finite(sample_id, ("latents", latent), ("latent_condition", latent_condition),
                       ("encoder_hidden_states", hidden),
                       ("camera_extrinsic", ext), ("camera_intrinsic", intr))
-        writer.write(make_example(latent, latent_condition, hidden, ext, intr,
-                                   sample_id=sample_id, caption=caption_map.get(sample_id)))
+        written_path = writer.write(
+            make_example(
+                latent,
+                latent_condition,
+                hidden,
+                ext,
+                intr,
+                sample_id=sample_id,
+                caption=caption_map.get(sample_id),
+            )
+        )
         metadata_writer.write({
             "sample_id": sample_id,
             "caption": caption_map.get(sample_id),
@@ -332,7 +327,7 @@ def main() -> int:
             "camera_intrinsic_shape": list(intr.shape),
             "height": height, "width": width, "num_frames": num_frames,
             "camera_fov_deg": args.camera_fov_deg,
-            "process_index": process_index, "tfrec_path": writer.current_path,
+            "process_index": process_index, "tfrec_path": written_path,
         })
         print(f"encoded sample_id={sample_id} latent={latent.shape} ext={ext.shape}", flush=True)
 

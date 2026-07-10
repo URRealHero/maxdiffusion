@@ -50,6 +50,36 @@ def _to_array(x):
   return x
 
 
+def _advance_training_rng(rng, steps):
+  """Advance the WAN train-step PRNG recurrence by the requested updates.
+
+  Every WAN train step splits its input key into four keys and returns element
+  one as the next step's key. Replaying that small recurrence on resume keeps
+  timestep/noise/dropout randomness aligned with an uninterrupted run without
+  putting a PRNG key into older checkpoint schemas.
+  """
+  steps = int(steps)
+  if steps < 0:
+    raise ValueError(f"steps must be non-negative, got {steps}")
+  if steps == 0:
+    return rng
+  return jax.jit(
+      lambda key: jax.lax.fori_loop(0, steps, lambda _, k: jax.random.split(k, num=4)[1], key)
+  )(rng)
+
+
+def _checkpoint_restore_args(opt_state, step):
+  """Build restore args without treating valid step zero as false."""
+  if opt_state is None or step is None:
+    return {}
+  return {"opt_state": opt_state, "step": step}
+
+
+def _checkpoint_payload(state, save_optimizer):
+  """Mirror periodic/final checkpoint payload selection."""
+  return state if save_optimizer else state.params
+
+
 def generate_sample(config, pipeline, filename_prefix):
   """
   Generates a video to validate training did not corrupt the model
@@ -100,9 +130,19 @@ class BaseWanTrainer(abc.ABC):
 
   def create_scheduler(self):
     """Creates and initializes the Flow Match scheduler for training."""
-    noise_scheduler = FlaxFlowMatchScheduler(dtype=jnp.float32)
+    # Inference has always consumed config.flow_shift, but training silently
+    # constructed the scheduler with its default shift=3.0. Honour an explicit
+    # train_flow_shift when supplied; otherwise keep one shared flow_shift
+    # contract for training and inference.
+    train_shift = float(getattr(self.config, "train_flow_shift", -1.0) or -1.0)
+    if train_shift <= 0:
+      train_shift = float(getattr(self.config, "flow_shift", 3.0))
+    if not np.isfinite(train_shift) or train_shift <= 0:
+      raise ValueError(f"Training flow shift must be finite and > 0, got {train_shift}")
+    noise_scheduler = FlaxFlowMatchScheduler(shift=train_shift, dtype=jnp.float32)
     noise_scheduler_state = noise_scheduler.create_state()
     noise_scheduler_state = noise_scheduler.set_timesteps(noise_scheduler_state, num_inference_steps=1000, training=True)
+    max_logging.log(f"Training FlowMatch scheduler: shift={train_shift}")
     return noise_scheduler, noise_scheduler_state
 
   @staticmethod
@@ -178,9 +218,8 @@ class BaseWanTrainer(abc.ABC):
   def start_training(self):
     with nn_partitioning.axis_rules(self.config.logical_axis_rules):
       pipeline, opt_state, step = self.checkpointer.load_checkpoint()
-    restore_args = {}
-    if opt_state and step:
-      restore_args = {"opt_state": opt_state, "step": step}
+    restore_args = _checkpoint_restore_args(opt_state, step)
+    if restore_args:
       del opt_state
     if self.config.enable_ssim:
       # Generate a sample before training to compare against generated sample after training.
@@ -338,6 +377,7 @@ class BaseWanTrainer(abc.ABC):
     start_step = restore_args.get("step", 0)
     if start_step:
       max_logging.log(f"Resuming training from step {start_step}")
+      rng = _advance_training_rng(rng, start_step)
     per_device_tflops, _, _ = BaseWanTrainer.calculate_tflops(pipeline)
     scheduler_state = pipeline.scheduler_state
     example_batch = load_next_batch(train_data_iterator, None, self.config)
@@ -404,18 +444,21 @@ class BaseWanTrainer(abc.ABC):
         example_batch = next_batch_future.result()
         if step != 0 and self.config.checkpoint_every != -1 and step % self.config.checkpoint_every == 0:
           max_logging.log(f"Saving checkpoint for step {step}")
-          if self.config.save_optimizer:
-            self.checkpointer.save_checkpoint(step, pipeline, state)
-          else:
-            self.checkpointer.save_checkpoint(step, pipeline, state.params)
+          self.checkpointer.save_checkpoint(step, pipeline, _checkpoint_payload(state, self.config.save_optimizer))
 
       _metrics_queue.put(None)
       writer_thread.join()
       if writer:
         writer.flush()
       if self.config.save_final_checkpoint:
-        max_logging.log(f"Saving final checkpoint for step {step}")
-        self.checkpointer.save_checkpoint(self.config.max_train_steps - 1, pipeline, state.params)
+        final_step = self.config.max_train_steps - 1
+        max_logging.log(f"Saving final checkpoint for step {final_step}")
+        # Keep final checkpoints structurally identical to periodic ones. In
+        # mixed-precision runs the full state can contain fp32 master weights
+        # as well as optimizer moments needed for a faithful resume.
+        self.checkpointer.save_checkpoint(
+            final_step, pipeline, _checkpoint_payload(state, self.config.save_optimizer)
+        )
         self.checkpointer.checkpoint_manager.wait_until_finished()
       # load new state for trained transformer
       pipeline.transformer = nnx.merge(state.graphdef, state.params, state.rest_of_state)

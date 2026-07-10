@@ -422,12 +422,16 @@ class ShardedWriter:
   def write(self, example: bytes):
     if self.writer is None:
       self._open()
+    written_path = self.current_path
     self.writer.write(example)
     self.records_in_shard += 1
     self.total_records += 1
     if self.records_in_shard >= self.records_per_shard:
       self.close_current()
       self.shard_index += 1
+    # current_path becomes None when this record exactly fills a shard. Return
+    # the path that actually received the record so metadata never loses it.
+    return written_path
 
   def close_current(self):
     if self.writer is not None:
@@ -504,7 +508,6 @@ def main() -> int:
   from maxdiffusion import pyconfig
   from maxdiffusion.pipelines.wan.wan_pipeline_2_2_dense import WanPipeline2_2_Dense
   import jax
-  import tensorflow as tf
 
   config_args = list(args.config_arg)
   manual_host_sharding = args.host_count is not None
@@ -619,7 +622,7 @@ def main() -> int:
         assert_finite_encoded_record(sample_id, latent, cond_latent, hidden_state)
 
       for (_, sample_id, record), latent, cond_latent, hidden_state in encoded_records:
-        writer.write(make_example(latent, cond_latent, hidden_state, args.condition_output_field))
+        written_path = writer.write(make_example(latent, cond_latent, hidden_state, args.condition_output_field))
         metadata_writer.write(
             {
                 "sample_id": sample_id,
@@ -633,7 +636,7 @@ def main() -> int:
                 "width": width,
                 "num_frames": num_frames,
                 "process_index": process_index,
-                "tfrec_path": writer.current_path,
+                "tfrec_path": written_path,
             },
         )
         print(f"encoded sample_id={sample_id} latent_shape={latent.shape}", flush=True)

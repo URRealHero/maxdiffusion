@@ -37,7 +37,10 @@ RUN_NAME="${RUN_NAME:-wan21-fun-camera-lora}"
 OUTPUT_DIR="${OUTPUT_DIR:-gs://data_us_central1_a/maxdiffusion/wan/wan21_fun_camera_lora}"
 DATASET_DIR="${DATASET_DIR:-gs://data_us_central1_a/hmworld_data/wan_2_1/concat_camera_encoded_full_clip/}"
 JAX_CACHE_DIR="${JAX_CACHE_DIR:-${OUTPUT_DIR}/jax_cache/}"
-SEED="${SEED:-$RANDOM}"
+# Stable by default so a restart does not silently change the diffusion RNG.
+# For an existing run, pass the seed recorded in its original config.
+SEED="${SEED:-42}"
+TRAIN_FLOW_SHIFT="${TRAIN_FLOW_SHIFT:-5.0}"
 
 TRAIN_PY="${TRAIN_PY:-src/maxdiffusion/train_wan_2_1_fun_camera.py}"
 CONFIG="${CONFIG:-src/maxdiffusion/configs/base_wan_2_1_fun_camera.yml}"
@@ -113,7 +116,7 @@ setsid nohup python ${TRAIN_PY} \
   ${CONFIG} \
   attention=flash weights_dtype=bfloat16 activations_dtype=bfloat16 \
   wan_transformer_pretrained_model_name_or_path='${TRANSFORMER_PATH}' \
-  flow_shift=5.0 fps=15 \
+  flow_shift=5.0 train_flow_shift=${TRAIN_FLOW_SHIFT} fps=15 \
   skip_jax_distributed_system=False \
   run_name=${RUN_NAME} \
   output_dir=${OUTPUT_DIR} \

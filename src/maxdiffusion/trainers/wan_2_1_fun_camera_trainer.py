@@ -71,7 +71,7 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
 
   def load_dataset(self, mesh, pipeline=None, is_training=True):
     config = self.config
-    if config.dataset_type != "tfrecord" and not config.cache_latents_text_encoder_outputs:
+    if config.dataset_type != "tfrecord" or not config.cache_latents_text_encoder_outputs:
       raise ValueError(
           "Fun camera training only supports dataset_type=tfrecord with cache_latents_text_encoder_outputs=True"
       )
@@ -86,7 +86,9 @@ class Wan2_1FunCameraTrainer(Wan2_2FunCameraTrainer):
     if not is_training:
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
     if is_training and getattr(config, "exclude_sample_ids_path", ""):
-      feature_description["sample_id"] = tf.io.FixedLenFeature([], tf.string, default_value="")
+      # Exclusion must fail closed: silently parsing a missing ID as an empty
+      # string would let legacy/unidentified records leak into the held-out set.
+      feature_description["sample_id"] = tf.io.FixedLenFeature([], tf.string)
 
     def prepare_sample(features):
       out = {

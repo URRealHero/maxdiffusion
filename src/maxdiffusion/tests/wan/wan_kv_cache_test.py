@@ -45,7 +45,10 @@ class WanKvCacheTest(unittest.TestCase):
             "height=240",  # Reduced resolution for speed (divisible by 16)
             "width=416",  # Reduced resolution for speed (divisible by 16)
             "num_frames=9",  # Reduced num_frames for speed
-            "attention=flash",
+            # This test forces JAX onto CPU; TPU Splash/Flash cannot lower
+            # there outside Pallas interpret mode. KV-cache semantics are
+            # kernel-independent, so exercise them with the CPU kernel.
+            "attention=dot_product",
             "scan_layers=False",
             "jit_initializers=False",
             "skip_jax_distributed_system=True",

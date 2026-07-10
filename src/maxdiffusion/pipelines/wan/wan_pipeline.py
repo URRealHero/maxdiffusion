@@ -73,6 +73,7 @@ def cast_with_exclusion(path, x, dtype_to_cast):
       "condition_embedder",  # The entire time/text conditioning module
       "scale_shift_table",  # Catches both the final and the AdaLN tables
       "lora_",  # Keep trainable LoRA adapters in fp32 for TPU mixed-precision stability
+      "memory",  # Memory/retriever weights underflowed when cast to bf16 in the CS port
   ]
 
   path_str = ".".join(str(k.key) if isinstance(k, jax.tree_util.DictKey) else str(k) for k in path)
@@ -83,6 +84,51 @@ def cast_with_exclusion(path, x, dtype_to_cast):
   else:
     # Cast everything else to dtype_to_cast
     return x.astype(dtype_to_cast)
+
+
+def _canonical_restored_param_path(path):
+  """Normalize Orbax/NNX wrapper and block-index differences for key matching."""
+  path = tuple(path)
+  if path and path[-1] == "value":
+    path = path[:-1]
+  # Orbax metadata may stringify any nnx list index, not just blocks.N.
+  # Canonical model/sharding trees retain those indices as Python ints.
+  return tuple(int(part) if isinstance(part, str) and part.isdigit() else part for part in path)
+
+
+def _canonicalize_restored_flat_params(flat_params):
+  """Canonicalize all restored leaves before optional groups are merged."""
+  canonical = {}
+  for path, value in flat_params.items():
+    normalized = _canonical_restored_param_path(path)
+    if normalized in canonical:
+      raise ValueError(f"Restored checkpoint has colliding parameter paths after normalization: {normalized}")
+    canonical[normalized] = value
+  return canonical
+
+
+def _is_memory_param_path(path):
+  parts = tuple(str(p) for p in path)
+  return (
+      bool(parts)
+      and (
+          parts[0] in ("memory_emb_0", "memory_emb_2", "memory_retriever")
+          or (parts[0] == "blocks" and ("memory_cross_attn" in parts or "norm_memory" in parts))
+      )
+  )
+
+
+def _optional_param_group_is_absent(expected_paths, present_paths, group_name):
+  """Return True for a wholly absent optional group; reject partial checkpoints."""
+  expected_paths = set(expected_paths)
+  if not expected_paths:
+    raise ValueError(f"Model declares {group_name} enabled but exposes zero matching params")
+  present_group = expected_paths & set(present_paths)
+  if present_group and present_group != expected_paths:
+    raise ValueError(
+        f"Checkpoint contains only {len(present_group)}/{len(expected_paths)} expected {group_name} params"
+    )
+  return not present_group
 
 
 def basic_clean(text):
@@ -264,6 +310,7 @@ def create_sharded_logical_transformer(
   logical_state_sharding = nn.logical_to_mesh_sharding(logical_state_spec, mesh, config.logical_axis_rules)
   logical_state_sharding = dict(nnx.to_flat_state(logical_state_sharding))
   params = state.to_pure_dict()
+  eval_param_shapes = params
   state = dict(nnx.to_flat_state(state))
 
   # 4. Load pretrained weights and move them to device using the state shardings from (3) above.
@@ -276,60 +323,75 @@ def create_sharded_logical_transformer(
     else:  # if not checkpointed with optimizer
       params = checkpoint_state
   else:
-    # the eval-shape tree (params) carries the abstract LoRA shapes; the base
-    # loader returns only base keys, so keep a reference for LoRA shape lookup.
-    eval_lora_shapes = params
     params = load_wan_transformer(
         config.wan_transformer_pretrained_model_name_or_path,
-        params,
+        eval_param_shapes,
         "cpu",
         num_layers=wan_config["num_layers"],
         scan_layers=config.scan_layers,
         subfolder=subfolder,
     )
 
-    # LoRA params are NOT in the base checkpoint (separate adapter, or fresh).
-    # Fill them here, before the cast/device_put below, or they stay absent and
-    # the sharding/device_put loop has nothing to place. Fresh init first, then
-    # overlay a LoRA safetensors file if wan_lora_path is given.
-    if int(wan_config.get("lora_rank", 0)) > 0:
-      from ...models.wan.wan_utils import init_wan_lora_params, load_wan_lora
-      flat_params = flax.traverse_util.flatten_dict(params)
-      flat_params.update(init_wan_lora_params(eval_lora_shapes, seed=int(getattr(config, "seed", 0))))
+  # Optional modules may be absent both from the pretrained base and from an
+  # older/full Orbax checkpoint. Fill only wholly absent groups; a partially
+  # present group indicates a corrupt/incompatible checkpoint and fails closed.
+  flat_params = flax.traverse_util.flatten_dict(params)
+  if restored_checkpoint:
+    flat_params = _canonicalize_restored_flat_params(flat_params)
+  present_paths = set(flat_params)
+
+  if int(wan_config.get("lora_rank", 0)) > 0:
+    from ...models.wan.wan_utils import init_wan_lora_params, load_wan_lora
+
+    fresh_lora = init_wan_lora_params(eval_param_shapes, seed=int(getattr(config, "seed", 0)))
+    expected_lora = set(fresh_lora)
+    if _optional_param_group_is_absent(expected_lora, present_paths, "LoRA"):
       lora_path = getattr(config, "wan_lora_path", "") or ""
       if lora_path:
-        flat_params.update(
-            load_wan_lora(lora_path, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"])
+        fresh_lora.update(
+            load_wan_lora(
+                lora_path,
+                eval_param_shapes,
+                scan_layers=config.scan_layers,
+                num_layers=wan_config["num_layers"],
+            )
         )
-      params = flax.traverse_util.unflatten_dict(flat_params)
+      flat_params.update(fresh_lora)
+      present_paths.update(expected_lora)
 
-    # Captain-Safari memory weights (memory_emb + per-block memory_cross_attn/norm_memory
-    # + memory_retriever) live in the same epoch-*.safetensors as the LoRA adapters.
-    if bool(wan_config.get("use_memory", False)):
-      from ...models.wan.wan_utils import load_wan_memory
+  if bool(wan_config.get("use_memory", False)):
+    from ...models.wan.wan_utils import load_wan_memory
+
+    expected_memory = {
+        path for path in flax.traverse_util.flatten_dict(eval_param_shapes) if _is_memory_param_path(path)
+    }
+    if _optional_param_group_is_absent(expected_memory, present_paths, "static-memory"):
       mem_path = getattr(config, "wan_memory_path", "") or getattr(config, "wan_lora_path", "") or ""
-      if mem_path:
-        flat_params = flax.traverse_util.flatten_dict(params)
-        flat_params.update(
-            load_wan_memory(mem_path, eval_lora_shapes, scan_layers=config.scan_layers, num_layers=wan_config["num_layers"])
+      if not mem_path:
+        raise ValueError(
+            "use_memory=True requires wan_memory_path (or wan_lora_path containing the CS memory weights). "
+            "Fresh static-memory initialization is intentionally unsupported because the ungated random "
+            "memory residual would perturb the pretrained DiT."
         )
-        params = flax.traverse_util.unflatten_dict(flat_params)
+      loaded_memory = load_wan_memory(
+          mem_path,
+          eval_param_shapes,
+          scan_layers=config.scan_layers,
+          num_layers=wan_config["num_layers"],
+      )
+      if set(loaded_memory) != expected_memory:
+        raise ValueError(
+            f"Memory loader returned {len(loaded_memory)}/{len(expected_memory)} expected static-memory params"
+        )
+      flat_params.update(loaded_memory)
+
+  params = flax.traverse_util.unflatten_dict(flat_params)
 
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),
       params,
   )
   for path, val in flax.traverse_util.flatten_dict(params).items():
-    if restored_checkpoint:
-      if path[-1] == "value":
-        path = path[:-1]  # remove 'value'
-
-      try:
-        # Convert block indices to integers, as they might have been loaded as strings from the checkpoint.
-        path = path[:1] + (int(path[1]),) + path[2:]
-      except Exception:
-        pass
-
     sharding = logical_state_sharding[path].value
     try:
       state[path].value = device_put_replicated(val, sharding)

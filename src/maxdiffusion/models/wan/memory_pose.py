@@ -88,10 +88,30 @@ def build_memory_pose_tokens(extr_key, intr_key, extr_query, intr_query,
   Mirrors model_fn_wan_video: concat first n_key key extrinsics with the query, convert
   to local coords (first key frame = origin), then pose-encode query (S=1) and keys (S=n_key).
   extr_key (>=n_key,3,4), intr_key (>=n_key,3,3), extr_query (3,4), intr_query (3,3)."""
-  extr_key = np.asarray(extr_key, dtype=np.float64)[:n_key]
-  intr_key = np.asarray(intr_key, dtype=np.float64)[:n_key]
+  n_key = int(n_key)
+  if n_key <= 0:
+    raise ValueError(f"n_key must be positive, got {n_key}")
+  extr_key = np.asarray(extr_key, dtype=np.float64)
+  intr_key = np.asarray(intr_key, dtype=np.float64)
   extr_query = np.asarray(extr_query, dtype=np.float64)
   intr_query = np.asarray(intr_query, dtype=np.float64)
+  if extr_key.ndim != 3 or tuple(extr_key.shape[1:]) != (3, 4):
+    raise ValueError(f"extr_key must have shape [K,3,4], got {extr_key.shape}")
+  if intr_key.ndim != 3 or tuple(intr_key.shape[1:]) != (3, 3):
+    raise ValueError(f"intr_key must have shape [K,3,3], got {intr_key.shape}")
+  if extr_key.shape[0] < n_key or intr_key.shape[0] < n_key:
+    raise ValueError(
+        f"n_key={n_key} requires at least that many key poses; "
+        f"got extr_key={extr_key.shape[0]}, intr_key={intr_key.shape[0]}"
+    )
+  if extr_query.shape != (3, 4) or intr_query.shape != (3, 3):
+    raise ValueError(
+        f"query poses must have shapes (3,4)/(3,3), got {extr_query.shape}/{intr_query.shape}"
+    )
+  arrays = (extr_key[:n_key], intr_key[:n_key], extr_query, intr_query)
+  if not all(np.isfinite(x).all() for x in arrays):
+    raise ValueError("memory pose inputs contain non-finite values")
+  extr_key, intr_key = extr_key[:n_key], intr_key[:n_key]
 
   combined = np.concatenate([extr_key, extr_query[None]], axis=0)  # (n_key+1,3,4)
   combined_local = convert_to_local_coordinates(combined)

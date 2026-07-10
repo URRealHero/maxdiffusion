@@ -78,7 +78,7 @@ class WanTrainer(BaseWanTrainer):
       )
 
     config = self.config
-    if config.dataset_type != "tfrecord" and not config.cache_latents_text_encoder_outputs:
+    if config.dataset_type != "tfrecord" or not config.cache_latents_text_encoder_outputs:
       raise ValueError(
           "Wan 2.1 training only supports config.dataset_type set to tfrecords and config.cache_latents_text_encoder_outputs set to True"
       )

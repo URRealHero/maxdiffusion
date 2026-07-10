@@ -37,8 +37,11 @@ import re
 import numpy as np
 import tensorflow as tf
 
-SHARD_RE = re.compile(r"host_(\d+)_run_(\d+)_file_(\d+)\.tfrec$")
-META_RE = re.compile(r"metadata_host_(\d+)_run_(\d+)\.jsonl$")
+# Run IDs from the launchers are timestamped strings such as
+# "tgtcam-20260710-120000", not only decimal process IDs. Anchor the capture
+# between the stable run/file delimiters so hyphens and underscores are safe.
+SHARD_RE = re.compile(r"host_(\d+)_run_(.+)_file_(\d+)\.tfrec$")
+META_RE = re.compile(r"metadata_host_(\d+)_run_(.+)\.jsonl$")
 
 
 def parse_args():

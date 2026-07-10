@@ -35,7 +35,7 @@ from jax.sharding import Mesh
 from flax.linen import partitioning as nn_partitioning
 
 from .. import pyconfig
-from ..max_utils import create_device_mesh, get_flash_block_sizes
+from ..max_utils import create_device_mesh
 from ..models.wan.transformers.transformer_wan import (
     WanTransformerBlock,
     WanFeedForward,
@@ -135,6 +135,103 @@ class WanLoRAAdapterTest(unittest.TestCase):
       out = adapter(x)
     self.assertEqual(out.shape, (2, 16, 128))
     self.assertTrue(jnp.allclose(out, 0.0), f"Expected zero output, got max={jnp.abs(out).max()}")
+
+
+class WanAttentionLoRAWiringTest(unittest.TestCase):
+  """Projection-level gates, including the Wan2.1 I2V-CC branch and KV cache."""
+
+  def setUp(self):
+    config, mesh = _make_mesh_and_config()
+    self.config = config
+    self.mesh = mesh
+
+  def _make_attention(self, *, i2v):
+    attn = FlaxWanAttention(
+        rngs=nnx.Rngs(0),
+        query_dim=8,
+        heads=2,
+        dim_head=4,
+        qk_norm="rms_norm_across_heads",
+        attention_kernel="dot_product",
+        is_self_attention=False,
+        added_kv_proj_dim=8 if i2v else None,
+        image_seq_len=2 if i2v else None,
+        lora_rank=2,
+        lora_alpha=2.0,
+    )
+    if i2v:
+      # Exercise the production padded-image path without allocating a full
+      # 128/256-token TPU alignment block.
+      attn.alignment = 4
+    return attn
+
+  @staticmethod
+  def _set_adapter_active(adapter, active):
+    fill = jnp.ones_like(adapter.lora_B.kernel.value) if active else jnp.zeros_like(adapter.lora_B.kernel.value)
+    adapter.lora_B.kernel.value = fill
+
+  def test_i2v_qkv_lora_is_live_and_cache_matches(self):
+    hidden = jax.random.normal(jax.random.key(11), (1, 3, 8))
+    image = jax.random.normal(jax.random.key(12), (1, 2, 8))
+    text = jax.random.normal(jax.random.key(13), (1, 4, 8))
+    image_padding = jnp.zeros((1, 2, 8), dtype=image.dtype)
+    encoder = jnp.concatenate([image, image_padding, text], axis=1)
+    encoder_mask = jnp.asarray([[1, 1, 0, 0, 1, 1, 1, 1]], dtype=jnp.int32)
+
+    with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      attn = self._make_attention(i2v=True)
+      base = attn(hidden, encoder, encoder_attention_mask=encoder_mask)
+
+      # Each official q/k/v target must independently affect I2V cross-attn.
+      for name in ("lora_q", "lora_k", "lora_v"):
+        adapter = getattr(attn, name)
+        self._set_adapter_active(adapter, True)
+        active = attn(hidden, encoder, encoder_attention_mask=encoder_mask)
+        self.assertGreater(
+            float(jnp.max(jnp.abs(active - base))),
+            1e-5,
+            f"{name} is present in the parameter tree but dead in I2V cross-attention",
+        )
+        self._set_adapter_active(adapter, False)
+
+      for name in ("lora_q", "lora_k", "lora_v"):
+        self._set_adapter_active(getattr(attn, name), True)
+      uncached = attn(hidden, encoder, encoder_attention_mask=encoder_mask)
+      cached = attn(
+          hidden,
+          encoder,
+          encoder_attention_mask=encoder_mask,
+          cached_kv=attn.compute_kv(encoder, encoder_mask),
+      )
+
+      # Below the image embedder's flash threshold there is no padding/mask.
+      # Forward and compute_kv must then both split at the actual image length.
+      encoder_unpadded = jnp.concatenate([image, text], axis=1)
+      uncached_unpadded = attn(hidden, encoder_unpadded)
+      cached_unpadded = attn(hidden, encoder_unpadded, cached_kv=attn.compute_kv(encoder_unpadded))
+
+    self.assertTrue(
+        jnp.allclose(uncached, cached, atol=1e-5, rtol=1e-5),
+        f"I2V LoRA KV cache drift: max={jnp.max(jnp.abs(uncached - cached))}",
+    )
+    self.assertTrue(
+        jnp.allclose(uncached_unpadded, cached_unpadded, atol=1e-5, rtol=1e-5),
+        f"I2V unpadded LoRA KV cache drift: max={jnp.max(jnp.abs(uncached_unpadded - cached_unpadded))}",
+    )
+
+  def test_standard_cross_attention_lora_cache_matches(self):
+    hidden = jax.random.normal(jax.random.key(21), (1, 3, 8))
+    encoder = jax.random.normal(jax.random.key(22), (1, 4, 8))
+    with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      attn = self._make_attention(i2v=False)
+      for name in ("lora_q", "lora_k", "lora_v"):
+        self._set_adapter_active(getattr(attn, name), True)
+      uncached = attn(hidden, encoder)
+      cached = attn(hidden, encoder, cached_kv=attn.compute_kv(encoder))
+    self.assertTrue(
+        jnp.allclose(uncached, cached, atol=1e-5, rtol=1e-5),
+        f"standard LoRA KV cache drift: max={jnp.max(jnp.abs(uncached - cached))}",
+    )
 
 
 class WanFeedForwardLoRATest(unittest.TestCase):

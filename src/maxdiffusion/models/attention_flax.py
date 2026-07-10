@@ -1689,6 +1689,8 @@ class FlaxWanAttention(nnx.Module):
       # NEW PATH for I2V CROSS-ATTENTION
       with self.conditional_named_scope("proj_query"):
         query_proj_raw = self.query(hidden_states)
+        if self.lora_q is not None:
+          query_proj_raw = query_proj_raw + self.lora_q(hidden_states)
 
       # Image embeddings are padded to multiples of 128 (v5p and below) or 256 (v6e and above) for TPU flash attention
       # Calculate the padded length to correctly split image and text embeddings
@@ -1699,6 +1701,10 @@ class FlaxWanAttention(nnx.Module):
         else:
           image_seq_len_actual = 257
         padded_img_len = ((image_seq_len_actual + alignment - 1) // alignment) * alignment  # 257 -> 384
+        if encoder_attention_mask is None:
+          # The image embedder does not pad below flash_min_seq_length. Keep
+          # forward splitting identical to compute_kv for that unpadded path.
+          padded_img_len = image_seq_len_actual
         encoder_hidden_states_img = encoder_hidden_states[:, :padded_img_len, :]
         encoder_hidden_states_text = encoder_hidden_states[:, padded_img_len:, :]
 
@@ -1727,11 +1733,15 @@ class FlaxWanAttention(nnx.Module):
       else:
         with self.conditional_named_scope("proj_key"):
           key_proj_text = self.key(encoder_hidden_states_text)
+          if self.lora_k is not None:
+            key_proj_text = key_proj_text + self.lora_k(encoder_hidden_states_text)
         if self.qk_norm:
           with self.conditional_named_scope("attn_k_norm"):
             key_proj_text = self.norm_k(key_proj_text)
         with self.conditional_named_scope("proj_value"):
           value_proj_text = self.value(encoder_hidden_states_text)
+          if self.lora_v is not None:
+            value_proj_text = value_proj_text + self.lora_v(encoder_hidden_states_text)
 
       # Image K/V (only if image embeddings are present)
       if encoder_hidden_states_img is not None:
@@ -1800,8 +1810,12 @@ class FlaxWanAttention(nnx.Module):
     if not is_i2v_cross_attention:
       with jax.named_scope("key_proj"):
         key_proj = self.key(encoder_hidden_states)
+        if self.lora_k is not None:
+          key_proj = key_proj + self.lora_k(encoder_hidden_states)
       with jax.named_scope("value_proj"):
         value_proj = self.value(encoder_hidden_states)
+        if self.lora_v is not None:
+          value_proj = value_proj + self.lora_v(encoder_hidden_states)
 
       if self.qk_norm:
         with self.conditional_named_scope("attn_k_norm"):
@@ -1826,11 +1840,15 @@ class FlaxWanAttention(nnx.Module):
       # Text K/V
       with self.conditional_named_scope("proj_key"):
         key_proj_text = self.key(encoder_hidden_states_text)
+        if self.lora_k is not None:
+          key_proj_text = key_proj_text + self.lora_k(encoder_hidden_states_text)
       if self.qk_norm:
         with self.conditional_named_scope("attn_k_norm"):
           key_proj_text = self.norm_k(key_proj_text)
       with self.conditional_named_scope("proj_value"):
         value_proj_text = self.value(encoder_hidden_states_text)
+        if self.lora_v is not None:
+          value_proj_text = value_proj_text + self.lora_v(encoder_hidden_states_text)
 
       # Image K/V (only if image embeddings are present)
       if encoder_hidden_states_img is not None:

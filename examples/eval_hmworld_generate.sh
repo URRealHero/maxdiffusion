@@ -52,6 +52,9 @@ NEG_PROMPT="${NEG_PROMPT:-}"
 GC="${GC:-/home/spu9/google-cloud-sdk/bin/gcloud}"
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
 RUN_ID="${RUN_ID:-hmworld-eval-$(date +%Y%m%d-%H%M%S)}"
+# Shared pod safety: never kill another process unless the operator opts in
+# after completing the pre-launch check above.
+CLEAN_STALE_PROCESSES="${CLEAN_STALE_PROCESSES:-False}"
 
 STEP_ARG=""
 [ -n "${CKPT_STEP}" ] && STEP_ARG="eval_checkpoint_step=${CKPT_STEP}"
@@ -59,6 +62,16 @@ STEP_ARG=""
 echo "HM-World eval-gen '${RUN_TAG}'  ${WIDTH}x${HEIGHT}x${NUM_FRAMES}  steps=${STEPS} gs=${GUIDANCE} lora_rank=${LORA_RANK}"
 echo "  ${TPU_NAME} --worker=all  host_count=${HOST_COUNT}  ckpt=${CKPT_RUN_DIR:-PAI-base}${CKPT_STEP:+ @${CKPT_STEP}}"
 echo "  eval=${EVAL_DATA_DIR}  ->  ${VIZ_OUT}   (log: ~/eval_logs/${RUN_ID}_w<WID>.log)"
+
+# Run cleanup in a separate remote command. If pkill and launch share one
+# command line, pkill -f can match the launcher shell itself because the later
+# Python command contains the target process name, yielding a misleading SSH
+# 255 before generation starts.
+if [ "${CLEAN_STALE_PROCESSES}" = "True" ]; then
+  "${GC}" alpha compute tpus tpu-vm ssh "${TPU_NAME}" \
+    --project="${PROJECT}" --zone="${ZONE}" --worker=all \
+    --command='pkill -9 -f "[e]val_fun_camera_visualize" 2>/dev/null || true; pkill -9 -f "[e]ncode_concat_camera" 2>/dev/null || true; sleep 2; sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true'
+fi
 
 "${GC}" alpha compute tpus tpu-vm ssh "${TPU_NAME}" \
   --project="${PROJECT}" --zone="${ZONE}" --worker=all \
@@ -75,12 +88,6 @@ WID=\$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/com
 # Single-host topology: each worker claims only its own 2x2 chips.
 export TPU_PROCESS_BOUNDS=1,1,1
 export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
-# Pre-launch hygiene: a prior job's process may still hold the TPU (vfio busy) at
-# launch time. Kill any leftover gen/encode proc on this worker + clear the stale lock.
-pkill -9 -f "[e]val_fun_camera_visualize" 2>/dev/null || true
-pkill -9 -f "[e]ncode_concat_camera" 2>/dev/null || true
-sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
-sleep 2
 mkdir -p \$HOME/eval_logs
 LOG=\$HOME/eval_logs/${RUN_ID}_w\${WID}.log
 setsid nohup python -u src/eval/eval_fun_camera_visualize.py \
