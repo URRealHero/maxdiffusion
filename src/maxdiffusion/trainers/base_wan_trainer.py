@@ -271,13 +271,20 @@ class BaseWanTrainer(abc.ABC):
           apply_fn=graphdef.apply, params=params, tx=optimizer, graphdef=graphdef, rest_of_state=rest_of_state
       )
       if restore_args:
-        step = restore_args.get("step", 0)
-        max_logging.log(f"Restoring optimizer and resuming from step {step}")
+        # Checkpoint label semantics: a checkpoint labeled N is saved at the END of
+        # loop iteration N (params/opt_state AFTER update N), so a resumed run must
+        # execute step N+1 first. Without the +1 the loop re-ran step N — one
+        # duplicate update per resume — and immediately overwrote checkpoint N.
+        # TrainState.step counts applied updates (N+1 after updates 0..N), so it
+        # gets the same +1.
+        resume_step = restore_args.get("step", 0) + 1
+        restore_args["step"] = resume_step
+        max_logging.log(f"Restoring optimizer from checkpoint step {resume_step - 1}; resuming at step {resume_step}")
         # flax.struct.replace() is FUNCTIONAL — returns a new object, does NOT mutate
         # in place. Without reassignment the restored opt_state (Adam m/v moments +
         # internal step count) was silently discarded, zeroing optimizer momentum on
         # every resume (weights + step still restored via other paths). Reassign.
-        state = state.replace(opt_state=restore_args.get("opt_state"), step=restore_args.get("step", 0))
+        state = state.replace(opt_state=restore_args.get("opt_state"), step=resume_step)
         del restore_args["opt_state"]
         del optimizer
       state = jax.tree.map(_to_array, state)
@@ -328,9 +335,9 @@ class BaseWanTrainer(abc.ABC):
     last_profiling_step = np.clip(
         first_profiling_step + self.config.profiler_steps - 1, first_profiling_step, self.config.max_train_steps - 1
     )
-    if restore_args.get("step", 0):
-      max_logging.log(f"Resuming training from step {step}")
     start_step = restore_args.get("step", 0)
+    if start_step:
+      max_logging.log(f"Resuming training from step {start_step}")
     per_device_tflops, _, _ = BaseWanTrainer.calculate_tflops(pipeline)
     scheduler_state = pipeline.scheduler_state
     example_batch = load_next_batch(train_data_iterator, None, self.config)
