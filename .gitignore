@@ -186,5 +186,7 @@ gha-creds-*.json
 # JAX cache
 .jax_cache/
 
-# markdown note
-*.mdexamples/
+# Project-local research notes and launchers
+*.md
+/examples/
+/eval_res/
