@@ -31,7 +31,7 @@ from ...pyconfig import HyperParameters
 from ... import max_logging
 from ... import max_utils
 from ...max_utils import get_flash_block_sizes, get_precision, device_put_replicated
-from ...models.wan.wan_utils import load_wan_transformer, load_wan_vae
+from ...models.wan.wan_utils import load_wan_transformer, load_wan_vae, wan_param_dtype
 from ...models.wan.transformers.transformer_wan import WanModel
 from ...models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
 from ...models.wan.wan_text_encoder_pytorch import WanTextEncoderForMaxDiffusion
@@ -64,26 +64,8 @@ TORCH_DTYPE_MAP = {
 
 
 def cast_with_exclusion(path, x, dtype_to_cast):
-  """
-  Casts arrays to dtype_to_cast, but keeps numerically sensitive params in float32.
-  """
-
-  exclusion_keywords = [
-      "norm",  # For all LayerNorm/GroupNorm layers
-      "condition_embedder",  # The entire time/text conditioning module
-      "scale_shift_table",  # Catches both the final and the AdaLN tables
-      "lora_",  # Keep trainable LoRA adapters in fp32 for TPU mixed-precision stability
-      "memory",  # Memory/retriever weights underflowed when cast to bf16 in the CS port
-  ]
-
-  path_str = ".".join(str(k.key) if isinstance(k, jax.tree_util.DictKey) else str(k) for k in path)
-
-  if any(keyword in path_str.lower() for keyword in exclusion_keywords):
-    # Keep these weights and biases in full precision
-    return x.astype(jnp.float32)
-  else:
-    # Cast everything else to dtype_to_cast
-    return x.astype(dtype_to_cast)
+  """Casts one WAN parameter using the shared loader/pipeline dtype policy."""
+  return x.astype(wan_param_dtype(path, dtype_to_cast))
 
 
 def _canonical_restored_param_path(path):
@@ -330,6 +312,7 @@ def create_sharded_logical_transformer(
         num_layers=wan_config["num_layers"],
         scan_layers=config.scan_layers,
         subfolder=subfolder,
+        cast_dtype_fn=partial(wan_param_dtype, dtype_to_cast=config.weights_dtype),
     )
 
   # Optional modules may be absent both from the pretrained base and from an

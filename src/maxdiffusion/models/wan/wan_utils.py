@@ -14,9 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
+import concurrent.futures
 import glob
 import json
+import os
+import threading
+import time
+from typing import Callable, Optional
+
+import ml_dtypes
+import numpy as np
 import torch
 import jax
 import jax.numpy as jnp
@@ -28,6 +35,26 @@ from ..modeling_flax_pytorch_utils import (rename_key, rename_key_and_reshape_te
 
 CAUSVID_TRANSFORMER_MODEL_NAME_OR_PATH = "lightx2v/Wan2.1-T2V-14B-CausVid"
 WAN_21_FUSION_X_MODEL_NAME_OR_PATH = "vrgamedevgirl84/Wan14BT2VFusioniX"
+
+_HF_METADATA_LOCK = threading.Lock()
+_WAN_FP32_PARAM_KEYWORDS = ("norm", "condition_embedder", "scale_shift_table", "lora_", "memory")
+
+
+def wan_param_dtype(path, dtype_to_cast):
+  """Returns the final host dtype for one WAN parameter path."""
+  path_str = ".".join(str(getattr(item, "key", item)) for item in path).lower()
+  if any(keyword in path_str for keyword in _WAN_FP32_PARAM_KEYWORDS):
+    return np.dtype(jnp.float32)
+  return np.dtype(dtype_to_cast)
+
+
+def _torch_tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+  """Returns a zero-copy CPU NumPy view, including bit-exact bfloat16."""
+  if tensor.device.type != "cpu":
+    tensor = tensor.cpu()
+  if tensor.dtype == torch.bfloat16:
+    return tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+  return tensor.numpy()
 
 
 def _tuple_str_to_int(in_tuple):
@@ -310,6 +337,7 @@ def load_wan_transformer(
     num_layers: int = 40,
     scan_layers: bool = True,
     subfolder: str = "",
+    cast_dtype_fn: Optional[Callable] = None,
 ):
   if pretrained_model_name_or_path == CAUSVID_TRANSFORMER_MODEL_NAME_OR_PATH:
     return load_causvid_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
@@ -317,11 +345,18 @@ def load_wan_transformer(
     return load_fusionx_transformer(pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers)
   else:
     return load_base_wan_transformer(
-        pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers, subfolder
+        pretrained_model_name_or_path,
+        eval_shapes,
+        device,
+        hf_download,
+        num_layers,
+        scan_layers,
+        subfolder,
+        cast_dtype_fn,
     )
 
 
-def load_base_wan_transformer(
+def _load_base_wan_transformer_legacy(
     pretrained_model_name_or_path: str,
     eval_shapes: dict,
     device: str,
@@ -418,6 +453,177 @@ def load_base_wan_transformer(
     del tensors
     jax.clear_caches()
     return flax_state_dict
+
+
+def load_base_wan_transformer(
+    pretrained_model_name_or_path: str,
+    eval_shapes: dict,
+    device: str,
+    hf_download: bool = True,
+    num_layers: int = 40,
+    scan_layers: bool = True,
+    subfolder: str = "",
+    cast_dtype_fn: Optional[Callable] = None,
+):
+  """Loads WAN weights into host NumPy arrays with strict conversion checks."""
+  if os.environ.get("MAXDIFFUSION_WAN_LEGACY_LOADER", "0").lower() in {"1", "true", "yes"}:
+    max_logging.log("Using legacy WAN transformer loader by environment override.")
+    return _load_base_wan_transformer_legacy(
+        pretrained_model_name_or_path, eval_shapes, device, hf_download, num_layers, scan_layers, subfolder
+    )
+
+  del device
+  filename = "diffusion_pytorch_model.safetensors.index.json"
+  model_paths = []
+
+  def download_hf_file(filename_to_download, download_subfolder=None):
+    with _HF_METADATA_LOCK:
+      return hf_hub_download(
+          pretrained_model_name_or_path,
+          subfolder=download_subfolder or None,
+          filename=filename_to_download,
+      )
+
+  if os.path.isdir(pretrained_model_name_or_path):
+    search_dir = os.path.join(pretrained_model_name_or_path, subfolder)
+    index_file_path = os.path.join(search_dir, filename)
+    if os.path.isfile(index_file_path):
+      with open(index_file_path, "r") as f:
+        index_dict = json.load(f)
+      model_paths = [os.path.join(search_dir, name) for name in sorted(set(index_dict["weight_map"].values()))]
+    else:
+      model_paths = sorted(glob.glob(os.path.join(search_dir, "diffusion_pytorch_model*.safetensors")))
+      if not model_paths and subfolder:
+        model_paths = sorted(
+            glob.glob(os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model*.safetensors"))
+        )
+      if not model_paths:
+        raise FileNotFoundError(
+            f"Could not find {filename} or diffusion_pytorch_model*.safetensors under "
+            f"{search_dir} (or repo root fallback)."
+        )
+  elif not hf_download:
+    raise ValueError("hf_download=False requires a local pretrained_model_name_or_path.")
+  else:
+    try:
+      index_file_path = download_hf_file(filename, subfolder)
+      with open(index_file_path, "r") as f:
+        index_dict = json.load(f)
+      model_paths = [download_hf_file(name, subfolder) for name in sorted(set(index_dict["weight_map"].values()))]
+    except Exception as index_exc:
+      single_file = "diffusion_pytorch_model.safetensors"
+      try:
+        model_paths = [download_hf_file(single_file, subfolder)]
+      except Exception:
+        try:
+          model_paths = [download_hf_file(single_file, "")]
+        except Exception:
+          raise index_exc
+
+  missing_files = [path for path in model_paths if not os.path.isfile(path)]
+  if missing_files:
+    raise FileNotFoundError(f"WAN checkpoint shard(s) not found: {missing_files}")
+
+  t_start = time.perf_counter()
+  expected_flat = flatten_dict(eval_shapes)
+  random_flax_state_dict = _build_random_flax_state_dict(eval_shapes)
+  flax_state_dict = {}
+  coverage = {}
+  assigned = set()
+  dict_lock = threading.Lock()
+
+  def expected_shape(path):
+    expected = getattr(expected_flat[path], "value", expected_flat[path])
+    return tuple(expected.shape)
+
+  def convert_chunk(ckpt_shard_path, chunk_keys):
+    with safe_open(ckpt_shard_path, framework="pt") as f:
+      for pt_key in chunk_keys:
+        tensor = _torch_tensor_to_numpy(f.get_tensor(pt_key))
+        pt_tuple_key = tuple(_rename_common_wan_transformer_key(rename_key(pt_key)).split("."))
+        block_index = None
+        if scan_layers and len(pt_tuple_key) >= 2 and pt_tuple_key[0] == "blocks":
+          block_index = int(pt_tuple_key[1])
+          if not 0 <= block_index < num_layers:
+            raise ValueError(f"Block index {block_index} outside [0, {num_layers}) for {pt_key}")
+          pt_tuple_key = ("blocks",) + pt_tuple_key[2:]
+
+        flax_key, flax_tensor = rename_key_and_reshape_tensor(
+            pt_tuple_key, tensor, random_flax_state_dict, scan_layers
+        )
+        flax_key = _tuple_str_to_int(rename_for_nnx(flax_key))
+        if flax_key not in expected_flat:
+          raise KeyError(f"Mapped WAN checkpoint key {pt_key} to unknown model path {flax_key}")
+        target_shape = expected_shape(flax_key)
+        source_shape = tuple(flax_tensor.shape)
+        target_dtype = cast_dtype_fn(flax_key) if cast_dtype_fn else flax_tensor.dtype
+
+        if block_index is not None:
+          if not target_shape or target_shape[0] != num_layers or target_shape[1:] != source_shape:
+            raise ValueError(
+                f"Shape mismatch for scanned {pt_key} -> {flax_key}: layer {source_shape}, expected {target_shape}"
+            )
+          token = (flax_key, block_index)
+          with dict_lock:
+            if token in assigned:
+              raise ValueError(f"Duplicate WAN checkpoint destination {flax_key} layer {block_index}")
+            assigned.add(token)
+            if flax_key not in flax_state_dict:
+              flax_state_dict[flax_key] = np.empty(target_shape, dtype=target_dtype)
+              coverage[flax_key] = np.zeros(num_layers, dtype=np.bool_)
+            coverage[flax_key][block_index] = True
+            stacked = flax_state_dict[flax_key]
+          stacked[block_index] = flax_tensor
+        else:
+          if target_shape != source_shape:
+            raise ValueError(f"Shape mismatch for {pt_key} -> {flax_key}: {source_shape}, expected {target_shape}")
+          value = np.array(flax_tensor, dtype=target_dtype, copy=True, order="C")
+          token = (flax_key, None)
+          with dict_lock:
+            if token in assigned:
+              raise ValueError(f"Duplicate WAN checkpoint destination {flax_key}")
+            assigned.add(token)
+            flax_state_dict[flax_key] = value
+
+  tasks = []
+  chunk_size = 16
+  for ckpt_shard_path in model_paths:
+    with safe_open(ckpt_shard_path, framework="pt") as f:
+      shard_keys = [key for key in f.keys() if "norm_added_q" not in key]
+    for start in range(0, len(shard_keys), chunk_size):
+      tasks.append((ckpt_shard_path, shard_keys[start : start + chunk_size]))
+  if not tasks:
+    raise ValueError(f"No supported WAN tensors found in checkpoint files: {model_paths}")
+
+  max_workers = min(32, len(tasks), os.cpu_count() or 1)
+  max_logging.log(
+      f"Fast WAN conversion {pretrained_model_name_or_path} {subfolder}: "
+      f"{len(model_paths)} shard(s), {len(tasks)} chunk(s), {max_workers} worker(s)"
+  )
+  with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    futures = [executor.submit(convert_chunk, path, keys) for path, keys in tasks]
+    for future in concurrent.futures.as_completed(futures):
+      future.result()
+
+  incomplete = {
+      key: np.flatnonzero(~rows).tolist() for key, rows in coverage.items() if not bool(np.all(rows))
+  }
+  if incomplete:
+    raise ValueError(f"Incomplete scanned WAN parameters; missing rows, e.g. {list(incomplete.items())[:3]}")
+
+  optional_keywords = ("lora_", "memory")
+  required_paths = {
+      key for key in expected_flat if not any(word in ".".join(map(str, key)).lower() for word in optional_keywords)
+  }
+  missing_paths = required_paths - set(flax_state_dict)
+  if missing_paths:
+    raise KeyError(f"WAN checkpoint is missing {len(missing_paths)} required paths, e.g. {list(missing_paths)[:3]}")
+
+  max_logging.log(
+      f"Converted {subfolder or 'transformer'} to host arrays in {time.perf_counter() - t_start:.1f}s "
+      f"({len(flax_state_dict)} parameter leaves)"
+  )
+  return unflatten_dict(flax_state_dict)
 
 
 def _is_motion_encoder_custom_weight(pt_key: str) -> bool:
