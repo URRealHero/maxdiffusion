@@ -25,6 +25,43 @@ AUTOTUNE = tf.data.AUTOTUNE
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def _finalize_training_dataset(
+    ds,
+    prepare_sample_fn,
+    global_batch_size,
+    dataloading_host_count,
+    dataloading_host_index,
+):
+  """Validate, repeat, and batch one host's finite training shard.
+
+  Repeating before drop-remainder batching allows a non-empty shard smaller
+  than one local batch to cross an epoch boundary instead of producing an
+  empty dataset forever. A fully empty post-filter shard is rejected eagerly
+  so multi-host training fails with a useful error rather than hanging at the
+  first collective.
+  """
+  local_batch_size = global_batch_size // dataloading_host_count
+  if local_batch_size <= 0:
+    raise ValueError(
+        f"Global batch size {global_batch_size} must be at least the dataloading host count "
+        f"{dataloading_host_count}."
+    )
+
+  if next(iter(ds.take(1)), None) is None:
+    raise ValueError(
+        f"Dataloading host {dataloading_host_index} has no training records after sharding/filtering. "
+        "Check TFRecord shard distribution and exclude_sample_ids_path."
+    )
+
+  return (
+      ds.map(prepare_sample_fn, num_parallel_calls=AUTOTUNE)
+      .shuffle(global_batch_size * 10, reshuffle_each_iteration=True)
+      .repeat(-1)
+      .batch(local_batch_size, drop_remainder=True)
+      .prefetch(AUTOTUNE)
+  )
+
+
 def load_as_tf_dataset(dataset, global_batch_size, shuffle, dataloading_host_count):
   dataset = dataset.with_format("tensorflow")[:]
   tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
@@ -133,6 +170,8 @@ def _make_tfrecord_iterator(
     filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*.tfrecord")))
   if not filenames:
     filenames = sorted(tf.io.gfile.glob(os.path.join(dataset_path, "*")))
+  if not filenames:
+    raise ValueError(f"No TFRecord files found in dataset path: {dataset_path}")
 
   used_prepare_sample = (
       prepare_sample_fn if (make_cached_tfrecord_iterator or config.dataset_type == "tfrecord") else prepare_sample
@@ -186,12 +225,12 @@ def _make_tfrecord_iterator(
       )
       max_logging.log(f"Held-out training: excluding {len(_bad)} sample_ids from training ({_exclude_path})")
       ds = ds.filter(lambda x: tf.equal(_excl.lookup(x["sample_id"]), 0))
-    ds = (
-        ds.map(used_prepare_sample, num_parallel_calls=AUTOTUNE)
-        .shuffle(global_batch_size * 10)
-        .batch(global_batch_size // dataloading_host_count, drop_remainder=True)
-        .repeat(-1)
-        .prefetch(AUTOTUNE)
+    ds = _finalize_training_dataset(
+        ds,
+        used_prepare_sample,
+        global_batch_size,
+        dataloading_host_count,
+        dataloading_host_index,
     )
   # For Evaluation: keep record-level sharding (low volume) + padding logic.
   else:
