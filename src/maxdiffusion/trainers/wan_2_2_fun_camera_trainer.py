@@ -248,11 +248,19 @@ def _per_token_timesteps(timesteps: jax.Array, f_lat: int, tokens_per_frame: int
   Token order matches WanModel: jax.lax.collapse over (F_lat, h/p, w/p),
   frame-major, so the first `tokens_per_frame` tokens belong to latent frame 0.
   """
+  timesteps = jnp.atleast_1d(timesteps)
   b = timesteps.shape[0]
   seq = f_lat * tokens_per_frame
   t_tok = jnp.broadcast_to(timesteps[:, None], (b, seq)).astype(jnp.float32)
   return t_tok.at[:, :tokens_per_frame].set(0.0)
 
+
+def _videox_fun_mse_loss(model_pred: jax.Array, training_target: jax.Array) -> jax.Array:
+  """VideoX-Fun's FP32 MSE with elementwise errors above 50 ignored."""
+  error = model_pred.astype(jnp.float32) - training_target.astype(jnp.float32)
+  squared_error = error**2
+  mask = (jnp.abs(error) <= 50.0).astype(jnp.float32)
+  return jnp.mean(squared_error * mask)
 
 def _upload_file_to_gcs(gcs_dir: str, local_path: str):
   """Upload one local file to gcs_dir/<basename> (gcs_dir = gs://bucket/prefix)."""
@@ -377,14 +385,16 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
       )
 
     with jax.named_scope("loss"):
-      loss = (training_target - model_pred) ** 2  # all frames (official + diffsynth)
-      # Official recipe: UNIFORM loss weight (weighting_scheme="none" -> ones).
-      # The midpoint-gaussian training_weight is the CS-era scheme; official_ff
-      # forces it off regardless of disable_training_weights.
-      if not config.disable_training_weights and not official_ff:
-        training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
-        loss = loss * training_weight
-      loss = jnp.mean(loss)
+      if official_ff:
+        # Official VideoX-Fun recipe: uniform, guarded FP32 MSE over all frames.
+        loss = _videox_fun_mse_loss(model_pred, training_target)
+      else:
+        # Preserve the existing diffsynth/CS compatibility behavior.
+        loss = (training_target - model_pred) ** 2
+        if not config.disable_training_weights:
+          training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
+          loss = loss * training_weight
+        loss = jnp.mean(loss)
 
     return loss
 
