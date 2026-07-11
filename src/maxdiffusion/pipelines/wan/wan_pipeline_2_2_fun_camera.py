@@ -218,6 +218,20 @@ def run_inference_2_2_fun_camera(
   cond_frame0 = y_latents[:, 4:, 0:1].astype(latents.dtype)
   if first_frame_clamp:
     latents = latents.at[:, :, 0:1].set(cond_frame0)
+  # Part 2 of the official mechanism: per-token timesteps with frame-0 tokens at
+  # t=0 (VideoX-Fun pipeline_wan2_2_fun_control.py:833; the transformer's TI2V
+  # per-token path, transformer_wan.py timestep.ndim==2). Token order is
+  # frame-major after the (1,2,2) patchify, so latent frame 0 owns the first
+  # (h//2)*(w//2) tokens.
+  _, _, f_lat, lat_h, lat_w = latents.shape
+  tokens_per_frame = (lat_h // 2) * (lat_w // 2)
+  seq_len = f_lat * tokens_per_frame
+
+  def _timestep_for(t, rows):
+    if not first_frame_clamp:
+      return jnp.broadcast_to(t, (rows,))
+    t_tok = jnp.broadcast_to(t.astype(jnp.float32), (rows, seq_len))
+    return t_tok.at[:, :tokens_per_frame].set(0.0)
   prompt_cond_embeds = prompt_embeds
   prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0) if do_cfg else None
 
@@ -269,7 +283,7 @@ def run_inference_2_2_fun_camera(
     if do_cfg:
       latents_doubled = jnp.concatenate([latents] * 2)
       transformer_input = _append_y(latents_doubled)
-      timestep = jnp.broadcast_to(t, (bsz * 2,))
+      timestep = _timestep_for(t, bsz * 2)
       noise_pred, _, _ = transformer_forward_pass_full_cfg(
           graphdef,
           sharded_state,
@@ -286,7 +300,7 @@ def run_inference_2_2_fun_camera(
       )
     else:
       transformer_input = _append_y(latents)
-      timestep = jnp.broadcast_to(t, (bsz,))
+      timestep = _timestep_for(t, bsz)
       noise_pred, _ = transformer_forward_pass(
           graphdef,
           sharded_state,
