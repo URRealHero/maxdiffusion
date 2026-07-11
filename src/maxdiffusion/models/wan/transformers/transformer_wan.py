@@ -638,6 +638,27 @@ class WanTransformerBlock(nnx.Module):
             6,
             axis=1,
         )
+      # Grouped (e.g. per-FRAME) modulation: [B, G, dim] rows with 1 < G < seq_len
+      # are applied on [B, G, seq/G, dim] views so the [B, seq, 6, dim] per-token
+      # tensor is never materialized — the full per-token layout wedged v6e HBM in
+      # the unrolled inference loop (2026-07-11). G == seq_len (true per-token) and
+      # G == 1 (global) keep the original elementwise form: identical graphs.
+      mod_groups = shift_msa.shape[1]
+
+      def _mod(x, scale, shift):
+        if 1 < mod_groups < x.shape[1]:
+          gsz = x.shape[1] // mod_groups
+          xg = x.reshape(x.shape[0], mod_groups, gsz, x.shape[-1])
+          return (xg * (1 + scale[:, :, None, :]) + shift[:, :, None, :]).reshape(x.shape)
+        return x * (1 + scale) + shift
+
+      def _gated_add(x, delta, gate):
+        if 1 < mod_groups < x.shape[1]:
+          gsz = x.shape[1] // mod_groups
+          dg = delta.reshape(delta.shape[0], mod_groups, gsz, delta.shape[-1])
+          return x + (dg * gate[:, :, None, :]).reshape(delta.shape)
+        return x + delta * gate
+
       axis_names = nn.logical_to_mesh_axes(("activation_batch", "activation_length", "activation_heads"))
       hidden_states = jax.lax.with_sharding_constraint(hidden_states, axis_names)
       hidden_states = checkpoint_name(hidden_states, "hidden_states")
@@ -647,7 +668,7 @@ class WanTransformerBlock(nnx.Module):
       # 1. Self-attention
       with self.conditional_named_scope("self_attn"):
         with self.conditional_named_scope("self_attn_norm"):
-          norm_hidden_states = (self.norm1(hidden_states.astype(jnp.float32)) * (1 + scale_msa) + shift_msa).astype(
+          norm_hidden_states = _mod(self.norm1(hidden_states.astype(jnp.float32)), scale_msa, shift_msa).astype(
               hidden_states.dtype
           )
         with self.conditional_named_scope("self_attn_attn"):
@@ -659,7 +680,7 @@ class WanTransformerBlock(nnx.Module):
               rngs=rngs,
           )
         with self.conditional_named_scope("self_attn_residual"):
-          hidden_states = (hidden_states.astype(jnp.float32) + attn_output * gate_msa).astype(hidden_states.dtype)
+          hidden_states = _gated_add(hidden_states.astype(jnp.float32), attn_output, gate_msa).astype(hidden_states.dtype)
 
       # 2. Cross-attention
       with self.conditional_named_scope("cross_attn"):
@@ -689,13 +710,13 @@ class WanTransformerBlock(nnx.Module):
       # 3. Feed-forward
       with self.conditional_named_scope("mlp"):
         with self.conditional_named_scope("mlp_norm"):
-          norm_hidden_states = (self.norm3(hidden_states.astype(jnp.float32)) * (1 + c_scale_msa) + c_shift_msa).astype(
+          norm_hidden_states = _mod(self.norm3(hidden_states.astype(jnp.float32)), c_scale_msa, c_shift_msa).astype(
               hidden_states.dtype
           )
         with self.conditional_named_scope("mlp_ffn"):
           ff_output = self.ffn(norm_hidden_states, deterministic=deterministic, rngs=rngs)
         with self.conditional_named_scope("mlp_residual"):
-          hidden_states = (hidden_states.astype(jnp.float32) + ff_output.astype(jnp.float32) * c_gate_msa).astype(
+          hidden_states = _gated_add(hidden_states.astype(jnp.float32), ff_output.astype(jnp.float32), c_gate_msa).astype(
               hidden_states.dtype
           )
       return hidden_states
@@ -1166,14 +1187,24 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     residual_x = hidden_states - hidden_states_before_blocks
 
     if per_token_t:
-      # temb: [B, seq_len, dim] — per-token modulation for final head
-      combined_head = jnp.expand_dims(self.scale_shift_table, 0) + jnp.expand_dims(temb, 2)  # [B, sl, 2, dim]
+      # temb: [B, G, dim] — per-token (G == seq_len) or grouped/per-frame (G < seq_len)
+      combined_head = jnp.expand_dims(self.scale_shift_table, 0) + jnp.expand_dims(temb, 2)  # [B, G, 2, dim]
       shift, scale = jnp.split(combined_head, 2, axis=2)
-      shift = shift.squeeze(2)  # [B, sl, dim]
-      scale = scale.squeeze(2)  # [B, sl, dim]
+      shift = shift.squeeze(2)  # [B, G, dim]
+      scale = scale.squeeze(2)  # [B, G, dim]
     else:
       shift, scale = jnp.split(self.scale_shift_table + jnp.expand_dims(temb, axis=1), 2, axis=1)
-    hidden_states = (self.norm_out(hidden_states.astype(jnp.float32)) * (1 + scale) + shift).astype(hidden_states.dtype)
+    norm_x = self.norm_out(hidden_states.astype(jnp.float32))
+    if per_token_t and 1 < shift.shape[1] < norm_x.shape[1]:
+      # grouped head modulation on [B, G, seq/G, dim] views (see block comment)
+      g = shift.shape[1]
+      gsz = norm_x.shape[1] // g
+      xg = norm_x.reshape(norm_x.shape[0], g, gsz, norm_x.shape[-1])
+      hidden_states = ((xg * (1 + scale[:, :, None, :]) + shift[:, :, None, :]).reshape(norm_x.shape)).astype(
+          hidden_states.dtype
+      )
+    else:
+      hidden_states = (norm_x * (1 + scale) + shift).astype(hidden_states.dtype)
     with jax.named_scope("proj_out"):
       hidden_states = self.proj_out(hidden_states)
 

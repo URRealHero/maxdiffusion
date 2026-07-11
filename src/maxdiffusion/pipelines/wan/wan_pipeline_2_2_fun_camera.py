@@ -228,27 +228,25 @@ def run_inference_2_2_fun_camera(
   cond_frame0 = y_latents[:, 4:, 0:1].astype(latents.dtype)
   if first_frame_clamp:
     latents = _clamp_frame0(latents, cond_frame0)
-  # Part 2 of the official mechanism: per-token timesteps with frame-0 tokens at
-  # t=0 (VideoX-Fun pipeline_wan2_2_fun_control.py:833; the transformer's TI2V
-  # per-token path, transformer_wan.py timestep.ndim==2). Token order is
-  # frame-major after the (1,2,2) patchify, so latent frame 0 owns the first
-  # (h//2)*(w//2) tokens. The zero-mask is built ONCE; per step the timestep is a
-  # single cached multiply — a fresh eager scatter per step wedged the TPU
-  # runtime's execute queue (all 16 eval workers stalled inside
-  # TpuLoadedExecutable::Execute) on the first camfix generation attempt.
-  _, _, f_lat, lat_h, lat_w = latents.shape
-  tokens_per_frame = (lat_h // 2) * (lat_w // 2)
-  seq_len = f_lat * tokens_per_frame
+  # Part 2 of the official mechanism: frame-0 tokens at t=0, others at t
+  # (VideoX-Fun pipeline_wan2_2_fun_control.py:833). The timestep only ever takes
+  # these TWO values, so it is passed per-FRAME [rows, f_lat]; the transformer's
+  # grouped-modulation path (transformer_wan.py) broadcasts within each frame's
+  # tokens — the materialized per-token [B, seq, 6, dim] layout wedged v6e HBM in
+  # the unrolled inference loop, and a per-step eager scatter here wedged the
+  # runtime execute queue (both 2026-07-11). Mask built ONCE; per step the
+  # timestep is a single cached multiply.
+  f_lat = latents.shape[2]
   rows_used = bsz * 2 if do_cfg else bsz
-  tok_t_mask = None
+  frame_t_mask = None
   if first_frame_clamp:
-    tok_t_mask = jnp.ones((rows_used, seq_len), jnp.float32).at[:, :tokens_per_frame].set(0.0)
+    frame_t_mask = jnp.ones((rows_used, f_lat), jnp.float32).at[:, 0].set(0.0)
 
   def _timestep_for(t, rows):
     if not first_frame_clamp:
       return jnp.broadcast_to(t, (rows,))
     assert rows == rows_used, (rows, rows_used)
-    return t.astype(jnp.float32) * tok_t_mask
+    return t.astype(jnp.float32) * frame_t_mask
   prompt_cond_embeds = prompt_embeds
   prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0) if do_cfg else None
 
