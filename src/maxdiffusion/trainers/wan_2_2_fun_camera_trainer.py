@@ -334,7 +334,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     encoder_hidden_states = data["encoder_hidden_states"].astype(config.weights_dtype)
 
     bsz = latents.shape[0]
-    f_lat, h_lat, w_lat = latents.shape[2], latents.shape[3], latents.shape[4]
+    f_lat = latents.shape[2]
 
     # Camera conditioning: tiny stored matrices -> packed Plucker, on device.
     control_camera_latents = build_control_camera_latents(
@@ -352,8 +352,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     # OFFICIAL VideoX-Fun first-frame training convention for the 16x-VAE 5B family
     # (scripts/wan2.2_fun/train_control_lora.py ~L1995): the frame-0 latent is kept
     # CLEAN (never noised) and the timestep is PER-TOKEN with frame-0 tokens at t=0;
-    # the loss stays over ALL frames (sigma-weighted, unmasked — the frame-0 term is
-    # an auxiliary: official inference discards frame-0 predictions via the latent
+    # the guarded FP32 loss stays uniform over ALL frames (the frame-0 term is an
+    # auxiliary: official inference discards frame-0 predictions via the latent
     # clamp, wan_fun_first_frame_clamp). The 7416e130-era comment claimed diffsynth/
     # CS scalar-t all-noised matched base training; VideoX-Fun's code shows CS is
     # the deviation. wan_fun_official_first_frame_training=False restores CS-style.
@@ -363,8 +363,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
       # official (control_latents[:, -C:]); causally equal to latents[:, :, 0:1]
       # but byte-consistent with the y channels and the inference clamp source.
       noisy_latents = noisy_latents.at[:, :, 0:1].set(latent_condition[:, :, 0:1].astype(noisy_latents.dtype))
-      f_lat = latents.shape[2]
-      tokens_per_frame = (latents.shape[3] // 2) * (latents.shape[4] // 2)
+      p_h, p_w = patch_hw
+      tokens_per_frame = (latents.shape[3] // p_h) * (latents.shape[4] // p_w)
       timestep_input = _per_token_timesteps(timesteps, f_lat, tokens_per_frame)
     else:
       timestep_input = timesteps  # scalar [B] (diffsynth/CS convention)

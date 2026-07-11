@@ -60,6 +60,11 @@ class BaseWanTrainerSchedulerTest(unittest.TestCase):
         scheduler, _ = self._trainer(5.0, train_flow_shift=3.0).create_scheduler()
         self.assertEqual(float(scheduler.config.shift), 3.0)
 
+    def test_sample_timesteps_preserves_batch_one_axis(self):
+        scheduler, _ = self._trainer(5.0).create_scheduler()
+        timesteps = scheduler.sample_timesteps(jax.random.key(0), batch_size=1)
+        self.assertEqual(timesteps.shape, (1,))
+
     def test_resume_rng_matches_uninterrupted_recurrence(self):
         rng, _ = jax.random.split(jax.random.key(123))
         expected = rng
