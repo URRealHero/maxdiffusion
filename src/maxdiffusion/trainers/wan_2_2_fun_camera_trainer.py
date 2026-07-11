@@ -339,13 +339,22 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
-    # Match diffsynth/CS Fun-5B training (seperated_timestep=False): ALL latent frames are
-    # noised (no clean frame-0 hold), a SCALAR timestep is used (not per-token), and the loss
-    # is over ALL frames. First-frame conditioning comes solely from the y-concat
-    # (mask + latent_condition). The previous per-token-timestep + clean-frame-0 + frame-0-
-    # excluded-loss convention is NOT how this base model was trained; the LoRA overfit to it
-    # and caused the first-frame "split" vs the (scalar) inference. (diffsynth wan_video_new.py
-    # training_loss: add_noise over the whole tensor + scalar timestep + mse over all frames.)
+    # OFFICIAL VideoX-Fun first-frame training convention for the 16x-VAE 5B family
+    # (scripts/wan2.2_fun/train_control_lora.py ~L1995): the frame-0 latent is kept
+    # CLEAN (never noised) and the timestep is PER-TOKEN with frame-0 tokens at t=0;
+    # the loss stays over ALL frames (sigma-weighted, unmasked — the frame-0 term is
+    # an auxiliary: official inference discards frame-0 predictions via the latent
+    # clamp, wan_fun_first_frame_clamp). The 7416e130-era comment claimed diffsynth/
+    # CS scalar-t all-noised matched base training; VideoX-Fun's code shows CS is
+    # the deviation. wan_fun_official_first_frame_training=False restores CS-style.
+    official_ff = bool(getattr(config, "wan_fun_official_first_frame_training", True))
+    if official_ff:
+      noisy_latents = noisy_latents.at[:, :, 0:1].set(latents[:, :, 0:1])
+      f_lat = latents.shape[2]
+      tokens_per_frame = (latents.shape[3] // 2) * (latents.shape[4] // 2)
+      timestep_input = _per_token_timesteps(timesteps, f_lat, tokens_per_frame)
+    else:
+      timestep_input = timesteps  # scalar [B] (diffsynth/CS convention)
 
     # y-conditioning: [mask(4) | latent_condition(48)], concat after the noisy
     # latents -> the 100-channel Fun camera-control input.
@@ -355,7 +364,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     with jax.named_scope("forward_pass"):
       model_pred = model(
           hidden_states=hidden_states,
-          timestep=timesteps,  # scalar [B] timestep (matches diffsynth + our scalar inference)
+          timestep=timestep_input,
           encoder_hidden_states=encoder_hidden_states,
           deterministic=False,
           rngs=nnx.Rngs(dropout=dropout_rng),
