@@ -158,6 +158,7 @@ class WanPipeline2_2_FunCamera(WanPipeline2_2_Dense):
         scheduler_state=scheduler_state,
         config=self.config,
         use_kv_cache=use_kv_cache,
+        first_frame_clamp=bool(getattr(self.config, "wan_fun_first_frame_clamp", True)),
     )
 
     t_denoise_start = time.perf_counter()
@@ -205,9 +206,18 @@ def run_inference_2_2_fun_camera(
     memory: Optional[jnp.array] = None,
     memory_pose_token: Optional[jnp.array] = None,
     memory_key_pose_token: Optional[jnp.array] = None,
+    first_frame_clamp: bool = True,
 ):
   do_cfg = guidance_scale > 1.0
   bsz = latents.shape[0]
+  # Official VideoX-Fun (pipeline_wan2_2_fun_control.py) hard-holds the anchor
+  # frame for the 16x-VAE 5B family: after init and after EVERY scheduler step,
+  # latent frame 0 is reset to the conditioning latent (frames 1+ keep denoising).
+  # y_latents layout is [B, 4 mask + 48 latent_condition, F, h, w]; the causal VAE
+  # makes latent_condition frame 0 == VAE(first frame).
+  cond_frame0 = y_latents[:, 4:, 0:1].astype(latents.dtype)
+  if first_frame_clamp:
+    latents = latents.at[:, :, 0:1].set(cond_frame0)
   prompt_cond_embeds = prompt_embeds
   prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0) if do_cfg else None
 
@@ -250,9 +260,10 @@ def run_inference_2_2_fun_camera(
     return jnp.concatenate([control_camera_latents_input] * batch_mult, axis=0)
 
   # Fun-5B-Control-Camera is seperated_timestep=False: scalar timestep per step, all frames
-  # denoised, first frame conditioning comes solely via the y-concat (mask + latent_condition).
-  # This matches diffsynth/CS inference (wan_video_new.py __call__: scalar timestep, no
-  # first_frame_latents hold for the Fun-Camera path).
+  # denoised. First-frame conditioning = the y-concat (mask + latent_condition) PLUS,
+  # when first_frame_clamp is on (official VideoX-Fun behavior for the 16x-VAE 5B),
+  # the per-step hard hold of latent frame 0 above. diffsynth/CS omit the hold —
+  # set wan_fun_first_frame_clamp=False to reproduce the old CS-parity behavior.
   for step in range(num_inference_steps):
     t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
     if do_cfg:
@@ -293,5 +304,7 @@ def run_inference_2_2_fun_camera(
       )
 
     latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
+    if first_frame_clamp:
+      latents = latents.at[:, :, 0:1].set(cond_frame0)
 
   return latents

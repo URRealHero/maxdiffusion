@@ -325,6 +325,9 @@ width: 1248
 num_frames: 121
 guidance_scale: 5.0
 flow_shift: 5.0
+# Official VideoX-Fun behavior for the 16x-VAE 5B: hard-hold latent frame 0 to the
+# conditioning latent after init and after every denoise step. False = old CS parity.
+wan_fun_first_frame_clamp: True
 # Training override. <=0 uses flow_shift above. Set 3.0 only when resuming a
 # legacy run created before training honoured flow_shift.
 train_flow_shift: -1.0
