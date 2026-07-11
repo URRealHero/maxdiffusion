@@ -188,6 +188,16 @@ class WanPipeline2_2_FunCamera(WanPipeline2_2_Dense):
     return video, trace
 
 
+@jax.jit
+def _clamp_frame0(latents, cond_frame0):
+  """Official first-frame hold, as ONE cached executable (compiled on first call).
+
+  Dispatching this as a per-step eager `.at[].set(...)` wedged the TPU runtime:
+  every eval worker blocked inside TpuLoadedExecutable::Execute mid-denoise
+  (py-spy verified, 2026-07-11). Keep it jitted."""
+  return latents.at[:, :, 0:1].set(cond_frame0)
+
+
 def run_inference_2_2_fun_camera(
     graphdef,
     sharded_state,
@@ -217,21 +227,28 @@ def run_inference_2_2_fun_camera(
   # makes latent_condition frame 0 == VAE(first frame).
   cond_frame0 = y_latents[:, 4:, 0:1].astype(latents.dtype)
   if first_frame_clamp:
-    latents = latents.at[:, :, 0:1].set(cond_frame0)
+    latents = _clamp_frame0(latents, cond_frame0)
   # Part 2 of the official mechanism: per-token timesteps with frame-0 tokens at
   # t=0 (VideoX-Fun pipeline_wan2_2_fun_control.py:833; the transformer's TI2V
   # per-token path, transformer_wan.py timestep.ndim==2). Token order is
   # frame-major after the (1,2,2) patchify, so latent frame 0 owns the first
-  # (h//2)*(w//2) tokens.
+  # (h//2)*(w//2) tokens. The zero-mask is built ONCE; per step the timestep is a
+  # single cached multiply — a fresh eager scatter per step wedged the TPU
+  # runtime's execute queue (all 16 eval workers stalled inside
+  # TpuLoadedExecutable::Execute) on the first camfix generation attempt.
   _, _, f_lat, lat_h, lat_w = latents.shape
   tokens_per_frame = (lat_h // 2) * (lat_w // 2)
   seq_len = f_lat * tokens_per_frame
+  rows_used = bsz * 2 if do_cfg else bsz
+  tok_t_mask = None
+  if first_frame_clamp:
+    tok_t_mask = jnp.ones((rows_used, seq_len), jnp.float32).at[:, :tokens_per_frame].set(0.0)
 
   def _timestep_for(t, rows):
     if not first_frame_clamp:
       return jnp.broadcast_to(t, (rows,))
-    t_tok = jnp.broadcast_to(t.astype(jnp.float32), (rows, seq_len))
-    return t_tok.at[:, :tokens_per_frame].set(0.0)
+    assert rows == rows_used, (rows, rows_used)
+    return t.astype(jnp.float32) * tok_t_mask
   prompt_cond_embeds = prompt_embeds
   prompt_embeds_combined = jnp.concatenate([prompt_embeds, negative_prompt_embeds], axis=0) if do_cfg else None
 
@@ -319,6 +336,6 @@ def run_inference_2_2_fun_camera(
 
     latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
     if first_frame_clamp:
-      latents = latents.at[:, :, 0:1].set(cond_frame0)
+      latents = _clamp_frame0(latents, cond_frame0)
 
   return latents
