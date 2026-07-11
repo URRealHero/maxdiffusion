@@ -22,10 +22,12 @@ limitations under the License.
 #   model input  = concat([noisy_latents(48), mask(4), latent_condition(48)]) = 100ch
 #   camera       = per-frame (extrinsic, intrinsic) -> Plucker -> packed [B,24,F_lat,H,W]
 #                  (computed ON DEVICE per step from the tiny stored matrices)
-#   timesteps    = per-token: first-latent-frame tokens get t=0 (clean first
-#                  frame), all others get the sampled t -- the TI2V convention.
-#   loss         = flow-match MSE on latent frames 1.. (frame 0 is the clean
-#                  conditioning frame, excluded, per DiffSynth FlowMatchSFTLoss).
+#   timesteps    = per-token: first-latent-frame tokens get t=0, clean frame-0
+#                  latent (official VideoX-Fun convention; knob
+#                  wan_fun_official_first_frame_training, False = CS scalar-t).
+#   loss         = flow-match MSE over ALL frames, UNIFORM weight (official
+#                  weighting_scheme="none"; frame-0 term is auxiliary — official
+#                  inference clamps over frame-0 predictions).
 #
 # Everything else (optimizer, schedule, logging, checkpoint cadence) is the
 # verified WAN 2.1/2.2-dense training loop, unchanged. No dtype changes.
@@ -349,7 +351,10 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
     # the deviation. wan_fun_official_first_frame_training=False restores CS-style.
     official_ff = bool(getattr(config, "wan_fun_official_first_frame_training", True))
     if official_ff:
-      noisy_latents = noisy_latents.at[:, :, 0:1].set(latents[:, :, 0:1])
+      # Frame-0 source = the MASKED-video latent (latent_condition), exactly as
+      # official (control_latents[:, -C:]); causally equal to latents[:, :, 0:1]
+      # but byte-consistent with the y channels and the inference clamp source.
+      noisy_latents = noisy_latents.at[:, :, 0:1].set(latent_condition[:, :, 0:1].astype(noisy_latents.dtype))
       f_lat = latents.shape[2]
       tokens_per_frame = (latents.shape[3] // 2) * (latents.shape[4] // 2)
       timestep_input = _per_token_timesteps(timesteps, f_lat, tokens_per_frame)
@@ -372,8 +377,11 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config, patch_h
       )
 
     with jax.named_scope("loss"):
-      loss = (training_target - model_pred) ** 2  # all frames (diffsynth convention)
-      if not config.disable_training_weights:
+      loss = (training_target - model_pred) ** 2  # all frames (official + diffsynth)
+      # Official recipe: UNIFORM loss weight (weighting_scheme="none" -> ones).
+      # The midpoint-gaussian training_weight is the CS-era scheme; official_ff
+      # forces it off regardless of disable_training_weights.
+      if not config.disable_training_weights and not official_ff:
         training_weight = jnp.expand_dims(training_weight, axis=(1, 2, 3, 4))
         loss = loss * training_weight
       loss = jnp.mean(loss)
