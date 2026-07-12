@@ -36,8 +36,8 @@ BRANCH="${BRANCH:-v2v-baseline}"
 
 LR="${LR:-1e-5}"
 # Opt-in official HyDRA recipe parity knobs. Historical runs used False/flax_lecun_normal.
-HYDRA_OFFICIAL_SCHEDULER="${HYDRA_OFFICIAL_SCHEDULER:-False}"
-HYDRA_TOKENIZER_INIT="${HYDRA_TOKENIZER_INIT:-flax_lecun_normal}"
+HYDRA_OFFICIAL_SCHEDULER="${HYDRA_OFFICIAL_SCHEDULER:-True}"
+HYDRA_TOKENIZER_INIT="${HYDRA_TOKENIZER_INIT:-torch_conv3d}"
 # HyDRA schedule (paper 5.1): 10K iterations, global batch 32, lr=1e-5 AdamW constant.
 # NOTE on batch: exact global-batch-32 on 128 chips needs tensor/context parallelism
 # (ctx hangs; tensor untested). Fallback = global batch 128 (fsdp=128) x 2500 steps
