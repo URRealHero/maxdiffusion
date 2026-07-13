@@ -482,6 +482,8 @@ eval_text_mode: "embedding"
 eval_prompt: ""                    # custom prompt for text_mode=prompt
 eval_negative_prompt: ""           # viz CFG negative; "" = classic empty-string unconditional (not WAN's default)
 eval_caption_manifest: ""          # gs:// jsonl (sample_id+caption) for caption text/display when not embedded
+eval_sids_file: ""                 # optional txt (one sample_id per line, local or gs://): generate ONLY these
+                                   # sids from eval_data_dir, e.g. fun_camera_eval_set/heldout_test_sids_filtered_n715.txt
 eval_output_dir: ""                # viz: where to write videos (decoupled from output_dir, which is forced to the ckpt run)
 # Multi-host eval-generation sharding: each pod worker generates a strided slice
 # records[eval_host_index::eval_host_count], so a large eval set (e.g. 1000 clips)

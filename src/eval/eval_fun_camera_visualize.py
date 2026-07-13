@@ -142,6 +142,23 @@ def run(config):
 
   records = read_eval_records(config.eval_data_dir, limit=limit)
 
+  # Optional sid-list filter (e.g. the filtered out-of-sight held-out subset). Applied
+  # BEFORE host striding, like `limit`, so the kept records stay balanced across workers.
+  # NOTE: combine with eval_num_generate_samples=0 — a nonzero limit truncates the read
+  # before this filter and would silently drop listed sids.
+  sids_file = str(getattr(config, "eval_sids_file", "") or "")
+  if sids_file:
+    with tf.io.gfile.GFile(sids_file) as f:
+      allow = {line.strip() for line in f if line.strip()}
+    n_read = len(records)
+    records = [r for r in records if r["sample_id"] in allow]
+    max_logging.log(f"[viz] eval_sids_file: kept {len(records)}/{n_read} records ({len(allow)} sids listed)")
+    missing = allow - {r["sample_id"] for r in records}
+    if missing:
+      max_logging.log(f"[viz] WARNING: {len(missing)} listed sids not in eval_data_dir, e.g. {sorted(missing)[:3]}")
+    if not records:
+      raise ValueError(f"eval_sids_file={sids_file} matched no records under {config.eval_data_dir}")
+
   # Multi-host sharding: each worker takes a strided slice so a pod can fan a large
   # eval set (e.g. 1000 clips) across all workers. The launcher passes eval_host_index
   # (from GCE metadata agent-worker-number) and eval_host_count (#workers). Strided
