@@ -27,7 +27,6 @@ from flax.training import train_state
 import jax
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
-import numpy as np
 from maxdiffusion import max_logging, max_utils, train_utils
 from maxdiffusion.generate_wan import inference_generate_video
 from maxdiffusion.generate_wan import run as generate_wan
