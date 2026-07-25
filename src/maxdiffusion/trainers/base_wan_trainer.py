@@ -319,19 +319,32 @@ class BaseWanTrainer(abc.ABC):
         resume_step = restore_args.get("step", 0) + 1
         restore_args["step"] = resume_step
         max_logging.log(f"Restoring optimizer from checkpoint step {resume_step - 1}; resuming at step {resume_step}")
+      # Shard the freshly created state first — it is entirely TPU-resident, so
+      # the constraint below is always valid. Restored checkpoint values are
+      # spliced in afterwards, directly onto their target shardings.
+      state = jax.tree.map(_to_array, state)
+      state_spec = nnx.get_partition_spec(state)
+      state = jax.lax.with_sharding_constraint(state, state_spec)
+      state_shardings = nnx.get_named_sharding(state, mesh)
+      if restore_args:
         # flax.struct.replace() is FUNCTIONAL — returns a new object, does NOT mutate
         # in place. Without reassignment the restored opt_state (Adam m/v moments +
         # internal step count) was silently discarded, zeroing optimizer momentum on
         # every resume (weights + step still restored via other paths). Reassign.
-        # The orbax restore returns opt_state as a plain nested dict — the
-        # optax NamedTuple node types (PartitionState/ScaleByAdamState/...)
-        # are not recoverable without an abstract target, and apply_gradients
-        # needs them. The freshly initialized state.opt_state is the correct
-        # structure (and carries the nnx sharding metadata), so transplant the
-        # restored values into it leaf-by-leaf. Leaf order is stable here:
-        # dicts flatten key-sorted and every optax state in this chain has
-        # alphabetical field order; shape+dtype are still validated to make
-        # any future structure drift a hard failure, not silent corruption.
+        # Two further constraints shape this splice:
+        # (1) the orbax restore returns opt_state as a plain nested dict — the
+        #     optax NamedTuple node types are not recoverable without an
+        #     abstract target, and apply_gradients needs them. The freshly
+        #     sharded state.opt_state is the authoritative structure, so the
+        #     restored VALUES are transplanted into it leaf-by-leaf. Leaf order
+        #     is stable (dicts flatten key-sorted; every optax state in this
+        #     chain has alphabetical field order); shape+dtype are validated so
+        #     structure drift is a hard failure, never silent corruption.
+        # (2) the restored values sit replicated on a host-local CPU mesh, and
+        #     in multi-controller JAX no primitive may move arrays between
+        #     device sets — each value is therefore rebuilt as a global array
+        #     on its template leaf's exact sharding (every host holds the full
+        #     value, so it can serve any shard).
         template_leaves, template_def = jax.tree.flatten(state.opt_state)
         restored_leaves = jax.tree.leaves(restore_args.get("opt_state"))
         if len(restored_leaves) != len(template_leaves):
@@ -348,30 +361,18 @@ class BaseWanTrainer(abc.ABC):
                 f"restored opt_state leaf {i} mismatch: checkpoint {r_shape}/{r_dtype} "
                 f"vs optimizer {t_shape}/{t_dtype}"
             )
-        restored_opt_state = jax.tree.unflatten(template_def, restored_leaves)
-        state = state.replace(opt_state=restored_opt_state, step=resume_step)
+
+        def _global_from_host(value, template_leaf):
+          host = np.asarray(jax.device_get(value))
+          return jax.make_array_from_callback(host.shape, template_leaf.sharding, lambda idx, _h=host: _h[idx])
+
+        restored_opt_state = jax.tree.unflatten(
+            template_def, [_global_from_host(r, t) for r, t in zip(restored_leaves, template_leaves)]
+        )
+        step_value = _global_from_host(np.asarray(resume_step, dtype=state.step.dtype), state.step)
+        state = state.replace(opt_state=restored_opt_state, step=step_value)
         del restore_args["opt_state"]
         del optimizer
-      state = jax.tree.map(_to_array, state)
-      state_spec = nnx.get_partition_spec(state)
-      state_shardings = nnx.get_named_sharding(state, mesh)
-      if restore_args:
-        # The orbax restore leaves opt_state replicated on a host-local CPU
-        # mesh (see load_wan_configs_from_orbax). In multi-controller JAX
-        # neither with_sharding_constraint nor device_put may move arrays
-        # between different device sets, so each restored leaf is rebuilt as
-        # a global array on its target sharding from the host-local copy
-        # (every host holds the full array). TPU-resident leaves (the params,
-        # placed by the pipeline build) pass through untouched.
-        def _place(x, s):
-          if isinstance(x, jax.Array) and x.sharding.device_set == s.device_set:
-            return x
-          host = np.asarray(jax.device_get(x))
-          return jax.make_array_from_callback(host.shape, s, lambda idx, _h=host: _h[idx])
-
-        state = jax.tree.map(_place, state, state_shardings)
-      else:
-        state = jax.lax.with_sharding_constraint(state, state_spec)
       if jax.process_index() == 0 and restore_args:
         max_logging.log("--- Optimizer State Sharding Spec (opt_state) ---")
         pretty_string = pprint.pformat(state_spec.opt_state, indent=4, width=60)
