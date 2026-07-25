@@ -323,7 +323,33 @@ class BaseWanTrainer(abc.ABC):
         # in place. Without reassignment the restored opt_state (Adam m/v moments +
         # internal step count) was silently discarded, zeroing optimizer momentum on
         # every resume (weights + step still restored via other paths). Reassign.
-        state = state.replace(opt_state=restore_args.get("opt_state"), step=resume_step)
+        # The orbax restore returns opt_state as a plain nested dict — the
+        # optax NamedTuple node types (PartitionState/ScaleByAdamState/...)
+        # are not recoverable without an abstract target, and apply_gradients
+        # needs them. The freshly initialized state.opt_state is the correct
+        # structure (and carries the nnx sharding metadata), so transplant the
+        # restored values into it leaf-by-leaf. Leaf order is stable here:
+        # dicts flatten key-sorted and every optax state in this chain has
+        # alphabetical field order; shape+dtype are still validated to make
+        # any future structure drift a hard failure, not silent corruption.
+        template_leaves, template_def = jax.tree.flatten(state.opt_state)
+        restored_leaves = jax.tree.leaves(restore_args.get("opt_state"))
+        if len(restored_leaves) != len(template_leaves):
+          raise ValueError(
+              f"restored opt_state has {len(restored_leaves)} leaves, freshly "
+              f"initialized optimizer has {len(template_leaves)} — checkpoint "
+              "and optimizer definition do not match"
+          )
+        for i, (t, r) in enumerate(zip(template_leaves, restored_leaves)):
+          t_shape, r_shape = tuple(getattr(t, "shape", ())), tuple(getattr(r, "shape", ()))
+          t_dtype, r_dtype = getattr(t, "dtype", None), getattr(r, "dtype", None)
+          if t_shape != r_shape or t_dtype != r_dtype:
+            raise ValueError(
+                f"restored opt_state leaf {i} mismatch: checkpoint {r_shape}/{r_dtype} "
+                f"vs optimizer {t_shape}/{t_dtype}"
+            )
+        restored_opt_state = jax.tree.unflatten(template_def, restored_leaves)
+        state = state.replace(opt_state=restored_opt_state, step=resume_step)
         del restore_args["opt_state"]
         del optimizer
       state = jax.tree.map(_to_array, state)
