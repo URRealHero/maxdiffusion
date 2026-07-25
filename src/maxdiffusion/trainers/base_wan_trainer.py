@@ -328,8 +328,15 @@ class BaseWanTrainer(abc.ABC):
         del optimizer
       state = jax.tree.map(_to_array, state)
       state_spec = nnx.get_partition_spec(state)
-      state = jax.lax.with_sharding_constraint(state, state_spec)
       state_shardings = nnx.get_named_sharding(state, mesh)
+      if restore_args:
+        # The orbax restore places opt_state on a host-local CPU mesh (see
+        # load_wan_configs_from_orbax) and the resume step is a fresh scalar.
+        # with_sharding_constraint cannot move arrays across platforms
+        # (CPU -> TPU), so a resumed state needs an explicit transfer.
+        state = jax.device_put(state, state_shardings)
+      else:
+        state = jax.lax.with_sharding_constraint(state, state_spec)
       if jax.process_index() == 0 and restore_args:
         max_logging.log("--- Optimizer State Sharding Spec (opt_state) ---")
         pretty_string = pprint.pformat(state_spec.opt_state, indent=4, width=60)
