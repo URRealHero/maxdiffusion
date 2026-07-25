@@ -27,6 +27,7 @@ from flax.training import train_state
 import jax
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
+import numpy as np
 from maxdiffusion import max_logging, max_utils, train_utils
 from maxdiffusion.generate_wan import inference_generate_video
 from maxdiffusion.generate_wan import run as generate_wan
@@ -330,11 +331,20 @@ class BaseWanTrainer(abc.ABC):
       state_spec = nnx.get_partition_spec(state)
       state_shardings = nnx.get_named_sharding(state, mesh)
       if restore_args:
-        # The orbax restore places opt_state on a host-local CPU mesh (see
-        # load_wan_configs_from_orbax) and the resume step is a fresh scalar.
-        # with_sharding_constraint cannot move arrays across platforms
-        # (CPU -> TPU), so a resumed state needs an explicit transfer.
-        state = jax.device_put(state, state_shardings)
+        # The orbax restore leaves opt_state replicated on a host-local CPU
+        # mesh (see load_wan_configs_from_orbax). In multi-controller JAX
+        # neither with_sharding_constraint nor device_put may move arrays
+        # between different device sets, so each restored leaf is rebuilt as
+        # a global array on its target sharding from the host-local copy
+        # (every host holds the full array). TPU-resident leaves (the params,
+        # placed by the pipeline build) pass through untouched.
+        def _place(x, s):
+          if isinstance(x, jax.Array) and x.sharding.device_set == s.device_set:
+            return x
+          host = np.asarray(jax.device_get(x))
+          return jax.make_array_from_callback(host.shape, s, lambda idx, _h=host: _h[idx])
+
+        state = jax.tree.map(_place, state, state_shardings)
       else:
         state = jax.lax.with_sharding_constraint(state, state_spec)
       if jax.process_index() == 0 and restore_args:
